@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  "skills": [
+    {
+      "name": "xerj",
+      "type": "skill-md",
+      "description": "Search local codebases, mixed-format folders, long-term agent memory, and reference-coding corpora with XERJ \u2014 via CLI (xerj search, xerj def, xerj autoindex, xerj code) or MCP (xerj_search, xerj_map, xerj_code_search, xerj_memory_*).",
+      "url": "https://xerj.org/SKILL.md",
+      "digest": "sha256:3475791cd9869a6414ab78db93aefa4d5b39bf7055e245e37881fb10af2b0695",
+      "files": [
+        "SKILL.md"
+      ]
+    }
+  ]
+}

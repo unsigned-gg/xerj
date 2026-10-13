@@ -68,3 +68,18 @@
   Content-Type: text/markdown; charset=utf-8
 /compare/*.md
   Content-Type: text/markdown; charset=utf-8
+/llms.txt
+  Content-Type: text/markdown; charset=utf-8
+/llms-full.txt
+  Content-Type: text/markdown; charset=utf-8
+/llms-install.md
+  Content-Type: text/markdown; charset=utf-8
+/SKILL.md
+  Content-Type: text/markdown; charset=utf-8
+/skill.md
+  Content-Type: text/markdown; charset=utf-8
+/.well-known/skills/index.json
+  Content-Type: application/json; charset=utf-8
+/.well-known/agent-skills/index.json
+  Content-Type: application/json; charset=utf-8
+
