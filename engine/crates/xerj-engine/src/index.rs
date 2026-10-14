@@ -11993,6 +11993,9 @@ impl Index {
         // still fires shard flushes in parallel.
         let n_shards = self.memtable.shard_count();
         for shard_idx in 0..n_shards {
+            if self.memtable.shard_load(shard_idx).0 == 0 {
+                continue;
+            }
             do_flush_shard(
                 shard_idx,
                 Arc::clone(&self.store),
@@ -25234,6 +25237,9 @@ impl Index {
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
             for shard_idx in 0..n_shards {
+                if memtable.shard_load(shard_idx).0 == 0 {
+                    continue;
+                }
                 let sema = Arc::clone(&flush_sema);
                 let store = Arc::clone(&store);
                 let memtable = Arc::clone(&memtable);
@@ -33005,6 +33011,10 @@ async fn do_flush_shard(
     warm_caches: PublishWarmCaches,
     #[cfg(test)] test_hook: Option<FlushPublisherTestHook>,
 ) -> Result<()> {
+    if memtable.shard_load(shard_idx).0 == 0 {
+        on_drained();
+        return Ok(());
+    }
     // Acquire admission before draining. Once the memtable has been drained
     // there must be no cancellation point until a non-cancellable blocking
     // worker owns both rollback data and the publication barrier.
@@ -59742,5 +59752,25 @@ mod exact_scan_hydration_tests {
         let doc = serde_json::json!({"_id": "shadowed", "tag": "t"});
         assert!(KnnFilterPlan::FullSource.matches(&filter, "real", &doc, &schema));
         assert!(!KnnFilterPlan::FullSource.matches(&filter, "other", &doc, &schema));
+    }
+
+    #[tokio::test]
+    async fn refresh_and_flush_skip_empty_shards_without_acquiring_finalize_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(&dir);
+        let idx = eng.get_or_create_index("empty-shard-skip").unwrap();
+        let permits_n = crate::pools::sizing().flush_finalize as u32;
+        let _permits = crate::flush_finalize_gate()
+            .acquire_many(permits_n)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(200), idx.refresh())
+            .await
+            .expect("refresh on empty index should not block on flush_finalize_gate")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(200), idx.flush())
+            .await
+            .expect("flush on empty index should not block on flush_finalize_gate")
+            .unwrap();
     }
 }
