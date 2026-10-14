@@ -20,10 +20,20 @@
 use serde_json::json;
 use tempfile::TempDir;
 use xerj_common::config::Config;
-use xerj_common::types::Schema;
+use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
+
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut schema = Schema::empty();
+    for &f in fields {
+        schema
+            .add_field(FieldConfig::new(f, FieldType::Keyword))
+            .unwrap();
+    }
+    schema
+}
 
 /// The served/bailed assertions read the PROCESS-GLOBAL
 /// `fast_path_aggs_served()` counter as a before/after delta, so two of
@@ -94,7 +104,9 @@ async fn exists_in_top_filter_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsq", Schema::empty()).unwrap();
+    engine
+        .create_index("existsq", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("existsq").unwrap();
     seed_exists_shapes(&idx).await;
 
@@ -137,7 +149,9 @@ async fn exists_on_numeric_field_matches_brute() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("existsn", Schema::empty()).unwrap();
+    engine
+        .create_index("existsn", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("existsn").unwrap();
     for i in 0..12_000u32 {
         let mut doc = json!({ "group": if i % 2 == 0 { "a" } else { "b" } });
@@ -213,7 +227,9 @@ async fn unmerged_ghosts_still_bail() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("ghosts", Schema::empty()).unwrap();
+    engine
+        .create_index("ghosts", kw_schema(&["group"]))
+        .unwrap();
     let idx = engine.get_index("ghosts").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -265,7 +281,9 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("readmit", Schema::empty()).unwrap();
+    engine
+        .create_index("readmit", kw_schema(&["extension"]))
+        .unwrap();
     let idx = engine.get_index("readmit").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(
@@ -304,7 +322,7 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
         "query": {
             "bool": {
                 "filter": [
-                    { "term": { "extension": "css" } },
+                    { "terms": { "extension": ["css"] } },
                     { "exists": { "field": "i" } }
                 ]
             }
@@ -349,7 +367,9 @@ async fn object_valued_memtable_doc_counts_as_exists() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("objmem", Schema::empty()).unwrap();
+    engine
+        .create_index("objmem", kw_schema(&["extension", "text"]))
+        .unwrap();
     let idx = engine.get_index("objmem").unwrap();
     for i in 0..12_000u32 {
         idx.index_document(

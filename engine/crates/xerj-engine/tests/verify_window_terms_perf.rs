@@ -25,10 +25,20 @@ use serde_json::json;
 use std::time::Instant;
 use tempfile::TempDir;
 use xerj_common::config::Config;
-use xerj_common::types::Schema;
+use xerj_common::types::{FieldConfig, FieldType, Schema};
 use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
+
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut schema = Schema::empty();
+    for &f in fields {
+        schema
+            .add_field(FieldConfig::new(f, FieldType::Keyword))
+            .unwrap();
+    }
+    schema
+}
 
 /// The client's window size (`SyncExecutor::VERIFY_WINDOW`).
 const WINDOW: usize = 1024;
@@ -131,7 +141,12 @@ async fn count_lane_full_window_is_served_columnar() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28", Schema::empty()).unwrap();
+    engine
+        .create_index(
+            "cves28",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28").unwrap();
     let digests = seed(&idx).await;
 
@@ -180,7 +195,12 @@ async fn count_lane_with_resident_ghosts_is_served_and_exact() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("cves28g", Schema::empty()).unwrap();
+    engine
+        .create_index(
+            "cves28g",
+            kw_schema(&["ax_file", "ax_dataset", "cve_id", "text"]),
+        )
+        .unwrap();
     let idx = engine.get_index("cves28g").unwrap();
     let digests = seed(&idx).await;
 
@@ -272,7 +292,9 @@ async fn doc_lane_window_fetch_is_bounded() {
     let _sequential = ONE_AT_A_TIME.lock().await;
     let dir = TempDir::new().unwrap();
     let engine = make_engine(&dir);
-    engine.create_index("catalog", Schema::empty()).unwrap();
+    engine
+        .create_index("catalog", kw_schema(&["file_key", "run_id", "ax_path"]))
+        .unwrap();
     let idx = engine.get_index("catalog").unwrap();
     // The catalog holds ONE doc per (digest, alias) — seed the same digests
     // plus a run_id that matches everything (the resume-rewrote-everything
