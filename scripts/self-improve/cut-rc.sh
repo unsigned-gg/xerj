@@ -16,7 +16,7 @@
 #        - cargo test -j 2 -p xerj-engine --test docs_capability_lists --test docs_do_not_promise_the_next_release
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd))"
 cd "$REPO_ROOT"
 
 MODE=""
@@ -169,7 +169,7 @@ p.write_text(s2)
 PY
 
   # 5. Regenerate landing/sitemap.xml so lastmod matches modified landing pages
-  python3 scripts/seo/build_sitemap.py
+  python3 scripts/seo/gen_sitemap.py --write
 fi
 
 echo ""
