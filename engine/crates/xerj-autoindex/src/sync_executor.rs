@@ -4797,7 +4797,7 @@ mod tests {
         let apply_of = std::sync::Arc::clone(&seen_threads);
         let apply = move |item: &usize| {
             apply_of.lock().unwrap().insert(std::thread::current().id());
-            if item % 3 == 0 {
+            if item.is_multiple_of(3) {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Ok(())
