@@ -68,15 +68,50 @@ org:
           protocol: http
           kind: readiness
     ci:
+      # Stage order is the DAG order: a node runs after every node it needs. Tools inside one
+      # node run in name order, so a stage that must come earlier gets its own node.
       nodes:
+        toolchain:
+          needs:
+            toolchain-check: true
         hygiene:
           needs:
+            toolchain: true
             projectfile-check: true
+            stages-check: true
             workflow-timeout-check: true
-        check:
-          goal: true
+        formatted:
           needs:
             hygiene: true
             cargo-fmt: true
+        linted:
+          needs:
+            formatted: true
             xtask-clippy: true
+        check:
+          goal: true
+          needs:
+            linted: true
             xtask-test: true
+
+gg:
+  unsigned:
+    ls:
+      tools:
+        deny:
+          crate: cargo-deny
+          version: "0.19.9"
+          bin: cargo-deny
+        machete:
+          crate: cargo-machete
+          version: "0.9.1"
+          bin: cargo-machete
+        nextest:
+          crate: cargo-nextest
+          version: "0.9.104"
+          bin: cargo-nextest
+        typos:
+          crate: typos-cli
+          version: "1.49.0"
+          bin: typos
+
