@@ -420,8 +420,7 @@ impl ClusterNode {
                             .metadata
                             .shard_assignments
                             .contains_key(&(name.clone(), 0))
-                    {
-                        if self
+                        && self
                             .raft
                             .propose(ClusterCommand::AssignShard {
                                 index: name.clone(),
@@ -429,10 +428,9 @@ impl ClusterNode {
                                 node_id: self.raft.id.clone(),
                             })
                             .is_ok()
-                        {
-                            let hb = self.raft.force_heartbeat();
-                            let _ = self.dispatch(hb).await;
-                        }
+                    {
+                        let hb = self.raft.force_heartbeat();
+                        let _ = self.dispatch(hb).await;
                     }
                 }
 
