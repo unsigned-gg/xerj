@@ -259,8 +259,12 @@ impl ResourceGovernor {
             Some(bytes) => bytes.min(self.machine_memory_bytes).max(1),
             None => self.memory_watermark_bytes_default,
         };
-        self.memory_watermark_bytes
-            .store(effective, Ordering::Relaxed);
+        let prev = self
+            .memory_watermark_bytes
+            .swap(effective, Ordering::Relaxed);
+        if effective > prev && self.rss_bytes.load(Ordering::Relaxed) < effective {
+            self.memory_tripped.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Per-query memory guard for `max_query_memory_mb` (item 1). Rejects a
@@ -2058,5 +2062,20 @@ mod tests {
             g.check_ingest_admission().is_ok(),
             "must release once RSS drops below 95% of watermark"
         );
+
+        // Raising the watermark live above current RSS clears a trip against the
+        // old ceiling even when RSS is within 5% of the raised ceiling (e.g. a
+        // 16 GiB box where 95% -> 100% clamp leaves rss >= 95% of raised).
+        g.refresh(0, wm + 1, 0);
+        assert!(g.check_ingest_admission().is_err());
+        let slightly_higher = (wm + 2).min(g.machine_memory_bytes);
+        if slightly_higher > wm + 1 {
+            g.set_memory_watermark_override(Some(slightly_higher));
+            g.refresh(0, wm + 1, 0);
+            assert!(
+                g.check_ingest_admission().is_ok(),
+                "raising watermark above RSS must clear trip immediately"
+            );
+        }
     }
 }
