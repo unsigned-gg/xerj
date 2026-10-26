@@ -114,8 +114,37 @@ pub(crate) async fn with_semantic_lifecycle_hook<F: std::future::Future>(
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/// A whole-request `_bulk` refusal (see [`BulkResult::refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkRefusal {
+    /// Human text for the ES error `reason`. Must not contain "circuit
+    /// breaker" or "memtable byte budget": the autoindex client reads those
+    /// as the parent memory breaker.
+    pub reason: String,
+    /// Seconds for the `Retry-After` header.
+    pub retry_after_secs: u64,
+}
+
+impl BulkRefusal {
+    /// Result for a request refused whole: no items, `errors: true`.
+    pub fn into_result(self, started: std::time::Instant) -> BulkResult {
+        BulkResult {
+            refusal: Some(self),
+            took_ms: started.elapsed().as_millis() as u64,
+            errors: true,
+            items: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkResult {
+    /// Set when the whole request was refused before any action ran. Items
+    /// are empty then: the HTTP layer answers 429 with an ES error body and a
+    /// `Retry-After` header instead of a bulk items body, because the client
+    /// drops a bulk response whose item count does not match its request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<BulkRefusal>,
     pub took_ms: u64,
     pub errors: bool,
     pub items: Vec<BulkItemResult>,
@@ -469,24 +498,49 @@ pub async fn process_bulk_with_opts(
     //    bulks with a single 413-style error item before allocating the
     //    parse-phase Vecs.
     let _bulk_permit = match crate::governor::global() {
-        Some(g) => match g.acquire_bulk().await {
-            Ok(p) => Some(p),
-            Err(e) => {
-                return BulkResult {
-                    took_ms: started.elapsed().as_millis() as u64,
-                    errors: true,
-                    items: vec![BulkItemResult {
-                        action: "bulk".to_string(),
-                        index: default_index.unwrap_or("").to_string(),
-                        id: String::new(),
-                        status: 503,
-                        result: None,
-                        error: Some(e.to_string()),
-                        get_source: None,
-                    }],
-                };
+        Some(g) => {
+            let wait_started = std::time::Instant::now();
+            let acquired = g.acquire_bulk_timeout(g.bulk_admission_wait()).await;
+            let waited = wait_started.elapsed().as_secs_f64();
+            match acquired {
+                Ok(p) => {
+                    if let Some(m) = xerj_common::metrics::global_metrics() {
+                        m.observe_bulk_admission("admit", waited);
+                    }
+                    Some(p)
+                }
+                Err(crate::governor::BulkAdmissionError::Timeout(t)) => {
+                    if let Some(m) = xerj_common::metrics::global_metrics() {
+                        m.observe_bulk_admission("timeout", waited);
+                    }
+                    return BulkRefusal {
+                        reason: format!(
+                            "all {} bulk slots stayed busy for {} ms; retry the whole request",
+                            g.max_concurrent_bulks(),
+                            t.waited.as_millis()
+                        ),
+                        retry_after_secs: t.retry_after_secs,
+                    }
+                    .into_result(started);
+                }
+                Err(crate::governor::BulkAdmissionError::Closed(e)) => {
+                    return BulkResult {
+                        refusal: None,
+                        took_ms: started.elapsed().as_millis() as u64,
+                        errors: true,
+                        items: vec![BulkItemResult {
+                            action: "bulk".to_string(),
+                            index: default_index.unwrap_or("").to_string(),
+                            id: String::new(),
+                            status: 503,
+                            result: None,
+                            error: Some(e.to_string()),
+                            get_source: None,
+                        }],
+                    };
+                }
             }
-        },
+        }
         None => None,
     };
     // Mirrors the permits held in the bulk pool: counted while the permit is.
@@ -510,6 +564,7 @@ pub async fn process_bulk_with_opts(
     let max_actions = engine.config().limits.max_actions_per_bulk;
     if max_actions > 0 && lines.len() > max_actions * 2 {
         return BulkResult {
+            refusal: None,
             took_ms: started.elapsed().as_millis() as u64,
             errors: true,
             items: vec![BulkItemResult {
@@ -614,6 +669,7 @@ pub async fn process_bulk_with_opts(
                 // this 429 like `Index::governor_write_gate` (#2321).
                 crate::engine::request_memory_pressure_drain();
                 return BulkResult {
+                    refusal: None,
                     took_ms: started.elapsed().as_millis() as u64,
                     errors: true,
                     items: refuse_every_action(&pairs, default_index, &EngineError::Common(e)),
@@ -2501,6 +2557,7 @@ pub async fn process_bulk_with_opts(
         );
     }
     BulkResult {
+        refusal: None,
         took_ms,
         errors,
         items: final_items,

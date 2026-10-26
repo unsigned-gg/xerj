@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **139 settings** versus
+//! Configuration is intentionally minimal: **140 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -75,7 +75,7 @@ pub struct Config {
     pub logs: LogsConfig,
     /// External embedding service — 22 settings.
     pub embedding: EmbeddingConfig,
-    /// Resource limits — 14 settings.
+    /// Resource limits — 16 settings.
     pub limits: LimitsConfig,
     /// High-throughput turbo indexing — 3 settings.
     pub indexing: IndexingConfig,
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 139 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 140 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -301,6 +301,11 @@ impl Config {
         if !(1..=64).contains(&self.embedding.neural_window_concurrency) {
             return Err(XerjError::config(
                 "embedding.neural_window_concurrency must be in 1..=64",
+            ));
+        }
+        if !(1_000..=600_000).contains(&self.limits.bulk_admission_wait_ms) {
+            return Err(XerjError::config(
+                "limits.bulk_admission_wait_ms must be in 1000..=600000",
             ));
         }
         if !(1..=1024).contains(&self.embedding.neural_max_inflight_calls) {
@@ -568,7 +573,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (139 user-facing settings total; counted by
+// Sub-configs  (140 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1799,7 +1804,7 @@ pub const AUTO_PROCESS_MEMORY_MB: u64 = u64::MAX;
 
 /// Resource limits.
 ///
-/// **15 settings.**
+/// **16 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -1819,6 +1824,12 @@ pub struct LimitsConfig {
     /// oversized bulks at the top of the parse phase with a 413-style per-item
     /// error instead of letting jemalloc abort the process on OOM.
     pub max_actions_per_bulk: usize,
+    /// How long a `_bulk` waits for a global bulk-pool permit before it is
+    /// refused (default: `30000` ms, range: `1000..=600000`). A refused bulk
+    /// answers HTTP 429 with an Elasticsearch-style error body and a
+    /// `Retry-After` header, not a bulk items body, so a client backs off the
+    /// whole request instead of retrying items it never sent.
+    pub bulk_admission_wait_ms: u64,
     /// Filesystem locations under which a snapshot repository's `settings.location`
     /// is allowed to resolve (an ES `path.repo` equivalent). Empty (the default)
     /// means **only `data_dir`** is permitted. Without this bound a write-capable
@@ -1961,6 +1972,7 @@ impl Default for LimitsConfig {
             max_concurrent_searches: 64,
             max_fields_per_index: 500,
             max_actions_per_bulk: 50_000,
+            bulk_admission_wait_ms: 30_000,
             snapshot_repo_allowlist: Vec::new(),
             hub_pack_restore: true,
             max_body_bytes: 100 * 1024 * 1024,
@@ -3847,6 +3859,22 @@ mod tests {
     }
 
     #[test]
+    fn bulk_admission_wait_defaults_to_thirty_seconds_and_is_bounded() {
+        assert_eq!(Config::default().limits.bulk_admission_wait_ms, 30_000);
+        for ms in [1_000u64, 600_000] {
+            Config::from_toml_str(&format!("[limits]\nbulk_admission_wait_ms = {ms}\n"))
+                .unwrap_or_else(|e| panic!("{ms}: {e}"));
+        }
+        for ms in [0u64, 999, 600_001] {
+            assert!(
+                Config::from_toml_str(&format!("[limits]\nbulk_admission_wait_ms = {ms}\n"))
+                    .is_err(),
+                "{ms} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn bulk_embed_deadline_defaults_to_two_minutes_and_zero_disables() {
         assert_eq!(Config::default().embedding.bulk_embed_deadline_ms, 120_000);
         let cfg = Config::from_toml_str("[embedding]\nbulk_embed_deadline_ms = 0\n").unwrap();
@@ -3937,7 +3965,7 @@ mod tests {
         ("vector", 6),
         ("logs", 2),
         ("embedding", 22),
-        ("limits", 15),
+        ("limits", 16),
         ("indexing", 3),
         ("engine", 6),
         ("cluster", 5),
@@ -3992,7 +4020,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 139,
+            total, 140,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

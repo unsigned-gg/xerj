@@ -258,6 +258,9 @@ pub struct ResourceGovernor {
     bulk_pool: Arc<Semaphore>,
     /// Configured bulk permit count (for observability / stats).
     max_concurrent_bulks: usize,
+    /// How long a `_bulk` waits for a permit before it is refused
+    /// (`limits.bulk_admission_wait_ms`).
+    bulk_admission_wait: Duration,
 
     // ── item 3: disk flood-stage write block ────────────────────────────
     /// Configured used-percentage watermark from startup config. `0` = the
@@ -711,6 +714,28 @@ impl ResourceGovernor {
             .acquire_owned()
             .await
             .map_err(|_| XerjError::internal("global bulk pool closed — shutting down"))
+    }
+
+    /// [`Self::acquire_bulk`] bounded by `d`. A pool that stays saturated for
+    /// the whole wait is a refusal the caller turns into a whole-request HTTP
+    /// 429, not a hang that outlasts the client's timeout.
+    pub async fn acquire_bulk_timeout(
+        &self,
+        d: Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, BulkAdmissionError> {
+        match tokio::time::timeout(d, self.acquire_bulk()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(closed)) => Err(BulkAdmissionError::Closed(closed)),
+            Err(_) => Err(BulkAdmissionError::Timeout(BulkAdmissionTimeout {
+                waited: d,
+                retry_after_secs: BULK_ADMISSION_RETRY_AFTER_SECS,
+            })),
+        }
+    }
+
+    /// The configured permit wait (`limits.bulk_admission_wait_ms`).
+    pub fn bulk_admission_wait(&self) -> Duration {
+        self.bulk_admission_wait
     }
 
     /// Configured global bulk-concurrency cap.
@@ -1327,6 +1352,27 @@ pub fn init(config: &Config) -> Arc<ResourceGovernor> {
 /// construct an [`crate::index::Index`] directly (never calling
 /// `Engine::new`) get `None` and skip all admission checks — behaviour is
 /// unchanged for them.
+/// `Retry-After` for a bulk refused at the pool. The wait has already been
+/// spent, and the pool drains as the running bulks finish, so a short pause
+/// before asking again is enough.
+pub const BULK_ADMISSION_RETRY_AFTER_SECS: u64 = 5;
+
+/// A `_bulk` that waited `waited` for a pool permit and did not get one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkAdmissionTimeout {
+    pub waited: Duration,
+    pub retry_after_secs: u64,
+}
+
+/// Why [`ResourceGovernor::acquire_bulk_timeout`] gave no permit.
+#[derive(Debug)]
+pub enum BulkAdmissionError {
+    /// Every permit stayed taken for the whole wait.
+    Timeout(BulkAdmissionTimeout),
+    /// The pool is closed: the process is shutting down.
+    Closed(XerjError),
+}
+
 pub fn global() -> Option<Arc<ResourceGovernor>> {
     GOVERNOR.get().map(Arc::clone)
 }
@@ -1529,6 +1575,7 @@ fn build(config: &Config) -> ResourceGovernor {
         search_inflight_peak: Arc::new(AtomicU64::new(0)),
         bulk_pool: Arc::new(Semaphore::new(max_concurrent_bulks)),
         max_concurrent_bulks,
+        bulk_admission_wait: Duration::from_millis(limits.bulk_admission_wait_ms),
         disk_flood_pct_default: limits.disk_flood_stage_percent.min(100),
         disk_flood_pct: AtomicU8::new(limits.disk_flood_stage_percent.min(100)),
         disk_threshold_enabled: AtomicBool::new(true),
@@ -3531,5 +3578,32 @@ mod tests {
         assert!(g.check_ingest_admission().is_err());
         g.refresh(0, raised * 98 / 100, 0);
         assert!(g.check_ingest_admission().is_err());
+    }
+
+    /// With every bulk permit taken, `acquire_bulk_timeout` returns the typed
+    /// timeout after about `d`; once a permit is released it succeeds.
+    #[tokio::test]
+    async fn acquire_bulk_timeout_refuses_after_the_wait_when_the_pool_is_full() {
+        let governor = build(&Config::default());
+        let mut held = Vec::new();
+        for _ in 0..governor.max_concurrent_bulks() {
+            held.push(governor.acquire_bulk().await.unwrap());
+        }
+        let wait = Duration::from_millis(120);
+        let t = Instant::now();
+        let err = governor.acquire_bulk_timeout(wait).await.unwrap_err();
+        let elapsed = t.elapsed();
+        match err {
+            BulkAdmissionError::Timeout(t) => {
+                assert_eq!(t.waited, wait);
+                assert_eq!(t.retry_after_secs, BULK_ADMISSION_RETRY_AFTER_SECS);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(elapsed >= wait, "returned early: {elapsed:?}");
+        assert!(elapsed < wait * 20, "did not honour the bound: {elapsed:?}");
+
+        held.pop();
+        assert!(governor.acquire_bulk_timeout(wait).await.is_ok());
     }
 }

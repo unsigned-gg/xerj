@@ -97,6 +97,8 @@ pub struct Metrics {
     /// Wall time of one neural embedding window (inference only, queue wait
     /// excluded) in seconds.
     pub embed_window_seconds: Histogram,
+    /// Seconds a `_bulk` waited for a bulk-pool permit.
+    pub bulk_admission_wait_seconds: Histogram,
 
     // ── Per-operation histograms ──────────────────────────────────────────────
     /// Query latency in seconds, labelled by query type.
@@ -117,6 +119,8 @@ pub struct Metrics {
     pub embed_passages_per_second: Gauge,
     /// `_bulk` requests currently holding a bulk-pool permit.
     pub bulks_in_flight: IntGauge,
+    /// `_bulk` admission decisions, by `decision` (admit, timeout).
+    pub bulk_admission_total: IntCounterVec,
 
     // ── Query cache (RC4-W4 item 4) ───────────────────────────────────────────
     /// Cumulative internal query-result cache hits across all indices. Exposed
@@ -257,6 +261,18 @@ impl Metrics {
         )
         .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
 
+        // Permit waits: 1ms -> ~16 min covers a free pool up to the 600 s cap.
+        let bulk_admission_wait_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "xerj_bulk_admission_wait_seconds",
+                "Seconds a _bulk request waited for a bulk-pool permit",
+            )
+            .buckets(
+                exponential_buckets(0.001, 4.0, 10).expect("bulk admission bucket config is valid"),
+            ),
+        )
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
         let query_latency_by_type = HistogramVec::new(
             histogram_opts!(
                 "xerj_query_latency_by_type_seconds",
@@ -308,6 +324,15 @@ impl Metrics {
             "xerj_bulks_in_flight",
             "Number of _bulk requests currently holding a bulk-pool permit",
         ))
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
+        let bulk_admission_total = IntCounterVec::new(
+            Opts::new(
+                "xerj_bulk_admission_total",
+                "_bulk admission decisions, by decision (admit, timeout)",
+            ),
+            &["decision"],
+        )
         .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
 
         let query_cache_hits = IntGauge::with_opts(Opts::new(
@@ -368,6 +393,7 @@ impl Metrics {
         reg!(merge_duration);
         reg!(wal_write_latency);
         reg!(embed_window_seconds);
+        reg!(bulk_admission_wait_seconds);
         reg!(query_latency_by_type);
         reg!(segment_count);
         reg!(doc_count);
@@ -376,6 +402,7 @@ impl Metrics {
         reg!(wal_size_bytes);
         reg!(embed_passages_per_second);
         reg!(bulks_in_flight);
+        reg!(bulk_admission_total);
         reg!(query_cache_hits);
         reg!(query_cache_misses);
         reg!(rerank_requests);
@@ -396,6 +423,7 @@ impl Metrics {
             merge_duration,
             wal_write_latency,
             embed_window_seconds,
+            bulk_admission_wait_seconds,
             query_latency_by_type,
             segment_count,
             doc_count,
@@ -404,6 +432,7 @@ impl Metrics {
             wal_size_bytes,
             embed_passages_per_second,
             bulks_in_flight,
+            bulk_admission_total,
             query_cache_hits,
             query_cache_misses,
             rerank_requests,
@@ -572,6 +601,15 @@ impl Metrics {
         self.embed_passages_per_second.set(passages_per_second);
     }
 
+    /// Record one `_bulk` pool-permit decision (`admit` or `timeout`) and how
+    /// long the request waited for it.
+    pub fn observe_bulk_admission(&self, decision: &str, wait_secs: f64) {
+        self.bulk_admission_total
+            .with_label_values(&[decision])
+            .inc();
+        self.bulk_admission_wait_seconds.observe(wait_secs);
+    }
+
     /// Observe one WAL append (durability write) latency, in seconds.
     pub fn observe_wal_write(&self, secs: f64) {
         self.wal_write_latency.observe(secs);
@@ -641,6 +679,27 @@ mod tests {
             assert_eq!(m.active_searches.get(), 1);
         }
         assert_eq!(m.active_searches.get(), 0);
+    }
+
+    #[test]
+    fn bulk_admission_series_are_exposed_and_update() {
+        let m = Metrics::new().unwrap();
+        m.observe_bulk_admission("admit", 0.002);
+        m.observe_bulk_admission("timeout", 30.0);
+        m.observe_bulk_admission("timeout", 30.0);
+        let text = m.gather_text().unwrap();
+        assert!(
+            text.contains("xerj_bulk_admission_total{decision=\"admit\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("xerj_bulk_admission_total{decision=\"timeout\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("xerj_bulk_admission_wait_seconds_count 3"),
+            "{text}"
+        );
     }
 
     #[test]
