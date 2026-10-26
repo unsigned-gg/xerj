@@ -1696,7 +1696,8 @@ pub struct EmbeddingConfig {
     /// range: `1..=3600`). The backlog bound is this many seconds times the
     /// measured neural throughput in passages per second. A semantic bulk that
     /// would push the reserved, not-yet-embedded passages past it is refused
-    /// whole with HTTP 429 and a `Retry-After`. With no measured throughput
+    /// whole with HTTP 429 and a `Retry-After` (in cluster mode: one 429 item
+    /// per action in an items body, no header). With no measured throughput
     /// yet (cold start, or a non-neural backend) nothing is refused, and an
     /// empty backlog always admits.
     pub bulk_passage_budget_secs: u64,
@@ -1843,6 +1844,8 @@ pub struct LimitsConfig {
     /// answers HTTP 429 with an Elasticsearch-style error body and a
     /// `Retry-After` header, not a bulk items body, so a client backs off the
     /// whole request instead of retrying items it never sent.
+    /// In cluster mode the refusal reaches the client as one 429 item per action
+    /// inside an items body, with no `Retry-After` header.
     pub bulk_admission_wait_ms: u64,
     /// Filesystem locations under which a snapshot repository's `settings.location`
     /// is allowed to resolve (an ES `path.repo` equivalent). Empty (the default)

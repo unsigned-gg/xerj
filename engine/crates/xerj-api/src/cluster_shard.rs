@@ -3392,3 +3392,47 @@ pub(crate) async fn delete_by_query_on_primaries(
         "primary applied the delete but a replica copy missed quorum. The primary has the delete; retry the delete so an in-sync replica can take the copy",
     )
 }
+
+#[cfg(test)]
+mod bulk_refusal_tests {
+    use super::*;
+
+    fn piece(id: &str) -> BulkPiece {
+        BulkPiece {
+            action: "index".to_string(),
+            index: "docs".to_string(),
+            id: id.to_string(),
+            action_line: String::new(),
+            source_line: None,
+            preset: None,
+            concrete: "docs".to_string(),
+        }
+    }
+
+    /// A group the primary refused whole has no items. The merged response
+    /// must still carry one 429 item per action, or the client drops it.
+    #[test]
+    fn refused_group_expands_to_one_429_item_per_action() {
+        let pieces = vec![piece("a"), piece("b"), piece("c")];
+        let which = vec![0, 2];
+        let refused = xerj_engine::bulk::BulkRefusal {
+            reason: "embedding backlog: test".to_string(),
+            retry_after_secs: 7,
+        }
+        .into_result(Instant::now());
+        assert!(refused.items.is_empty());
+
+        let (items, wire) = align_group(&pieces, &which, refused, Vec::new());
+        assert_eq!(items.len(), which.len());
+        assert_eq!(wire.len(), which.len());
+        for (item, &at) in items.iter().zip(&which) {
+            assert_eq!(item.status, 429);
+            assert_eq!(item.id, pieces[at].id);
+            let reason = item.error.as_deref().unwrap();
+            assert!(
+                reason.starts_with("xerj_bulk_admission_exception: embedding backlog"),
+                "{reason}"
+            );
+        }
+    }
+}

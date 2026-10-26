@@ -1348,10 +1348,6 @@ pub fn init(config: &Config) -> Arc<ResourceGovernor> {
     governor
 }
 
-/// The installed governor, if [`init`] has run. Engine-only unit tests that
-/// construct an [`crate::index::Index`] directly (never calling
-/// `Engine::new`) get `None` and skip all admission checks — behaviour is
-/// unchanged for them.
 /// `Retry-After` for a bulk refused at the pool. The wait has already been
 /// spent, and the pool drains as the running bulks finish, so a short pause
 /// before asking again is enough.
@@ -1373,6 +1369,10 @@ pub enum BulkAdmissionError {
     Closed(XerjError),
 }
 
+/// The installed governor, if [`init`] has run. Engine-only unit tests that
+/// construct an [`crate::index::Index`] directly (never calling
+/// `Engine::new`) get `None` and skip all admission checks — behaviour is
+/// unchanged for them.
 pub fn global() -> Option<Arc<ResourceGovernor>> {
     GOVERNOR.get().map(Arc::clone)
 }

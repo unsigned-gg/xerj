@@ -57,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   glaeda. `/v1/metrics` gains `xerj_embed_passages_queued` and the `hold`
   value of `xerj_bulk_admission_total`. The new key raises the user-facing
   settings count to 141.
+  Cluster mode: a refused request answers one 429 item per action in an items
+  body, with no `Retry-After` header.
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
   prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.

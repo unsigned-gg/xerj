@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Vendored from cerebral-work/scorcher scorcher-admission/src/solver.rs (derived from
-// unsigned-gg/glaeda eb7088c), 2026-10-26.
+// unsigned-gg/glaeda eb7088c), 2026-10-26. See NOTICE.
 //
 //! Drum-Buffer-Rope admission arithmetic for the embedding backlog.
 //!

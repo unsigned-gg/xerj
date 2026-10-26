@@ -18935,11 +18935,16 @@ impl Index {
                 let (start, end, window_passages) = windows_ref[ordinal];
                 // A window is finished, embedded or refused, when this future
                 // ends: give its passages back to the admission backlog.
-                let _window_done = reservation.map(|(reserved, _)| WindowRelease {
+                let mut window_done = reservation.map(|(reserved, _)| WindowRelease {
                     reserved,
                     passages: window_passages as u64,
+                    armed: true,
                 });
                 if embed_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // Refused: the result loop releases this window.
+                    if let Some(done) = window_done.as_mut() {
+                        done.defuse();
+                    }
                     return Err(anyhow::Error::new(
                         xerj_ai::embedder::EmbeddingAdmissionError {
                             reason: "bulk embedding deadline reached before this window \
@@ -18948,9 +18953,19 @@ impl Index {
                         },
                     ));
                 }
-                embedder_ref
+                let result = embedder_ref
                     .embed_batch_gated(window_texts_ref(start, end))
-                    .await
+                    .await;
+                // Only a clean window releases itself. A failed or short one
+                // may be retried per item, so its passages stay reserved
+                // until the result loop has finished with it.
+                let clean = matches!(&result, Ok(v) if v.len() == window_passages);
+                if !clean {
+                    if let Some(done) = window_done.as_mut() {
+                        done.defuse();
+                    }
+                }
+                result
             };
             if dual_session_scheduler_enabled(
                 onnx_pinned,
@@ -19018,6 +19033,9 @@ impl Index {
                             admission_rejections[job.source_idx] = true;
                             failures[job.source_idx] = Some(format!("field [{}]: {e}", job.field));
                         }
+                        if let Some((reserved, _)) = reservation {
+                            reserved.release(passages as u64);
+                        }
                     }
                     batch_result => {
                         // Preserve per-item bulk behavior on a backend error:
@@ -19074,6 +19092,10 @@ impl Index {
                                         Some(format!("field [{}]: {e}", jobs[job_idx].field));
                                 }
                             }
+                        }
+                        // The window's passages were held through the retries.
+                        if let Some((reserved, _)) = reservation {
+                            reserved.release(passages as u64);
                         }
                     }
                 }
@@ -57682,20 +57704,31 @@ mod semantic_embedding_window_tests {
     }
 }
 
-/// The chunker used by the auto-embed-on-ingest path.
 /// Releases one embedding window's passages from the admission backlog when
 /// dropped, so a refused, failed or cancelled window gives them back too.
 struct WindowRelease<'a> {
     reserved: &'a crate::admission::PassageReservation,
     passages: u64,
+    armed: bool,
+}
+
+impl WindowRelease<'_> {
+    /// The window did not embed cleanly. Its passages stay reserved, because
+    /// the result loop retries or refuses the window and releases them then.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for WindowRelease<'_> {
     fn drop(&mut self) {
-        self.reserved.release(self.passages);
+        if self.armed {
+            self.reserved.release(self.passages);
+        }
     }
 }
 
+/// The chunker used by the auto-embed-on-ingest path.
 fn semantic_chunker() -> xerj_ai::TextChunker {
     xerj_ai::TextChunker::new(SEMANTIC_CHUNK_SIZE, SEMANTIC_CHUNK_OVERLAP)
 }

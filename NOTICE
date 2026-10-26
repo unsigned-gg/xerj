@@ -2,3 +2,8 @@ XERJ
 Copyright 2026 The XERJ Authors
 
 This product includes software developed by the XERJ project (https://xerj.org).
+
+engine/crates/xerj-engine/src/admission/dbr.rs is adapted from
+scorcher-admission src/solver.rs (cerebral-work/scorcher), licensed under the
+Apache License 2.0 (SPDX-License-Identifier: Apache-2.0). That file is derived
+from unsigned-gg/glaeda, branch unsigned, commit eb7088c.

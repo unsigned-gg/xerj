@@ -2877,14 +2877,6 @@ fn mapping_has_strict_date(props: &Value) -> bool {
     false
 }
 
-/// True when any field in the mapping is a `semantic_text` field. Such
-/// fields auto-embed their text into a companion `<field>_vector` at
-/// ingest, which only happens on the per-doc `index_document` path
-/// (`Index::apply_semantic_embeddings`). The turbo auto-id batch path
-/// stores the raw NDJSON bytes and never parses/embeds them, so an index
-/// with a `semantic_text` field MUST be routed through the per-doc path —
-/// otherwise auto-id bulk docs land with an empty vector column and
-/// `semantic`/`knn` search silently returns nothing.
 /// Top-level `semantic_text` field names of an index's mapping. Empty when the
 /// index has no mapping yet (a template-created index).
 fn semantic_text_field_names(engine: &Engine, index: &str) -> Vec<String> {
@@ -2944,6 +2936,14 @@ fn estimate_semantic_group_passages(
         .sum()
 }
 
+/// True when any field in the mapping is a `semantic_text` field. Such
+/// fields auto-embed their text into a companion `<field>_vector` at
+/// ingest, which only happens on the per-doc `index_document` path
+/// (`Index::apply_semantic_embeddings`). The turbo auto-id batch path
+/// stores the raw NDJSON bytes and never parses/embeds them, so an index
+/// with a `semantic_text` field MUST be routed through the per-doc path —
+/// otherwise auto-id bulk docs land with an empty vector column and
+/// `semantic`/`knn` search silently returns nothing.
 fn mapping_has_semantic_text(props: &Value) -> bool {
     let Some(obj) = props.as_object() else {
         return false;
@@ -3826,6 +3826,16 @@ mod semantic_lifecycle_tests {
     fn slow_embedding_server(
         delay: std::time::Duration,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        embedding_server(delay, 0)
+    }
+
+    /// [`slow_embedding_server`] whose first `fail_first` requests answer 400
+    /// at once. A 400 is not retried by the client, so the window fails and the
+    /// per-item retry runs.
+    fn embedding_server(
+        delay: std::time::Duration,
+        fail_first: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{Read, Write};
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3867,7 +3877,14 @@ mod semantic_lifecycle_tests {
                         serde_json::from_slice(&buf[body_start..body_start + content_length])
                             .unwrap();
                     let inputs = request["input"].as_array().map_or(0, Vec::len);
-                    counter.fetch_add(1, Ordering::SeqCst);
+                    let seen = counter.fetch_add(1, Ordering::SeqCst);
+                    if seen < fail_first {
+                        let _ = sock.write_all(
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\
+                              Connection: close\r\n\r\n",
+                        );
+                        return;
+                    }
                     std::thread::sleep(delay);
                     let data: Vec<Value> = (0..inputs)
                         .map(|i| json!({"index": i, "embedding": vec![0.25f64; 16]}))
@@ -3954,7 +3971,17 @@ mod semantic_lifecycle_tests {
         budget_secs: u64,
         window_passages: usize,
     ) -> (TempDir, Arc<Engine>) {
-        let (url, _calls) = slow_embedding_server(delay);
+        slow_semantic_engine_failing(name, delay, budget_secs, window_passages, 0).0
+    }
+
+    fn slow_semantic_engine_failing(
+        name: &str,
+        delay: std::time::Duration,
+        budget_secs: u64,
+        window_passages: usize,
+        fail_first: usize,
+    ) -> ((TempDir, Arc<Engine>), Arc<std::sync::atomic::AtomicUsize>) {
+        let (url, calls) = embedding_server(delay, fail_first);
         let dir = TempDir::new().unwrap();
         let mut config = Config::default();
         config.server.data_dir = dir.path().to_string_lossy().into_owned();
@@ -3980,7 +4007,7 @@ mod semantic_lifecycle_tests {
                 json!({"properties": {"content": {"type": "semantic_text"}}}),
             )
             .unwrap();
-        (dir, Arc::new(engine))
+        ((dir, Arc::new(engine)), calls)
     }
 
     fn semantic_body(name: &str, prefix: &str, docs: usize) -> String {
@@ -4051,6 +4078,38 @@ mod semantic_lifecycle_tests {
         assert!(retried.refusal.is_none(), "{retried:?}");
         assert!(retried.items.iter().all(|item| item.status == 201));
         assert_eq!(engine.passage_admission().queued(), 0);
+    }
+
+    /// A window that fails and is retried per item keeps its passages
+    /// reserved until the retries finish: the retries spend model time too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_window_stays_reserved_through_the_per_item_retry() {
+        use std::sync::atomic::Ordering;
+        let name = "semantic-dbr-retry";
+        let ((_dir, engine), calls) =
+            slow_semantic_engine_failing(name, std::time::Duration::from_millis(400), 60, 64, 1);
+        engine.passage_admission().set_service_rate_for_test(10.0);
+        let admission = Arc::clone(engine.passage_admission());
+
+        let task_engine = Arc::clone(&engine);
+        let body = semantic_body(name, "r", 4);
+        let task = tokio::spawn(async move { process_bulk(&task_engine, None, &body).await });
+        // Request 1 (the window) was refused with a 400; request 2 is the
+        // first per-item retry.
+        wait_until(|| calls.load(Ordering::SeqCst) >= 2).await;
+        assert_eq!(admission.queued(), 4, "retrying passages must stay in L");
+        let result = task.await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + 4,
+            "one failed window call, then one call per document"
+        );
+        assert!(
+            result.items.iter().all(|item| item.status == 201),
+            "{:?}",
+            result.items
+        );
+        assert_eq!(admission.queued(), 0);
     }
 
     /// A bulk dropped while its first embedding window is running (the client
