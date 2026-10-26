@@ -685,6 +685,8 @@ pub fn write_secret_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io
 #[derive(Clone)]
 pub struct Engine {
     config: Arc<Config>,
+    /// Reserved, not-yet-embedded passages of admitted semantic bulks.
+    passage_admission: Arc<crate::admission::PassageAdmission>,
     indices: Arc<DashMap<String, Arc<Index>>>,
     data_dir: PathBuf,
     /// alias_name → list of index names
@@ -1076,6 +1078,7 @@ impl Engine {
 
         let engine = Self {
             config: Arc::new(config),
+            passage_admission: crate::admission::PassageAdmission::new(),
             indices: Arc::new(DashMap::new()),
             data_dir: data_dir.clone(),
             aliases: Arc::new(DashMap::new()),
@@ -4342,6 +4345,11 @@ impl Engine {
 
         info!(name, "data stream deleted");
         Ok(())
+    }
+
+    /// The process-wide embedding backlog that `_bulk` admission checks.
+    pub fn passage_admission(&self) -> &Arc<crate::admission::PassageAdmission> {
+        &self.passage_admission
     }
 
     /// Return a reference to the engine configuration.

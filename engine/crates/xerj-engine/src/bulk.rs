@@ -1655,6 +1655,42 @@ pub async fn process_bulk_with_opts(
     }
     let parsed = non_index_actions;
 
+    // ── DBR passage-budget admission ─────────────────────────────────────
+    //
+    // Decided here, after grouping and before any group executes, so a held
+    // bulk has written nothing and the client can re-send the whole body. The
+    // cost is estimated from the raw bytes of each semantic field; the real
+    // chunk count replaces it once a group is chunked
+    // (`apply_semantic_embeddings_batch_reserved`).
+    let (passage_reservation, group_passage_estimates) = if semantic_index_batches.is_empty() {
+        (None, HashMap::new())
+    } else {
+        let estimates: HashMap<String, u64> = semantic_index_batches
+            .iter()
+            .map(|(index, batch)| {
+                (
+                    index.clone(),
+                    estimate_semantic_group_passages(engine, index, batch),
+                )
+            })
+            .collect();
+        let cost: u64 = estimates.values().sum();
+        let budget = engine.config().embedding.bulk_passage_budget_secs;
+        match engine.passage_admission().admit(cost, budget) {
+            Ok(reservation) => (Some(reservation), estimates),
+            Err(hold) => {
+                if let Some(m) = xerj_common::metrics::global_metrics() {
+                    m.count_bulk_admission("hold");
+                }
+                return BulkRefusal {
+                    reason: hold.reason,
+                    retry_after_secs: hold.retry_after_secs,
+                }
+                .into_result(started);
+            }
+        }
+    };
+
     let group_ms = t_group.elapsed().as_millis() as u64;
     let t_exec = std::time::Instant::now();
     // Time spent inside apply_semantic_embeddings_batch, summed over groups.
@@ -1695,6 +1731,15 @@ pub async fn process_bulk_with_opts(
         let idx = match engine.get_or_create_index(&index_name) {
             Ok(i) => i,
             Err(e) => {
+                // This group will not embed: give its share back now.
+                if let Some(reservation) = passage_reservation.as_ref() {
+                    reservation.release(
+                        group_passage_estimates
+                            .get(&index_name)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
                 for (item_idx, id, source) in batch {
                     if let Some(raw_memory) = semantic_raw_memory.as_mut() {
                         release_raw_owner(raw_memory, source);
@@ -1784,7 +1829,18 @@ pub async fn process_bulk_with_opts(
         // scratch are not yet logically attributed. Their effect remains
         // visible only as allocator/RSS physical delta; it is not zero.
         let t_embed = std::time::Instant::now();
-        let prepared = idx.apply_semantic_embeddings_batch(valid_sources).await;
+        let group_estimate = group_passage_estimates
+            .get(&index_name)
+            .copied()
+            .unwrap_or(0);
+        let prepared = idx
+            .apply_semantic_embeddings_batch_reserved(
+                valid_sources,
+                passage_reservation
+                    .as_ref()
+                    .map(|reservation| (reservation, group_estimate)),
+            )
+            .await;
         embed_ms += t_embed.elapsed().as_millis() as u64;
         #[cfg(test)]
         let _ = semantic_lifecycle_hook(&index_name, SemanticLifecyclePoint::Prepared);
@@ -2829,6 +2885,65 @@ fn mapping_has_strict_date(props: &Value) -> bool {
 /// with a `semantic_text` field MUST be routed through the per-doc path —
 /// otherwise auto-id bulk docs land with an empty vector column and
 /// `semantic`/`knn` search silently returns nothing.
+/// Top-level `semantic_text` field names of an index's mapping. Empty when the
+/// index has no mapping yet (a template-created index).
+fn semantic_text_field_names(engine: &Engine, index: &str) -> Vec<String> {
+    let Some(mapping) = engine.index_mappings.get(index) else {
+        return Vec::new();
+    };
+    let props = mapping.get("properties").or_else(|| {
+        mapping
+            .get("mappings")
+            .and_then(|mappings| mappings.get("properties"))
+    });
+    props
+        .and_then(Value::as_object)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(_, spec)| {
+                    spec.get("type").and_then(Value::as_str) == Some("semantic_text")
+                })
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Estimated embedding passages for one index group of a bulk: per document
+/// `max(1, sum over its semantic fields of ceil(bytes / 448))`. It reads the
+/// top-level keys of the raw document without building a `Value`. With no
+/// mapped semantic field known (template-created index) the whole document
+/// counts as the field, an upper bound that the real chunk count corrects.
+fn estimate_semantic_group_passages(
+    engine: &Engine,
+    index: &str,
+    batch: &[(usize, Option<String>, std::sync::Arc<[u8]>)],
+) -> u64 {
+    use serde_json::value::RawValue;
+    let fields = semantic_text_field_names(engine, index);
+    batch
+        .iter()
+        .map(|(_, _, bytes)| {
+            if fields.is_empty() {
+                return crate::admission::estimate_passages(bytes.len() as u64);
+            }
+            let Ok(doc) = serde_json::from_slice::<HashMap<&str, &RawValue>>(bytes) else {
+                return 1;
+            };
+            let passages: u64 = fields
+                .iter()
+                .filter_map(|field| doc.get(field.as_str()))
+                .filter(|raw| raw.get().starts_with('"'))
+                // JSON text length less the two quotes; escapes make it an
+                // upper bound of the decoded text.
+                .map(|raw| crate::admission::estimate_passages(raw.get().len() as u64 - 2))
+                .sum();
+            passages.max(1)
+        })
+        .sum()
+}
+
 fn mapping_has_semantic_text(props: &Value) -> bool {
     let Some(obj) = props.as_object() else {
         return false;
@@ -3829,6 +3944,134 @@ mod semantic_lifecycle_tests {
             "only the first window may reach the backend; rejected windows must not \
              be retried per item"
         );
+    }
+
+    /// Proxy-mode semantic index named `name` whose embeddings come from a
+    /// server that answers after `delay`; one window holds every passage.
+    fn slow_semantic_engine(
+        name: &str,
+        delay: std::time::Duration,
+        budget_secs: u64,
+        window_passages: usize,
+    ) -> (TempDir, Arc<Engine>) {
+        let (url, _calls) = slow_embedding_server(delay);
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.embedding.mode = "proxy".into();
+        config.embedding.default_endpoint = url;
+        config.embedding.default_model = "m".into();
+        config.embedding.bulk_passage_budget_secs = budget_secs;
+        config.embedding.onnx_scheduling_window = window_passages;
+        let engine = Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut field = FieldConfig::new("content", FieldType::Text);
+        field.options.dimensions = Some(16);
+        field.embedding = Some(EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("content_vector".into()),
+        });
+        schema.fields.push(field);
+        engine.create_index(name, schema).unwrap();
+        engine
+            .put_index_mapping(
+                name,
+                json!({"properties": {"content": {"type": "semantic_text"}}}),
+            )
+            .unwrap();
+        (dir, Arc::new(engine))
+    }
+
+    fn semantic_body(name: &str, prefix: &str, docs: usize) -> String {
+        let mut body = String::new();
+        for i in 0..docs {
+            body.push_str(&format!(
+                "{{\"index\":{{\"_index\":\"{name}\",\"_id\":\"{prefix}{i}\"}}}}\n\
+                 {{\"content\":\"short document number {i}\"}}\n"
+            ));
+        }
+        body
+    }
+
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached in 2 s");
+    }
+
+    /// With the model at 10 passages/s and a 1 s budget (rope of 10), the
+    /// second concurrent semantic bulk is refused whole while the first
+    /// proceeds: no items, a Retry-After from the excess backlog, nothing
+    /// written. Once the first finishes the same body is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn second_concurrent_semantic_bulk_is_held_with_retry_after() {
+        let name = "semantic-dbr-hold";
+        let (_dir, engine) =
+            slow_semantic_engine(name, std::time::Duration::from_millis(600), 1, 64);
+        engine.passage_admission().set_service_rate_for_test(10.0);
+
+        let first_engine = Arc::clone(&engine);
+        let first_body = semantic_body(name, "a", 12);
+        let first =
+            tokio::spawn(async move { process_bulk(&first_engine, None, &first_body).await });
+        let admission = Arc::clone(engine.passage_admission());
+        wait_until(|| admission.queued() == 12).await;
+
+        let held = process_bulk(&engine, None, &semantic_body(name, "b", 12)).await;
+        let refusal = held.refusal.as_ref().expect("second bulk must be refused");
+        // 12 queued + 12 asked = 24; 14 over the rope of 10 at 10/s -> 2 s.
+        assert_eq!(refusal.retry_after_secs, 2, "{refusal:?}");
+        assert!(
+            refusal.reason.starts_with("embedding backlog"),
+            "{}",
+            refusal.reason
+        );
+        assert!(held.items.is_empty() && held.errors);
+        assert_eq!(
+            engine.passage_admission().queued(),
+            12,
+            "a hold reserves nothing"
+        );
+
+        let first = first.await.unwrap();
+        assert!(first.refusal.is_none());
+        assert!(
+            first.items.iter().all(|item| item.status == 201),
+            "{:?}",
+            first.items
+        );
+        assert_eq!(engine.passage_admission().queued(), 0);
+
+        let retried = process_bulk(&engine, None, &semantic_body(name, "b", 12)).await;
+        assert!(retried.refusal.is_none(), "{retried:?}");
+        assert!(retried.items.iter().all(|item| item.status == 201));
+        assert_eq!(engine.passage_admission().queued(), 0);
+    }
+
+    /// A bulk dropped while its first embedding window is running (the client
+    /// went away) releases its reservation, so the backlog returns to zero.
+    /// Three windows of four passages: the running one is released by its own
+    /// guard, the two that never started only by the reservation's drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_semantic_bulk_returns_the_backlog_to_zero() {
+        let name = "semantic-dbr-cancel";
+        let (_dir, engine) =
+            slow_semantic_engine(name, std::time::Duration::from_millis(800), 60, 4);
+        engine.passage_admission().set_service_rate_for_test(10.0);
+        let admission = Arc::clone(engine.passage_admission());
+
+        let task_engine = Arc::clone(&engine);
+        let body = semantic_body(name, "c", 12);
+        let task = tokio::spawn(async move { process_bulk(&task_engine, None, &body).await });
+        wait_until(|| admission.queued() == 12).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        wait_until(|| admission.queued() == 0).await;
     }
 
     #[tokio::test]

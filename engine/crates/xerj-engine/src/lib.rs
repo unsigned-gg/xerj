@@ -16,6 +16,7 @@
 // internals.
 #![allow(clippy::type_complexity)]
 
+pub mod admission;
 pub mod aggs;
 pub mod audit;
 pub mod bulk;

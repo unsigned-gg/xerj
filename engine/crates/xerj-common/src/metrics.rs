@@ -119,8 +119,10 @@ pub struct Metrics {
     pub embed_passages_per_second: Gauge,
     /// `_bulk` requests currently holding a bulk-pool permit.
     pub bulks_in_flight: IntGauge,
-    /// `_bulk` admission decisions, by `decision` (admit, timeout).
+    /// `_bulk` admission decisions, by `decision` (admit, timeout, hold).
     pub bulk_admission_total: IntCounterVec,
+    /// Passages reserved by admitted semantic bulks and not yet embedded.
+    pub embed_passages_queued: IntGauge,
 
     // ── Query cache (RC4-W4 item 4) ───────────────────────────────────────────
     /// Cumulative internal query-result cache hits across all indices. Exposed
@@ -329,10 +331,16 @@ impl Metrics {
         let bulk_admission_total = IntCounterVec::new(
             Opts::new(
                 "xerj_bulk_admission_total",
-                "_bulk admission decisions, by decision (admit, timeout)",
+                "_bulk admission decisions, by decision (admit, timeout, hold)",
             ),
             &["decision"],
         )
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
+        let embed_passages_queued = IntGauge::with_opts(Opts::new(
+            "xerj_embed_passages_queued",
+            "Passages reserved by admitted semantic bulks and not yet embedded",
+        ))
         .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
 
         let query_cache_hits = IntGauge::with_opts(Opts::new(
@@ -403,6 +411,7 @@ impl Metrics {
         reg!(embed_passages_per_second);
         reg!(bulks_in_flight);
         reg!(bulk_admission_total);
+        reg!(embed_passages_queued);
         reg!(query_cache_hits);
         reg!(query_cache_misses);
         reg!(rerank_requests);
@@ -433,6 +442,7 @@ impl Metrics {
             embed_passages_per_second,
             bulks_in_flight,
             bulk_admission_total,
+            embed_passages_queued,
             query_cache_hits,
             query_cache_misses,
             rerank_requests,
@@ -604,10 +614,15 @@ impl Metrics {
     /// Record one `_bulk` pool-permit decision (`admit` or `timeout`) and how
     /// long the request waited for it.
     pub fn observe_bulk_admission(&self, decision: &str, wait_secs: f64) {
+        self.count_bulk_admission(decision);
+        self.bulk_admission_wait_seconds.observe(wait_secs);
+    }
+
+    /// Count one `_bulk` admission decision that had no permit wait (`hold`).
+    pub fn count_bulk_admission(&self, decision: &str) {
         self.bulk_admission_total
             .with_label_values(&[decision])
             .inc();
-        self.bulk_admission_wait_seconds.observe(wait_secs);
     }
 
     /// Observe one WAL append (durability write) latency, in seconds.
@@ -699,6 +714,18 @@ mod tests {
         assert!(
             text.contains("xerj_bulk_admission_wait_seconds_count 3"),
             "{text}"
+        );
+        m.count_bulk_admission("hold");
+        m.embed_passages_queued.set(7);
+        let text = m.gather_text().unwrap();
+        assert!(
+            text.contains("xerj_bulk_admission_total{decision=\"hold\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("xerj_embed_passages_queued 7"), "{text}");
+        assert!(
+            text.contains("xerj_bulk_admission_wait_seconds_count 3"),
+            "a hold has no permit wait to observe: {text}"
         );
     }
 

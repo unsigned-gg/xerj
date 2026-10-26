@@ -2327,6 +2327,21 @@ async fn handle_bulk(
     }
     let opts = bulk_opts_from_parts(require_alias, default_pipeline, default_source_req_json);
     let (result, wire) = run_primary_bulk(state, body, default_index, opts).await;
+    // Tell the accepting node this was a whole-request refusal: its items are
+    // empty and `PrimaryBulkReply` has no field for the refusal.
+    if let Some(refusal) = &result.refusal {
+        return ShardResult::http(
+            429,
+            json!({
+                "error": {
+                    "type": "xerj_bulk_admission_exception",
+                    "reason": format!("xerj_bulk_admission_exception: {}", refusal.reason),
+                },
+                "status": 429,
+            })
+            .to_string(),
+        );
+    }
     let reply = PrimaryBulkReply {
         took_ms: result.took_ms,
         errors: result.errors,
@@ -2459,6 +2474,17 @@ fn align_group(
     Vec<xerj_engine::bulk::BulkItemResult>,
     Vec<Option<(u64, u64)>>,
 ) {
+    // A whole-request refusal has no items. Answer every action 429 so the
+    // merged response keeps one item per action and the client re-offers
+    // them, rather than a count mismatch it would drop.
+    if let Some(refusal) = &result.refusal {
+        return spread_group_failure(
+            pieces,
+            which,
+            429,
+            format!("xerj_bulk_admission_exception: {}", refusal.reason),
+        );
+    }
     if result.items.len() == which.len() {
         if wire.len() < which.len() {
             wire.resize(which.len(), None);

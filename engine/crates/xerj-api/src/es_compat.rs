@@ -50860,6 +50860,94 @@ mod search_actor_class_tests {
 #[cfg(test)]
 mod bulk_refusal_tests {
     use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    /// End to end through the router: with the embedding backlog full, a
+    /// semantic `_bulk` is answered 429 with an ES error body and an integer
+    /// `Retry-After`, and writes nothing. Releasing the backlog admits it.
+    #[tokio::test]
+    async fn bulk_over_the_embedding_budget_is_a_429_through_the_router() {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        let state = AppState::new(config, engine, metrics);
+        let app = crate::router::build_es_compat_router(state.clone());
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::put("/sem-admission")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {"content": {"type": "semantic_text"}}}})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // mu = 10 passages/s, budget 60 s: rope 600. Park 700 passages.
+        let admission = state.engine.passage_admission().clone();
+        admission.set_service_rate_for_test(10.0);
+        let parked = admission.admit(700, 60).expect("empty backlog admits");
+
+        let bulk = "{\"index\":{\"_index\":\"sem-admission\",\"_id\":\"1\"}}\n\
+                    {\"content\":\"one short document\"}\n";
+        let send = |app: axum::Router| async move {
+            app.oneshot(
+                Request::post("/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(bulk))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let refused = send(app.clone()).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 700 queued + 1 asked = 701; 101 over the rope at 10/s -> 11 s.
+        assert_eq!(
+            refused
+                .headers()
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "11"
+        );
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 429);
+        assert_eq!(body["error"]["type"], "xerj_bulk_admission_exception");
+        assert!(body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("embedding backlog"));
+        assert!(
+            body.get("items").is_none(),
+            "a refusal is not a bulk items body"
+        );
+        assert_eq!(admission.queued(), 700, "a refusal reserves nothing");
+
+        drop(parked);
+        let admitted = send(app).await;
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(admitted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["items"].as_array().map(Vec::len), Some(1), "{body}");
+        assert_eq!(admission.queued(), 0);
+    }
 
     /// A whole-request refusal is a 429 with an ES error body and an integer
     /// `Retry-After`, never a bulk items body, and its text does not read as

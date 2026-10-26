@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1/metrics` gains `xerj_bulk_admission_total{decision}` and
   `xerj_bulk_admission_wait_seconds`. The new key raises the user-facing
   settings count to 140.
+- **Semantic `_bulk` requests are admitted against an embedding passage
+  budget.** New `[embedding] bulk_passage_budget_secs` (default `60`, range
+  `1..=3600`). The engine counts passages that admitted bulks reserved and the
+  model has not yet embedded, and refuses a bulk whole when that backlog plus
+  its own estimated passages would exceed the budget times the measured neural
+  throughput. The refusal is the same HTTP 429 with `Retry-After` as the
+  bulk-slot refusal, so a client backs off and re-sends the whole request.
+  The check runs once per request, before any index group is written, and
+  the estimate is replaced by the real chunk count per index group within a
+  bulk. Nothing is refused before a throughput has been measured, and an empty
+  backlog always admits. The admission arithmetic (Little's Law, utilization,
+  rope) is vendored from scorcher-admission under Apache-2.0, derived from
+  glaeda. `/v1/metrics` gains `xerj_embed_passages_queued` and the `hold`
+  value of `xerj_bulk_admission_total`. The new key raises the user-facing
+  settings count to 141.
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
   prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.

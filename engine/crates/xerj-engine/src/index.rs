@@ -18697,7 +18697,21 @@ impl Index {
     /// not turn otherwise valid bulk items into failures.
     pub(crate) async fn apply_semantic_embeddings_batch(
         &self,
+        sources: Vec<Value>,
+    ) -> Vec<Result<Value>> {
+        self.apply_semantic_embeddings_batch_reserved(sources, None)
+            .await
+    }
+
+    /// [`Self::apply_semantic_embeddings_batch`] for a `_bulk` that reserved
+    /// its passages at admission. `reservation` is `(handle, estimate)`: once
+    /// the documents are chunked the estimate is replaced by the real passage
+    /// count, and each finished window releases its passages. Callers without
+    /// a reservation (single-document writes) pass `None` and are not counted.
+    pub(crate) async fn apply_semantic_embeddings_batch_reserved(
+        &self,
         mut sources: Vec<Value>,
+        reservation: Option<(&crate::admission::PassageReservation, u64)>,
     ) -> Vec<Result<Value>> {
         // Budget for starting embedding windows. Captured first so schema
         // reads and chunking count against it.
@@ -18851,6 +18865,13 @@ impl Index {
             }
         }
 
+        // Real passage count, now that every document is chunked: replace the
+        // admission estimate with it. Sources that fail before embedding have
+        // no job, so their share is released here.
+        if let Some((reserved, estimated)) = reservation {
+            reserved.settle(estimated, jobs.iter().map(|j| j.texts.len() as u64).sum());
+        }
+
         let mut outputs: Vec<Option<Vec<Vec<f32>>>> = vec![None; jobs.len()];
         let mut failures = pre_failures;
         let mut admission_rejections = vec![false; sources.len()];
@@ -18911,7 +18932,13 @@ impl Index {
             let windows_ref = &windows;
             let window_texts_ref = &window_texts;
             let launch = move |ordinal: usize| async move {
-                let (start, end, _passages) = windows_ref[ordinal];
+                let (start, end, window_passages) = windows_ref[ordinal];
+                // A window is finished, embedded or refused, when this future
+                // ends: give its passages back to the admission backlog.
+                let _window_done = reservation.map(|(reserved, _)| WindowRelease {
+                    reserved,
+                    passages: window_passages as u64,
+                });
                 if embed_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                     return Err(anyhow::Error::new(
                         xerj_ai::embedder::EmbeddingAdmissionError {
@@ -57656,6 +57683,19 @@ mod semantic_embedding_window_tests {
 }
 
 /// The chunker used by the auto-embed-on-ingest path.
+/// Releases one embedding window's passages from the admission backlog when
+/// dropped, so a refused, failed or cancelled window gives them back too.
+struct WindowRelease<'a> {
+    reserved: &'a crate::admission::PassageReservation,
+    passages: u64,
+}
+
+impl Drop for WindowRelease<'_> {
+    fn drop(&mut self) {
+        self.reserved.release(self.passages);
+    }
+}
+
 fn semantic_chunker() -> xerj_ai::TextChunker {
     xerj_ai::TextChunker::new(SEMANTIC_CHUNK_SIZE, SEMANTIC_CHUNK_OVERLAP)
 }
