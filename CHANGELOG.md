@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (smoothed neural throughput) and `xerj_bulks_in_flight` (bulk requests
   holding a pool permit). The two new keys raise the user-facing settings
   count from 137 to 139.
+- **`_bulk` refuses a whole request when no bulk slot frees up.** New
+  `[limits] bulk_admission_wait_ms` (default `30000`, range `1000..=600000`)
+  bounds the wait for one of the global bulk-pool permits. On timeout the
+  server answers HTTP 429 with an Elasticsearch-style error body of type
+  `xerj_bulk_admission_exception` and a `Retry-After` header, instead of
+  waiting without limit. It is not a bulk items body, because the autoindex
+  client drops a bulk response whose item count differs from its request.
+  `/v1/metrics` gains `xerj_bulk_admission_total{decision}` and
+  `xerj_bulk_admission_wait_seconds`. The new key raises the user-facing
+  settings count to 140.
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
   prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.

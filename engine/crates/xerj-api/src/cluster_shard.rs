@@ -2418,6 +2418,7 @@ async fn execute_owner_group(
                             .map(|item| item.map(|wire| (wire.version, wire.seq_no)))
                             .collect();
                         let result = xerj_engine::bulk::BulkResult {
+                            refusal: None,
                             took_ms: reply.took_ms,
                             errors: reply.errors,
                             items: reply.items,
@@ -2602,6 +2603,7 @@ pub(crate) async fn bulk_on_primaries(
         .any(|item| item.error.is_some() || !(200..300).contains(&item.status));
     (
         xerj_engine::bulk::BulkResult {
+            refusal: None,
             took_ms: started.elapsed().as_millis() as u64,
             errors,
             items,

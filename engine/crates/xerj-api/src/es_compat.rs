@@ -20731,6 +20731,13 @@ async fn process_bulk_body(
             Vec::new(),
         )
     };
+    // A whole-request refusal (no bulk slot, or an embedding backlog) is an
+    // HTTP 429 with an ES error body, not a bulk items body: the autoindex
+    // client drops a bulk response whose item count differs from its request,
+    // and backs off a non-bulk 429 as a plain throttle.
+    if let Some(refusal) = &result.refusal {
+        return bulk_refusal_response(refusal);
+    }
     let took_ms = result.took_ms;
     let errors = result.errors;
 
@@ -45542,6 +45549,30 @@ fn scroll_window_exceeded(total: u64, cap: usize) -> axum::response::Response {
         .into_response()
 }
 
+/// Whole-request `_bulk` refusal: HTTP 429, an ES-shaped error body and a
+/// `Retry-After` header in integer seconds. `reason` must not contain the
+/// memory-breaker phrases the autoindex client special-cases.
+fn bulk_refusal_response(refusal: &xerj_engine::bulk::BulkRefusal) -> axum::response::Response {
+    let reason = format!("xerj_bulk_admission_exception: {}", refusal.reason);
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": {
+                "root_cause": [{ "type": "xerj_bulk_admission_exception", "reason": reason }],
+                "type": "xerj_bulk_admission_exception",
+                "reason": reason,
+            },
+            "status": 429,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(refusal.retry_after_secs),
+    );
+    response
+}
+
 /// ES-shaped 429 for exceeding the open-scroll-contexts cap (RC4
 /// blocker 11). Mirrors ES's `search.max_open_scroll_context` rejection
 /// text, naming xerj's own setting key.
@@ -50823,5 +50854,49 @@ mod search_actor_class_tests {
         // A catalog-named DATA index must not be caught by the exact-name
         // match — only the maintenance index itself is machine.
         assert_eq!(search_actor_class(10, "autoindex-catalog-copy"), "user");
+    }
+}
+
+#[cfg(test)]
+mod bulk_refusal_tests {
+    use super::*;
+
+    /// A whole-request refusal is a 429 with an ES error body and an integer
+    /// `Retry-After`, never a bulk items body, and its text does not read as
+    /// the parent memory breaker to the autoindex client.
+    #[tokio::test]
+    async fn bulk_refusal_is_a_429_with_an_es_error_body_and_retry_after() {
+        let response = bulk_refusal_response(&xerj_engine::bulk::BulkRefusal {
+            reason: "all 8 bulk slots stayed busy for 30000 ms; retry the whole request".into(),
+            retry_after_secs: 5,
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "5"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], 429);
+        assert_eq!(body["error"]["type"], "xerj_bulk_admission_exception");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"],
+            "xerj_bulk_admission_exception"
+        );
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("xerj_bulk_admission_exception: "),
+            "{reason}"
+        );
+        assert!(body.get("items").is_none() && body.get("errors").is_none());
+        assert!(!reason.contains("circuit breaker"), "{reason}");
+        assert!(!reason.contains("memtable byte budget"), "{reason}");
     }
 }

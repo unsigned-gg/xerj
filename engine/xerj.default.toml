@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 59 of XERJ's 139 user-facing settings to their
+# This file sets 59 of XERJ's 140 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -492,7 +492,7 @@ timeout_ms = 5000
 # 0 turns the deadline off. Default: 120000.
 # bulk_embed_deadline_ms = 120000
 
-# ── Resource Limits (7 of 15 settings) ────────────────────────────────────────
+# ── Resource Limits (7 of 16 settings) ────────────────────────────────────────
 
 [limits]
 
@@ -527,6 +527,11 @@ max_fields_per_index = 500
 # fire. 50 000 actions × ~300 B ≈ 15 MiB — well bounded. Set to 0 to
 # disable the cap (not recommended in production).
 max_actions_per_bulk = 50000
+
+# How long (ms) a _bulk waits for one of the 8 global bulk-pool permits before
+# it is refused with HTTP 429, an Elasticsearch-style error body and a
+# Retry-After header. Range: 1000 - 600000. Default: 30000.
+# bulk_admission_wait_ms = 30000
 
 # Filesystem roots a snapshot repository's settings.location may resolve under
 # (an Elasticsearch path.repo equivalent). Empty = only data_dir is permitted.
