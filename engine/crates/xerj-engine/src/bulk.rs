@@ -489,6 +489,11 @@ pub async fn process_bulk_with_opts(
         },
         None => None,
     };
+    // Mirrors the permits held in the bulk pool: counted while the permit is.
+    let _bulk_in_flight = _bulk_permit
+        .is_some()
+        .then(|| xerj_common::metrics::global_metrics().map(|m| m.bulk_in_flight_guard()))
+        .flatten();
 
     let t_lines = std::time::Instant::now();
     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1596,6 +1601,8 @@ pub async fn process_bulk_with_opts(
 
     let group_ms = t_group.elapsed().as_millis() as u64;
     let t_exec = std::time::Instant::now();
+    // Time spent inside apply_semantic_embeddings_batch, summed over groups.
+    let mut embed_ms = 0u64;
 
     // ── semantic_text index actions: cross-document embedding windows ────
     //
@@ -1720,7 +1727,9 @@ pub async fn process_bulk_with_opts(
         // Backend-owned chunk strings, tokenizer tensors, and inference
         // scratch are not yet logically attributed. Their effect remains
         // visible only as allocator/RSS physical delta; it is not zero.
+        let t_embed = std::time::Instant::now();
         let prepared = idx.apply_semantic_embeddings_batch(valid_sources).await;
+        embed_ms += t_embed.elapsed().as_millis() as u64;
         #[cfg(test)]
         let _ = semantic_lifecycle_hook(&index_name, SemanticLifecyclePoint::Prepared);
         let mut valid_memory = valid_memory.map(Vec::into_iter);
@@ -2470,12 +2479,13 @@ pub async fn process_bulk_with_opts(
     // THROWAWAY prof (XERJ_PROF): whole-request bulk attribution.
     if std::env::var_os("XERJ_PROF").is_some() {
         eprintln!(
-            "XERJ_PROF bulk total_ms={} lines_ms={} parse_ms={} group_ms={} exec_ms={} n_lines={}",
+            "XERJ_PROF bulk total_ms={} lines_ms={} parse_ms={} group_ms={} exec_ms={} embed_ms={} n_lines={}",
             took_ms,
             lines_ms,
             parse_ms,
             group_ms,
             exec_ms,
+            embed_ms,
             lines.len()
         );
     }

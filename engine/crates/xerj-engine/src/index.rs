@@ -18834,13 +18834,10 @@ impl Index {
                 let (texts, offsets) = if chunks.len() <= 1 {
                     (vec![text.to_string()], vec![(0, text.len())])
                 } else {
-                    (
-                        chunks.iter().map(|c| c.text.clone()).collect(),
-                        chunks
-                            .iter()
-                            .map(|c| (c.start_offset, c.end_offset))
-                            .collect(),
-                    )
+                    chunks
+                        .into_iter()
+                        .map(|c| (c.text, (c.start_offset, c.end_offset)))
+                        .unzip()
                 };
                 jobs.push(EmbedJob {
                     source_idx,

@@ -1023,7 +1023,12 @@ impl NeuralHandle {
             let started = std::time::Instant::now();
             let result = model.embed_blocking(&texts);
             if result.is_ok() {
-                record_neural_window(passages, started.elapsed());
+                let elapsed = started.elapsed();
+                record_neural_window(passages, elapsed);
+                if let Some(metrics) = xerj_common::metrics::global_metrics() {
+                    metrics
+                        .observe_embed_window(elapsed.as_secs_f64(), neural_passages_per_second());
+                }
             }
             result
         })
@@ -1106,14 +1111,11 @@ mod neural_gate_tests {
     #[tokio::test]
     async fn second_concurrent_call_times_out_when_one_permit() {
         let gate = NeuralGate::new(1, Duration::from_millis(50));
-        let (first, second) = tokio::join!(
-            fake_embed(&gate, Duration::from_millis(400)),
-            async {
-                // Let the first call take the only slot.
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                fake_embed(&gate, Duration::from_millis(1)).await
-            }
-        );
+        let (first, second) = tokio::join!(fake_embed(&gate, Duration::from_millis(400)), async {
+            // Let the first call take the only slot.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            fake_embed(&gate, Duration::from_millis(1)).await
+        });
         first.expect("the call holding the slot succeeds");
         let err = second.expect_err("the second call must be refused");
         assert!(

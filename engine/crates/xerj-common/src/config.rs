@@ -3836,7 +3836,9 @@ mod tests {
             Config::from_toml_str(&format!(
                 "[embedding]\nneural_max_inflight_calls = {value}\n"
             ))
-            .expect_err(&format!("neural_max_inflight_calls={value} must be rejected"));
+            .expect_err(&format!(
+                "neural_max_inflight_calls={value} must be rejected"
+            ));
         }
     }
 

@@ -21,7 +21,7 @@
 //! ```
 
 use prometheus::{
-    exponential_buckets, histogram_opts, Histogram, HistogramOpts, HistogramVec, IntCounter,
+    exponential_buckets, histogram_opts, Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, Opts, Registry,
 };
 
@@ -94,6 +94,9 @@ pub struct Metrics {
     pub merge_duration: Histogram,
     /// WAL write latency in seconds.
     pub wal_write_latency: Histogram,
+    /// Wall time of one neural embedding window (inference only, queue wait
+    /// excluded) in seconds.
+    pub embed_window_seconds: Histogram,
 
     // ── Per-operation histograms ──────────────────────────────────────────────
     /// Query latency in seconds, labelled by query type.
@@ -110,6 +113,10 @@ pub struct Metrics {
     pub active_searches: IntGauge,
     /// Size of the WAL on disk in bytes.
     pub wal_size_bytes: IntGauge,
+    /// Smoothed neural embedding throughput in passages per second (EWMA).
+    pub embed_passages_per_second: Gauge,
+    /// `_bulk` requests currently holding a bulk-pool permit.
+    pub bulks_in_flight: IntGauge,
 
     // ── Query cache (RC4-W4 item 4) ───────────────────────────────────────────
     /// Cumulative internal query-result cache hits across all indices. Exposed
@@ -239,6 +246,17 @@ impl Metrics {
         )
         .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
 
+        // Embedding windows: 10ms -> ~160s, the span from an idle model to a
+        // window queued behind a saturated one.
+        let embed_window_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "xerj_embed_window_seconds",
+                "Wall time of one neural embedding window (inference only)",
+            )
+            .buckets(exponential_buckets(0.01, 2.0, 15).expect("embed bucket config is valid")),
+        )
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
         let query_latency_by_type = HistogramVec::new(
             histogram_opts!(
                 "xerj_query_latency_by_type_seconds",
@@ -277,6 +295,18 @@ impl Metrics {
         let wal_size_bytes = IntGauge::with_opts(Opts::new(
             "xerj_wal_size_bytes",
             "Current WAL size on disk in bytes",
+        ))
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
+        let embed_passages_per_second = Gauge::with_opts(Opts::new(
+            "xerj_embed_passages_per_second",
+            "Smoothed neural embedding throughput in passages per second (EWMA)",
+        ))
+        .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
+
+        let bulks_in_flight = IntGauge::with_opts(Opts::new(
+            "xerj_bulks_in_flight",
+            "Number of _bulk requests currently holding a bulk-pool permit",
         ))
         .map_err(|e| XerjError::internal(format!("metrics: {e}")))?;
 
@@ -337,12 +367,15 @@ impl Metrics {
         reg!(flush_duration);
         reg!(merge_duration);
         reg!(wal_write_latency);
+        reg!(embed_window_seconds);
         reg!(query_latency_by_type);
         reg!(segment_count);
         reg!(doc_count);
         reg!(memory_usage);
         reg!(active_searches);
         reg!(wal_size_bytes);
+        reg!(embed_passages_per_second);
+        reg!(bulks_in_flight);
         reg!(query_cache_hits);
         reg!(query_cache_misses);
         reg!(rerank_requests);
@@ -362,12 +395,15 @@ impl Metrics {
             flush_duration,
             merge_duration,
             wal_write_latency,
+            embed_window_seconds,
             query_latency_by_type,
             segment_count,
             doc_count,
             memory_usage,
             active_searches,
             wal_size_bytes,
+            embed_passages_per_second,
+            bulks_in_flight,
             query_cache_hits,
             query_cache_misses,
             rerank_requests,
@@ -504,6 +540,14 @@ impl Metrics {
         }
     }
 
+    /// Count one `_bulk` request as in flight until the guard drops.
+    pub fn bulk_in_flight_guard(&self) -> BulkInFlightGuard {
+        self.bulks_in_flight.inc();
+        BulkInFlightGuard {
+            gauge: self.bulks_in_flight.clone(),
+        }
+    }
+
     // ── Type-erased observe helpers ───────────────────────────────────────────
     //
     // These let crates that do NOT depend on the `prometheus` crate (e.g.
@@ -521,6 +565,13 @@ impl Metrics {
         self.merge_duration.observe(secs);
     }
 
+    /// Observe one finished neural embedding window and publish the smoothed
+    /// throughput, in seconds and passages per second.
+    pub fn observe_embed_window(&self, secs: f64, passages_per_second: f64) {
+        self.embed_window_seconds.observe(secs);
+        self.embed_passages_per_second.set(passages_per_second);
+    }
+
     /// Observe one WAL append (durability write) latency, in seconds.
     pub fn observe_wal_write(&self, secs: f64) {
         self.wal_write_latency.observe(secs);
@@ -529,6 +580,17 @@ impl Metrics {
     /// Observe one end-to-end indexing (ingest) operation latency, in seconds.
     pub fn observe_index(&self, secs: f64) {
         self.index_latency.observe(secs);
+    }
+}
+
+/// RAII guard for the `bulks_in_flight` gauge.
+pub struct BulkInFlightGuard {
+    gauge: IntGauge,
+}
+
+impl Drop for BulkInFlightGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
     }
 }
 
@@ -579,6 +641,24 @@ mod tests {
             assert_eq!(m.active_searches.get(), 1);
         }
         assert_eq!(m.active_searches.get(), 0);
+    }
+
+    #[test]
+    fn embedding_series_are_exposed_and_update() {
+        let m = Metrics::new().unwrap();
+        m.observe_embed_window(0.5, 120.0);
+        let text = m.gather_text().unwrap();
+        assert!(text.contains("xerj_embed_window_seconds_count 1"), "{text}");
+        assert!(
+            text.contains("xerj_embed_passages_per_second 120"),
+            "{text}"
+        );
+        assert!(text.contains("xerj_bulks_in_flight 0"), "{text}");
+        {
+            let _g = m.bulk_in_flight_guard();
+            assert_eq!(m.bulks_in_flight.get(), 1);
+        }
+        assert_eq!(m.bulks_in_flight.get(), 0);
     }
 
     #[test]
