@@ -215,6 +215,138 @@ fn shared_neural_cell(cfg: &crate::neural::NeuralConfig) -> std::sync::Arc<Neura
     cell
 }
 
+/// The embedding backend refused a window before running it: the process-wide
+/// in-flight gate stayed full for the whole timeout, or the caller's bulk
+/// deadline had already passed. Not feature-gated, so the engine can map it to
+/// a retryable item status (429) on every build.
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+pub struct EmbeddingAdmissionError {
+    pub reason: String,
+}
+
+/// Process-wide cap on concurrent embedding windows for the built-in neural
+/// backend. Each permit is one window running through the model; a window that
+/// cannot get one within `timeout` is rejected rather than queued.
+pub struct NeuralGate {
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    max_inflight: usize,
+    timeout: std::time::Duration,
+}
+
+impl NeuralGate {
+    pub fn new(max_inflight: usize, timeout: std::time::Duration) -> Self {
+        let max_inflight = max_inflight.max(1);
+        Self {
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(max_inflight)),
+            max_inflight,
+            timeout,
+        }
+    }
+
+    /// Wait up to the gate timeout for a slot.
+    pub async fn admit(
+        &self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, EmbeddingAdmissionError> {
+        let full = || EmbeddingAdmissionError {
+            reason: format!(
+                "neural embedding admission full: {} windows already in flight for {} ms; \
+                 retry with backoff",
+                self.max_inflight,
+                self.timeout.as_millis()
+            ),
+        };
+        match tokio::time::timeout(self.timeout, self.permits.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) | Err(_) => Err(full()),
+        }
+    }
+}
+
+/// Exponentially weighted passages-per-second, fed one sample per window.
+///
+/// The value is the f64 bit pattern in an atomic, so the hot path takes no
+/// lock. A rate of `0.0` means no window has been observed yet.
+pub struct RateEwma {
+    bits: std::sync::atomic::AtomicU64,
+    alpha: f64,
+}
+
+impl RateEwma {
+    pub const fn new(alpha: f64) -> Self {
+        Self {
+            bits: std::sync::atomic::AtomicU64::new(0),
+            alpha,
+        }
+    }
+
+    pub fn record(&self, passages: usize, elapsed: std::time::Duration) {
+        let secs = elapsed.as_secs_f64();
+        if passages == 0 || secs <= 0.0 {
+            return;
+        }
+        let sample = passages as f64 / secs;
+        let alpha = self.alpha;
+        let mut old_bits = self.bits.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let old = f64::from_bits(old_bits);
+            let next = if old == 0.0 {
+                sample
+            } else {
+                alpha * sample + (1.0 - alpha) * old
+            };
+            match self.bits.compare_exchange_weak(
+                old_bits,
+                next.to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => old_bits = current,
+            }
+        }
+    }
+
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.bits.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+static NEURAL_GATE: std::sync::OnceLock<NeuralGate> = std::sync::OnceLock::new();
+static NEURAL_RATE: RateEwma = RateEwma::new(0.2);
+
+/// Size the process-wide neural gate from `embedding.neural_max_inflight_calls`
+/// and `embedding.timeout_ms`. The first call wins; later calls are ignored,
+/// because the gate must be one object for every index in the process.
+pub fn configure_neural_gate(max_inflight: usize, timeout_ms: u64) {
+    let _ = NEURAL_GATE.set(NeuralGate::new(
+        max_inflight,
+        std::time::Duration::from_millis(timeout_ms),
+    ));
+}
+
+/// The process-wide gate. Before `configure_neural_gate` it admits one window
+/// per detected core and waits the default embedding timeout (5 s).
+pub fn neural_gate() -> &'static NeuralGate {
+    NEURAL_GATE.get_or_init(|| {
+        NeuralGate::new(
+            xerj_common::resource::cores(),
+            std::time::Duration::from_millis(5000),
+        )
+    })
+}
+
+/// Record one finished neural window into the process-wide rate.
+pub fn record_neural_window(passages: usize, elapsed: std::time::Duration) {
+    NEURAL_RATE.record(passages, elapsed);
+}
+
+/// Smoothed neural throughput in passages per second (EWMA, alpha 0.2), or
+/// `0.0` before the first window. This is the model's service rate.
+pub fn neural_passages_per_second() -> f64 {
+    NEURAL_RATE.get()
+}
+
 /// A backend-agnostic text embedder shared across the engine.
 pub enum Embedder {
     /// Built-in lexical feature-hash embedder (no model, no network).
@@ -881,10 +1013,22 @@ impl NeuralHandle {
     }
 
     async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let permit = neural_gate().admit().await.map_err(anyhow::Error::new)?;
         let model = self.get().await?;
-        tokio::task::spawn_blocking(move || model.embed_blocking(&texts))
-            .await
-            .map_err(|e| anyhow!("neural embed task panicked: {e}"))?
+        let passages = texts.len();
+        tokio::task::spawn_blocking(move || {
+            // The slot stays charged until native inference returns, even if
+            // the async waiter is cancelled.
+            let _permit = permit;
+            let started = std::time::Instant::now();
+            let result = model.embed_blocking(&texts);
+            if result.is_ok() {
+                record_neural_window(passages, started.elapsed());
+            }
+            result
+        })
+        .await
+        .map_err(|e| anyhow!("neural embed task panicked: {e}"))?
     }
 }
 
@@ -944,5 +1088,70 @@ mod neural_handle_tests {
 
         let replacement = NeuralHandle::new(cfg);
         assert!(replacement.cell.get().is_none());
+    }
+}
+
+#[cfg(test)]
+mod neural_gate_tests {
+    use super::{EmbeddingAdmissionError, NeuralGate, RateEwma};
+    use std::time::Duration;
+
+    /// A fake embedder call: take a slot, hold it for `hold`, release it.
+    async fn fake_embed(gate: &NeuralGate, hold: Duration) -> anyhow::Result<()> {
+        let _permit = gate.admit().await.map_err(anyhow::Error::new)?;
+        tokio::time::sleep(hold).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_concurrent_call_times_out_when_one_permit() {
+        let gate = NeuralGate::new(1, Duration::from_millis(50));
+        let (first, second) = tokio::join!(
+            fake_embed(&gate, Duration::from_millis(400)),
+            async {
+                // Let the first call take the only slot.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                fake_embed(&gate, Duration::from_millis(1)).await
+            }
+        );
+        first.expect("the call holding the slot succeeds");
+        let err = second.expect_err("the second call must be refused");
+        assert!(
+            err.downcast_ref::<EmbeddingAdmissionError>().is_some(),
+            "refusal must downcast to EmbeddingAdmissionError: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_calls_succeed_with_two_permits() {
+        let gate = NeuralGate::new(2, Duration::from_millis(50));
+        let (a, b) = tokio::join!(
+            fake_embed(&gate, Duration::from_millis(100)),
+            fake_embed(&gate, Duration::from_millis(100))
+        );
+        a.unwrap();
+        b.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slot_is_released_after_the_call() {
+        let gate = NeuralGate::new(1, Duration::from_millis(50));
+        fake_embed(&gate, Duration::from_millis(1)).await.unwrap();
+        fake_embed(&gate, Duration::from_millis(1)).await.unwrap();
+    }
+
+    #[test]
+    fn ewma_starts_at_first_sample_then_smooths() {
+        let rate = RateEwma::new(0.2);
+        assert_eq!(rate.get(), 0.0);
+        rate.record(100, Duration::from_secs(1));
+        assert!((rate.get() - 100.0).abs() < 1e-9);
+        rate.record(200, Duration::from_secs(1));
+        // 0.2 * 200 + 0.8 * 100
+        assert!((rate.get() - 120.0).abs() < 1e-9);
+        // Empty or zero-length windows are ignored.
+        rate.record(0, Duration::from_secs(1));
+        rate.record(10, Duration::ZERO);
+        assert!((rate.get() - 120.0).abs() < 1e-9);
     }
 }

@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 59 of XERJ's 137 user-facing settings to their
+# This file sets 59 of XERJ's 138 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete

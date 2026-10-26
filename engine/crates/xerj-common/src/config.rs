@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **137 settings** versus
+//! Configuration is intentionally minimal: **138 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -73,7 +73,7 @@ pub struct Config {
     pub vector: VectorConfig,
     /// Log (time-series) retention — 2 settings.
     pub logs: LogsConfig,
-    /// External embedding service — 20 settings.
+    /// External embedding service — 21 settings.
     pub embedding: EmbeddingConfig,
     /// Resource limits — 14 settings.
     pub limits: LimitsConfig,
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 137 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 138 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -301,6 +301,11 @@ impl Config {
         if !(1..=64).contains(&self.embedding.neural_window_concurrency) {
             return Err(XerjError::config(
                 "embedding.neural_window_concurrency must be in 1..=64",
+            ));
+        }
+        if !(1..=1024).contains(&self.embedding.neural_max_inflight_calls) {
+            return Err(XerjError::config(
+                "embedding.neural_max_inflight_calls must be in 1..=1024",
             ));
         }
 
@@ -563,7 +568,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (137 user-facing settings total; counted by
+// Sub-configs  (138 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1604,7 +1609,7 @@ pub struct NeuralIngestProbe {
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
-/// **20 settings.**
+/// **21 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -1656,6 +1661,14 @@ pub struct EmbeddingConfig {
     /// model instead of one (#938); every window is still embedded as its
     /// own batch and reassembled by position, so outputs are unchanged.
     pub neural_window_concurrency: usize,
+    /// Neural backend: maximum embedding windows running through the model
+    /// at once across the whole process, i.e. across every concurrent
+    /// `_bulk` (default: detected cores, range: `1..=1024`). Without it,
+    /// N bulks times `neural_window_concurrency` forward passes contend for
+    /// the same cores. A window that cannot get a slot within `timeout_ms`
+    /// is rejected as an admission failure (item status 429) instead of
+    /// queueing behind the model without bound.
+    pub neural_max_inflight_calls: usize,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.
     /// Required when `mode = "onnx-experimental"`; never auto-downloaded.
@@ -1738,6 +1751,7 @@ impl Default for EmbeddingConfig {
             model_cache_dir: String::new(),
             local_model_dir: String::new(),
             neural_window_concurrency: 1,
+            neural_max_inflight_calls: crate::resource::cores(),
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
             onnx_scheduling_window: 64,
@@ -3797,6 +3811,26 @@ mod tests {
     }
 
     #[test]
+    fn neural_max_inflight_calls_defaults_to_cores_and_is_bounded() {
+        assert_eq!(
+            Config::default().embedding.neural_max_inflight_calls,
+            crate::resource::cores()
+        );
+        for value in [1usize, 4, 1024] {
+            Config::from_toml_str(&format!(
+                "[embedding]\nneural_max_inflight_calls = {value}\n"
+            ))
+            .unwrap_or_else(|error| panic!("neural_max_inflight_calls={value}: {error}"));
+        }
+        for value in [0usize, 1025] {
+            Config::from_toml_str(&format!(
+                "[embedding]\nneural_max_inflight_calls = {value}\n"
+            ))
+            .expect_err(&format!("neural_max_inflight_calls={value} must be rejected"));
+        }
+    }
+
+    #[test]
     fn onnx_throughput_controls_accept_only_bounded_values() {
         for (key, valid) in [
             ("onnx_scheduling_window", [1, 64, 4096].as_slice()),
@@ -3879,7 +3913,7 @@ mod tests {
         ("fts", 1),
         ("vector", 6),
         ("logs", 2),
-        ("embedding", 20),
+        ("embedding", 21),
         ("limits", 15),
         ("indexing", 3),
         ("engine", 6),
@@ -3935,7 +3969,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 137,
+            total, 138,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

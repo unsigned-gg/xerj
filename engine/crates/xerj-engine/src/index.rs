@@ -39718,9 +39718,15 @@ fn semantic_width_mismatch_error(detail: &str) -> xerj_common::XerjError {
 /// `EmbeddingError` (500, `circuit_breaking_exception`) with `ctx` prepended.
 /// Takes `impl Display` because the `Embedder` surfaces `anyhow::Error` (the
 /// classification of transient-vs-permanent already happened inside the proxy).
-fn is_embedding_admission_rejection(_e: &anyhow::Error) -> bool {
+fn is_embedding_admission_rejection(e: &anyhow::Error) -> bool {
+    if e
+        .downcast_ref::<xerj_ai::embedder::EmbeddingAdmissionError>()
+        .is_some()
+    {
+        return true;
+    }
     #[cfg(feature = "onnx-experimental")]
-    if _e
+    if e
         .downcast_ref::<xerj_ai::embedder::OnnxAdmissionError>()
         .is_some()
     {
@@ -41939,6 +41945,7 @@ fn make_neural_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xe
     // `configured_neural_config`. Duplicating it here once let the reported
     // identity describe a different model than the one that loads.
     ensure_neural_ready(cfg)?;
+    xerj_ai::embedder::configure_neural_gate(cfg.neural_max_inflight_calls, cfg.timeout_ms);
     let neural_cfg = configured_neural_config(cfg);
     info!(
         model = %neural_cfg.model_id,
