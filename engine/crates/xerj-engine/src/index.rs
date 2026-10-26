@@ -18921,7 +18921,9 @@ impl Index {
                         },
                     ));
                 }
-                embedder_ref.embed_batch(window_texts_ref(start, end)).await
+                embedder_ref
+                    .embed_batch_gated(window_texts_ref(start, end))
+                    .await
             };
             if dual_session_scheduler_enabled(
                 onnx_pinned,
@@ -19008,7 +19010,10 @@ impl Index {
                             "semantic embedding window failed; retrying per item"
                         );
                         for job_idx in start..end {
-                            match embedder.embed_batch(jobs[job_idx].texts.clone()).await {
+                            match embedder
+                                .embed_batch_gated(jobs[job_idx].texts.clone())
+                                .await
+                            {
                                 Ok(v)
                                     if v.len() == jobs[job_idx].texts.len()
                                         && v.iter()

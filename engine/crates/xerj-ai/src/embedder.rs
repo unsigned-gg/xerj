@@ -263,6 +263,18 @@ impl NeuralGate {
     }
 }
 
+/// Take a slot when `gated`, else none and without touching the gate.
+pub async fn admit_optional(
+    gate: &NeuralGate,
+    gated: bool,
+) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, EmbeddingAdmissionError> {
+    if gated {
+        gate.admit().await.map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Exponentially weighted passages-per-second, fed one sample per window.
 ///
 /// The value is the f64 bit pattern in an atomic, so the hot path takes no
@@ -316,23 +328,39 @@ static NEURAL_GATE: std::sync::OnceLock<NeuralGate> = std::sync::OnceLock::new()
 static NEURAL_RATE: RateEwma = RateEwma::new(0.2);
 
 /// Size the process-wide neural gate from `embedding.neural_max_inflight_calls`
-/// and `embedding.timeout_ms`. The first call wins; later calls are ignored,
-/// because the gate must be one object for every index in the process.
+/// and `embedding.timeout_ms`. The first call wins; later calls cannot resize
+/// it, because the gate must be one object for every index in the process. A
+/// later call that asks for different values logs a warning naming both.
 pub fn configure_neural_gate(max_inflight: usize, timeout_ms: u64) {
-    let _ = NEURAL_GATE.set(NeuralGate::new(
-        max_inflight,
-        std::time::Duration::from_millis(timeout_ms),
-    ));
+    let wanted = NeuralGate::new(max_inflight, std::time::Duration::from_millis(timeout_ms));
+    let (want_n, want_t) = (wanted.max_inflight, wanted.timeout);
+    if NEURAL_GATE.set(wanted).is_err() {
+        if let Some(gate) = NEURAL_GATE.get() {
+            if gate.max_inflight != want_n || gate.timeout != want_t {
+                tracing::warn!(
+                    in_force_max_inflight = gate.max_inflight,
+                    in_force_timeout_ms = gate.timeout.as_millis() as u64,
+                    requested_max_inflight = want_n,
+                    requested_timeout_ms = want_t.as_millis() as u64,
+                    "neural embedding gate already configured; keeping the values in force"
+                );
+            }
+        }
+    }
 }
 
-/// The process-wide gate. Before `configure_neural_gate` it admits one window
-/// per detected core and waits the default embedding timeout (5 s).
+/// The process-wide gate. If it runs before any `configure_neural_gate` call
+/// it configures itself from defaults (one slot per detected core, 5 s) and
+/// logs a warning, so the size is never silently lost.
 pub fn neural_gate() -> &'static NeuralGate {
     NEURAL_GATE.get_or_init(|| {
-        NeuralGate::new(
-            xerj_common::resource::cores(),
-            std::time::Duration::from_millis(5000),
-        )
+        let cores = xerj_common::resource::cores();
+        tracing::warn!(
+            max_inflight = cores,
+            timeout_ms = 5000u64,
+            "neural embedding gate used before configuration; using defaults"
+        );
+        NeuralGate::new(cores, std::time::Duration::from_millis(5000))
     })
 }
 
@@ -430,7 +458,25 @@ impl Embedder {
     }
 
     /// Embed a batch of texts into vectors. Order matches the input.
+    ///
+    /// Not subject to the neural in-flight gate: query-time embeds use this
+    /// and must not queue behind ingest. Bulk ingest uses
+    /// [`Self::embed_batch_gated`].
     pub async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch_inner(texts, false).await
+    }
+
+    /// Like [`Self::embed_batch`], but a built-in neural window first takes a
+    /// slot from the process-wide gate and is refused with
+    /// [`EmbeddingAdmissionError`] if none frees within the timeout. Other
+    /// backends behave exactly as in `embed_batch`.
+    pub async fn embed_batch_gated(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch_inner(texts, true).await
+    }
+
+    async fn embed_batch_inner(&self, texts: Vec<String>, gated: bool) -> Result<Vec<Vec<f32>>> {
+        #[cfg(not(feature = "neural"))]
+        let _ = gated;
         match self {
             Embedder::Lexical => Ok(texts.iter().map(|t| local_embed(t, DEFAULT_DIMS)).collect()),
             Embedder::Proxy(proxy) => proxy
@@ -438,7 +484,7 @@ impl Embedder {
                 .await
                 .map_err(|e| anyhow!("embedding proxy failed: {e}")),
             #[cfg(feature = "neural")]
-            Embedder::Neural(handle) => handle.embed_batch(texts).await,
+            Embedder::Neural(handle) => handle.embed_batch(texts, gated).await,
             #[cfg(feature = "onnx-experimental")]
             Embedder::Onnx(handle) => handle.embed_batch(texts).await,
         }
@@ -1012,8 +1058,10 @@ impl NeuralHandle {
             .cloned()
     }
 
-    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let permit = neural_gate().admit().await.map_err(anyhow::Error::new)?;
+    async fn embed_batch(&self, texts: Vec<String>, gated: bool) -> Result<Vec<Vec<f32>>> {
+        let permit = admit_optional(neural_gate(), gated)
+            .await
+            .map_err(anyhow::Error::new)?;
         let model = self.get().await?;
         let passages = texts.len();
         tokio::task::spawn_blocking(move || {
@@ -1122,6 +1170,21 @@ mod neural_gate_tests {
             err.downcast_ref::<EmbeddingAdmissionError>().is_some(),
             "refusal must downcast to EmbeddingAdmissionError: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn ungated_path_never_takes_a_permit() {
+        use super::admit_optional;
+        let gate = NeuralGate::new(1, Duration::from_millis(30));
+        let held = gate.admit().await.unwrap();
+        // Gate is full: gated callers are refused, ungated ones pass at once.
+        assert!(admit_optional(&gate, true).await.is_err());
+        let started = std::time::Instant::now();
+        assert!(admit_optional(&gate, false).await.unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_millis(20));
+        // The ungated call took nothing: releasing the one permit frees the gate.
+        drop(held);
+        assert!(admit_optional(&gate, true).await.unwrap().is_some());
     }
 
     #[tokio::test]

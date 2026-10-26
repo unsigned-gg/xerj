@@ -1665,6 +1665,7 @@ pub struct EmbeddingConfig {
     /// at once across the whole process, i.e. across every concurrent
     /// `_bulk` (default: detected cores, range: `1..=1024`). Without it,
     /// N bulks times `neural_window_concurrency` forward passes contend for
+    /// Only bulk ingest windows are gated; query-time embeds are not.
     /// the same cores. A window that cannot get a slot within `timeout_ms`
     /// is rejected as an admission failure (item status 429) instead of
     /// queueing behind the model without bound.
@@ -1676,7 +1677,10 @@ pub struct EmbeddingConfig {
     /// re-offer exactly those items. Windows that started earlier finish, and
     /// their documents are written. The point is to answer inside the
     /// client's timeout instead of timing out and having the whole body
-    /// re-sent and re-embedded.
+    /// re-sent and re-embedded. The budget is per index group within a bulk.
+    /// It applies to neural, proxy and ONNX; an admission rejection fails the
+    /// whole window (every item in it answers 429) instead of retrying each
+    /// item.
     pub bulk_embed_deadline_ms: u64,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.

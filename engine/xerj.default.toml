@@ -479,6 +479,19 @@ timeout_ms = 5000
 # Range: 1 – 64.
 # neural_window_concurrency = 1
 
+# Neural backend: how many embedding windows may run through the model at once
+# across ALL concurrent _bulk requests (query-time embeds are not gated). A
+# window that gets no slot within timeout_ms is refused and its items answer
+# 429. Default: the detected core count. Range: 1 – 1024.
+# neural_max_inflight_calls = 8
+
+# Wall-clock budget (ms) for starting embedding windows, per index group within
+# a _bulk. Applies to neural, proxy and ONNX. A window that would start after it
+# is refused: its items answer 429 and the client re-offers them. Windows
+# already running finish. An admission rejection fails the whole window.
+# 0 turns the deadline off. Default: 120000.
+# bulk_embed_deadline_ms = 120000
+
 # ── Resource Limits (7 of 15 settings) ────────────────────────────────────────
 
 [limits]

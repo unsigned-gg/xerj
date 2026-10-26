@@ -12,17 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The built-in neural embedder has a process-wide in-flight gate.** New
   `[embedding] neural_max_inflight_calls` (default: detected cores, range
   `1..=1024`) caps how many embedding windows run through the model at once
-  across all concurrent `_bulk` requests. A window that cannot get a slot
+  across all concurrent `_bulk` requests. Query-time embeds are not gated.
+  A window that cannot get a slot
   within `timeout_ms` is refused with a retryable admission error, which
   `_bulk` answers as item status 429 `resource_exhausted`. The proxy path is
   unchanged.
 - **`_bulk` has an embedding deadline.** New
   `[embedding] bulk_embed_deadline_ms` (default `120000`, `0` turns it off).
-  A window that would start after the deadline is not run; its items answer
-  429 and the autoindex client re-offers only those. Windows already running
-  finish and their documents are written. An admission rejection of a window
-  no longer triggers the per-item retry loop, so refused capacity is not
-  spent again and written documents are not re-embedded.
+  The budget is per index group within a bulk and applies to neural, proxy
+  and ONNX. A window that would start after the deadline is not run; its
+  items answer 429 and the autoindex client re-offers only those. Windows
+  already running finish and their documents are written. An admission
+  rejection fails the whole window, for every backend including ONNX, and no
+  longer triggers the per-item retry loop, so refused capacity is not spent
+  again and written documents are not re-embedded.
 - **Embedding observability.** The `XERJ_PROF` bulk line now prints
   `embed_ms`. `/v1/metrics` gains `xerj_embed_window_seconds` (histogram,
   neural inference time per window), `xerj_embed_passages_per_second`
