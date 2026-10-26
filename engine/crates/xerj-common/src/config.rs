@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **138 settings** versus
+//! Configuration is intentionally minimal: **139 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -73,7 +73,7 @@ pub struct Config {
     pub vector: VectorConfig,
     /// Log (time-series) retention — 2 settings.
     pub logs: LogsConfig,
-    /// External embedding service — 21 settings.
+    /// External embedding service — 22 settings.
     pub embedding: EmbeddingConfig,
     /// Resource limits — 14 settings.
     pub limits: LimitsConfig,
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 138 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 139 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -568,7 +568,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (138 user-facing settings total; counted by
+// Sub-configs  (139 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1609,7 +1609,7 @@ pub struct NeuralIngestProbe {
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
-/// **21 settings.**
+/// **22 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -1669,6 +1669,15 @@ pub struct EmbeddingConfig {
     /// is rejected as an admission failure (item status 429) instead of
     /// queueing behind the model without bound.
     pub neural_max_inflight_calls: usize,
+    /// Wall-clock budget, in milliseconds, for the embedding windows of one
+    /// `_bulk` index group (default: `120000`; `0` turns the deadline off).
+    /// A window that would START after the deadline is not run: every
+    /// document in it answers 429 `resource_exhausted` so the client can
+    /// re-offer exactly those items. Windows that started earlier finish, and
+    /// their documents are written. The point is to answer inside the
+    /// client's timeout instead of timing out and having the whole body
+    /// re-sent and re-embedded.
+    pub bulk_embed_deadline_ms: u64,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.
     /// Required when `mode = "onnx-experimental"`; never auto-downloaded.
@@ -1752,6 +1761,7 @@ impl Default for EmbeddingConfig {
             local_model_dir: String::new(),
             neural_window_concurrency: 1,
             neural_max_inflight_calls: crate::resource::cores(),
+            bulk_embed_deadline_ms: 120_000,
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
             onnx_scheduling_window: 64,
@@ -3831,6 +3841,13 @@ mod tests {
     }
 
     #[test]
+    fn bulk_embed_deadline_defaults_to_two_minutes_and_zero_disables() {
+        assert_eq!(Config::default().embedding.bulk_embed_deadline_ms, 120_000);
+        let cfg = Config::from_toml_str("[embedding]\nbulk_embed_deadline_ms = 0\n").unwrap();
+        assert_eq!(cfg.embedding.bulk_embed_deadline_ms, 0);
+    }
+
+    #[test]
     fn onnx_throughput_controls_accept_only_bounded_values() {
         for (key, valid) in [
             ("onnx_scheduling_window", [1, 64, 4096].as_slice()),
@@ -3913,7 +3930,7 @@ mod tests {
         ("fts", 1),
         ("vector", 6),
         ("logs", 2),
-        ("embedding", 21),
+        ("embedding", 22),
         ("limits", 15),
         ("indexing", 3),
         ("engine", 6),
@@ -3969,7 +3986,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 138,
+            total, 139,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

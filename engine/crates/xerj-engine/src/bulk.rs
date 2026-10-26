@@ -3639,6 +3639,131 @@ mod semantic_lifecycle_tests {
         assert_eq!(ledger.accounting_errors(), 0);
     }
 
+    /// Embedding endpoint that answers every request with 200 and a width-16
+    /// vector per input after `delay`. Returns the URL and a request counter.
+    fn slow_embedding_server(
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    // Read headers, then exactly Content-Length body bytes.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let (body_start, content_length) = loop {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (pos + 4, len);
+                        }
+                    };
+                    while buf.len() < body_start + content_length {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let request: Value =
+                        serde_json::from_slice(&buf[body_start..body_start + content_length])
+                            .unwrap();
+                    let inputs = request["input"].as_array().map_or(0, Vec::len);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    let data: Vec<Value> = (0..inputs)
+                        .map(|i| json!({"index": i, "embedding": vec![0.25f64; 16]}))
+                        .collect();
+                    let body = json!({ "data": data }).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (format!("http://{addr}/v1/embeddings"), calls)
+    }
+
+    /// The bulk embed deadline refuses windows that would start after it and
+    /// answers their items 429, without the per-item retry that would spend
+    /// the capacity just refused. Windows that started in time are written.
+    #[tokio::test]
+    async fn bulk_embed_deadline_answers_late_windows_429_without_per_item_retry() {
+        use std::sync::atomic::Ordering;
+        let name = "semantic-embed-deadline";
+        let (url, calls) = slow_embedding_server(std::time::Duration::from_millis(400));
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.embedding.mode = "proxy".into();
+        config.embedding.default_endpoint = url;
+        config.embedding.default_model = "m".into();
+        // One passage per window, one window at a time.
+        config.embedding.onnx_scheduling_window = 1;
+        config.embedding.neural_window_concurrency = 1;
+        config.embedding.bulk_embed_deadline_ms = 100;
+        let engine = Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut field = FieldConfig::new("content", FieldType::Text);
+        field.options.dimensions = Some(16);
+        field.embedding = Some(EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("content_vector".into()),
+        });
+        schema.fields.push(field);
+        engine.create_index(name, schema).unwrap();
+        engine
+            .put_index_mapping(
+                name,
+                json!({"properties": {"content": {"type": "semantic_text"}}}),
+            )
+            .unwrap();
+
+        let mut body = String::new();
+        for i in 0..6 {
+            body.push_str(&format!(
+                "{{\"index\":{{\"_index\":\"{name}\",\"_id\":\"d{i}\"}}}}\n\
+                 {{\"content\":\"short document number {i}\"}}\n"
+            ));
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let result = process_bulk(&engine, None, &body).await;
+        let statuses: Vec<u16> = result.items.iter().map(|item| item.status).collect();
+        assert_eq!(
+            statuses,
+            [201, 429, 429, 429, 429, 429],
+            "{:?}",
+            result.items
+        );
+        assert!(result.errors);
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            1,
+            "only the first window may reach the backend; rejected windows must not \
+             be retried per item"
+        );
+    }
+
     #[tokio::test]
     async fn tracing_off_semantic_path_skips_all_instrumentation_structures() {
         assert_eq!(
