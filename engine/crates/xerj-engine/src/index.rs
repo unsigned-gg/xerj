@@ -18704,9 +18704,11 @@ impl Index {
     }
 
     /// [`Self::apply_semantic_embeddings_batch`] for a `_bulk` group whose
-    /// passages were reserved against the passage budget. Each embedding
-    /// window returns its passages to the ledger when it ends, whether it
-    /// succeeded or failed.
+    /// passages were reserved against the passage budget. A window returns its
+    /// passages to the ledger when its result is final: right after a
+    /// successful call or an admission refusal, and after the last per-item
+    /// retry when the whole-window call failed. Whatever is still held when
+    /// the guard drops is returned then.
     pub(crate) async fn apply_semantic_embeddings_batch_reserved(
         &self,
         mut sources: Vec<Value>,
@@ -18938,9 +18940,17 @@ impl Index {
                         .embed_batch_gated(window_texts_ref(start, end))
                         .await
                 };
-                // The window is done, so its passages no longer wait on the model.
-                if let Some(reservation) = reservation {
-                    reservation.release(passages as u64);
+                // A window whose result is final is done with the model. One that
+                // failed for a reason other than admission is retried per item
+                // below, and keeps its passages until that retry ends.
+                let final_result = match &result {
+                    Ok(vectors) => vectors.len() == passages,
+                    Err(e) => is_embedding_admission_rejection(e),
+                };
+                if final_result {
+                    if let Some(reservation) = reservation {
+                        reservation.release(passages as u64);
+                    }
                 }
                 result
             };
@@ -19066,6 +19076,10 @@ impl Index {
                                         Some(format!("field [{}]: {e}", jobs[job_idx].field));
                                 }
                             }
+                        }
+                        // The per-item retry is over, so the window is finished.
+                        if let Some(reservation) = reservation {
+                            reservation.release(passages as u64);
                         }
                     }
                 }

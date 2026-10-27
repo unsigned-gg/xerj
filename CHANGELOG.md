@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admitted while no throughput has been measured, and while nothing is
   queued: the budget bounds the queue, not one request, so an idle node never
   refuses the same bulk forever (the embed deadline bounds that request).
+  Only the built-in neural backend measures throughput, so with `proxy` or
+  ONNX embedding the rule never refuses a request.
   `/v1/metrics` gains `xerj_embed_passages_queued` and the `reject` value of
   `xerj_bulk_admission_total{decision}`. The new key raises the user-facing
   settings count to 141.

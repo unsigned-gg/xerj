@@ -13,8 +13,8 @@ use std::sync::Arc;
 /// Bytes of document per estimated passage.
 pub const BYTES_PER_PASSAGE: u64 = 448;
 
-/// Longest `Retry-After` a refusal asks for, in seconds.
-pub const MAX_RETRY_AFTER_SECS: u64 = 60;
+/// Largest `Retry-After` value a refusal will ever send, in seconds.
+pub const RETRY_AFTER_CEILING_SECS: u64 = 60;
 
 /// Estimated passages for one document of `doc_bytes` bytes.
 pub fn estimate_passages(doc_bytes: usize) -> u64 {
@@ -94,7 +94,8 @@ impl PassageLedger {
                     queued,
                     cost,
                     budget: budget as u64,
-                    retry_after_secs: (excess_secs.ceil() as u64).clamp(1, MAX_RETRY_AFTER_SECS),
+                    retry_after_secs: (excess_secs.ceil() as u64)
+                        .clamp(1, RETRY_AFTER_CEILING_SECS),
                 });
             }
             match self.queued.compare_exchange_weak(
@@ -273,13 +274,13 @@ mod tests {
     fn retry_after_is_ceil_of_excess_over_mu_clamped_to_1_through_60() {
         let l = ledger();
         let _held = l.admit(600, 10.0, 60).unwrap();
-        // 1 over at 10/s is 0.1 s: rounds up to 1.
+        // One passage short of fitting needs a tenth of a second; the floor is 1.
         assert_eq!(l.admit(1, 10.0, 60).unwrap_err().retry_after_secs, 1);
-        // 250 over at 10/s is 25 s.
+        // 250 passages short at 10 per second is exactly 25 seconds.
         assert_eq!(l.admit(250, 10.0, 60).unwrap_err().retry_after_secs, 25);
-        // 251 over at 10/s is 25.1 s: rounds up to 26.
+        // 251 short is 25.1 seconds; a fraction is rounded up to a whole second.
         assert_eq!(l.admit(251, 10.0, 60).unwrap_err().retry_after_secs, 26);
-        // Far over: capped.
+        // A huge shortfall is held at the ceiling.
         assert_eq!(
             l.admit(1_000_000, 10.0, 60).unwrap_err().retry_after_secs,
             60

@@ -498,6 +498,8 @@ timeout_ms = 5000
 # already queued, exceed the budget is refused whole with HTTP 429 and a
 # Retry-After header. It is admitted while no throughput is measured yet, and
 # while nothing is queued (the budget bounds the queue, not one request).
+# Only the built-in neural backend measures throughput, so with proxy or ONNX
+# embedding this rule never refuses a request.
 # 0 turns the rule off. Range: 0 - 3600. Default: 60.
 # bulk_passage_budget_secs = 60
 

@@ -1739,6 +1739,8 @@ pub async fn process_bulk_with_opts(
         let idx = match engine.get_or_create_index(&index_name) {
             Ok(i) => i,
             Err(e) => {
+                // This group will not embed; stop counting it against others.
+                drop(passage_guards.remove(&index_name));
                 for (item_idx, id, source) in batch {
                     if let Some(raw_memory) = semantic_raw_memory.as_mut() {
                         release_raw_owner(raw_memory, source);
@@ -3759,6 +3761,15 @@ mod semantic_lifecycle_tests {
     fn slow_embedding_server(
         delay: std::time::Duration,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        scripted_embedding_server(delay, Arc::new(|_| 200))
+    }
+
+    /// Like [`slow_embedding_server`], but `status_for(inputs)` picks the HTTP
+    /// status of each request from the number of inputs it carries.
+    fn scripted_embedding_server(
+        delay: std::time::Duration,
+        status_for: Arc<dyn Fn(usize) -> u16 + Send + Sync>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{Read, Write};
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3769,6 +3780,7 @@ mod semantic_lifecycle_tests {
             for stream in listener.incoming() {
                 let Ok(mut sock) = stream else { continue };
                 let counter = Arc::clone(&counter);
+                let status_for = Arc::clone(&status_for);
                 std::thread::spawn(move || {
                     // Read headers, then exactly Content-Length body bytes.
                     let mut buf = Vec::new();
@@ -3802,12 +3814,17 @@ mod semantic_lifecycle_tests {
                     let inputs = request["input"].as_array().map_or(0, Vec::len);
                     counter.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(delay);
+                    let status = status_for(inputs);
                     let data: Vec<Value> = (0..inputs)
                         .map(|i| json!({"index": i, "embedding": vec![0.25f64; 16]}))
                         .collect();
-                    let body = json!({ "data": data }).to_string();
+                    let body = if status == 200 {
+                        json!({ "data": data }).to_string()
+                    } else {
+                        json!({ "error": "scripted failure" }).to_string()
+                    };
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
@@ -4018,6 +4035,56 @@ mod semantic_lifecycle_tests {
         assert_eq!(ok.items[0].status, 201, "{:?}", ok.items);
         assert_eq!(ledger.queued(), 1);
         drop(held);
+        assert_eq!(ledger.queued(), 0);
+    }
+
+    /// A window that fails as a whole is retried one document at a time. That
+    /// retry still uses the model, so the window's passages stay reserved
+    /// until it ends.
+    #[tokio::test]
+    async fn passages_stay_reserved_through_the_per_item_retry() {
+        use crate::admission::{with_test_scope, PassageLedger};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let name = "passage-budget-retry";
+        let ledger = Arc::new(PassageLedger::isolated());
+        let retries = Arc::new(AtomicU64::new(0));
+        let lowest_queued = Arc::new(AtomicU64::new(u64::MAX));
+        // The two-input window fails for good; each one-input retry succeeds.
+        let status_for: Arc<dyn Fn(usize) -> u16 + Send + Sync> = {
+            let (ledger, retries, lowest) = (
+                Arc::clone(&ledger),
+                Arc::clone(&retries),
+                Arc::clone(&lowest_queued),
+            );
+            Arc::new(move |inputs| {
+                if inputs >= 2 {
+                    return 400;
+                }
+                retries.fetch_add(1, Ordering::SeqCst);
+                lowest.fetch_min(ledger.queued(), Ordering::SeqCst);
+                200
+            })
+        };
+        let (url, _calls) =
+            scripted_embedding_server(std::time::Duration::from_millis(5), status_for);
+        let (_dir, engine) = proxy_semantic_engine(&[name], url, |_| {});
+        let body = semantic_body(name, &[100, 100]);
+        let result = with_test_scope(Arc::clone(&ledger), 0.0, async {
+            process_bulk(&engine, None, &body).await
+        })
+        .await;
+        assert_eq!(
+            result.items.iter().map(|i| i.status).collect::<Vec<_>>(),
+            [201, 201],
+            "{:?}",
+            result.items
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 2, "one retry per document");
+        assert_eq!(
+            lowest_queued.load(Ordering::SeqCst),
+            2,
+            "both passages must stay reserved during every retry"
+        );
         assert_eq!(ledger.queued(), 0);
     }
 
