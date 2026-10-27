@@ -87,8 +87,13 @@ async fn bulk_over_the_passage_budget_is_429_with_retry_after_and_a_small_one_is
     seed_one_passage_per_second();
     let (app, _dir) = app(60).await;
     create_index(&app).await;
+    // One passage already queued by another request keeps the rule live: an
+    // idle node admits any single request, however large.
+    let _in_flight = xerj_engine::admission::process_ledger()
+        .admit(1, 1.0, 60)
+        .expect("idle ledger admits");
 
-    // About 100 passages against a budget of 60: 40 over at 1/s is 40 s.
+    // 1 + about 100 passages against a budget of 60: 41 over at 1/s is 41 s.
     let (status, retry_after, body) = bulk(&app, bulk_body(448 * 100)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     let secs: u64 = retry_after.expect("Retry-After").parse().expect("integer");

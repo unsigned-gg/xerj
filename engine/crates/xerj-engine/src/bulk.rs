@@ -3994,7 +3994,9 @@ mod semantic_lifecycle_tests {
             c.embedding.bulk_passage_budget_secs = 1;
         });
         let ledger = Arc::new(PassageLedger::isolated());
-        // 7 + 7 = 14 passages against a budget of 10.
+        // One passage already queued, so the rule is live; 1 + 7 + 7 = 15
+        // passages against a budget of 10.
+        let held = ledger.admit(1, 10.0, 1).unwrap();
         let body = format!(
             "{}{}",
             semantic_body("budget-a", &[3000]),
@@ -4005,15 +4007,17 @@ mod semantic_lifecycle_tests {
         })
         .await;
         assert!(refused.refusal.is_some(), "{:?}", refused.items);
-        assert_eq!(ledger.queued(), 0);
+        assert_eq!(ledger.queued(), 1, "a refusal reserves nothing");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        // Either half alone fits.
+        // Either half alone fits: 1 + 7 <= 10.
         let ok = with_test_scope(Arc::clone(&ledger), 10.0, async {
             process_bulk(&engine, None, &semantic_body("budget-a", &[3000])).await
         })
         .await;
         assert!(ok.refusal.is_none());
         assert_eq!(ok.items[0].status, 201, "{:?}", ok.items);
+        assert_eq!(ledger.queued(), 1);
+        drop(held);
         assert_eq!(ledger.queued(), 0);
     }
 

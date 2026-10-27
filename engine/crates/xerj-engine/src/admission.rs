@@ -4,7 +4,8 @@
 //! second). `L` counts passages that admitted requests have reserved and the
 //! model has not finished. A request that would cost `cost` passages is
 //! admitted when `L + cost <= budget_secs * mu`, and refused whole otherwise.
-//! Until `mu` has been measured, every request is admitted.
+//! Until `mu` has been measured, and while `L == 0`, every request is
+//! admitted: the budget bounds the queue, not one request.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -87,7 +88,7 @@ impl PassageLedger {
         let mut queued = self.queued.load(Ordering::Acquire);
         loop {
             let total = queued.saturating_add(cost);
-            if measured && total as f64 > budget {
+            if measured && queued > 0 && total as f64 > budget {
                 let excess_secs = (total as f64 - budget) / mu;
                 return Err(Rejection {
                     queued,
@@ -255,10 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn a_request_larger_than_the_whole_budget_is_refused_even_when_idle() {
+    fn a_request_larger_than_the_whole_budget_is_admitted_when_nothing_is_queued() {
+        // The budget bounds the queue, not one request: an idle node must
+        // never refuse the same bulk forever. The embed deadline bounds it.
         let l = ledger();
-        let err = l.admit(601, 10.0, 60).unwrap_err();
-        assert_eq!(err.queued, 0);
+        let g = l.admit(601, 10.0, 60).unwrap();
+        assert_eq!(l.queued(), 601);
+        // With that in flight, even a small request waits its turn.
+        let err = l.admit(1, 10.0, 60).unwrap_err();
+        assert_eq!(err.queued, 601);
+        drop(g);
         assert_eq!(l.queued(), 0);
     }
 

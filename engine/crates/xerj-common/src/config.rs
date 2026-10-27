@@ -1698,7 +1698,8 @@ pub struct EmbeddingConfig {
     /// in passages per second. A `_bulk` is refused whole, with HTTP 429 and
     /// a `Retry-After` header, when the passages already queued plus its own
     /// estimate exceed the budget. It is admitted while no throughput has
-    /// been measured yet.
+    /// been measured yet, and while nothing is queued: the budget bounds the
+    /// queue, not one request.
     pub bulk_passage_budget_secs: u64,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.
