@@ -42,6 +42,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/v1/metrics` gains `xerj_bulk_admission_total{decision}` and
   `xerj_bulk_admission_wait_seconds`. The new key raises the user-facing
   settings count to 140.
+- **`_bulk` refuses a semantic request whole when the embedder is behind.**
+  New `[embedding] bulk_passage_budget_secs` (default `60`, range `0..=3600`,
+  `0` turns the rule off) sets how many seconds of embedding work a `_bulk`
+  may queue. The budget is that many seconds times the measured neural
+  embedding throughput in passages per second. After grouping, the request
+  costs the sum over its semantic documents of the document bytes divided by
+  448, rounded up. If the passages already queued plus that cost exceed the
+  budget, the server answers HTTP 429 with an `xerj_bulk_admission_exception`
+  body whose reason starts with `embedding passage budget exceeded`, and a
+  `Retry-After` of 1 to 60 seconds. Otherwise the cost is queued and each
+  embedding window gives its passages back when it ends. The request is
+  admitted while no throughput has been measured. A single request larger
+  than the whole budget is refused even when nothing else is queued.
+  `/v1/metrics` gains `xerj_embed_passages_queued` and the `reject` value of
+  `xerj_bulk_admission_total{decision}`. The new key raises the user-facing
+  settings count to 141.
 
 - `xerj sessions import --format claude-code --input FILE --output NEW.jsonl`
   prepares an explicit Claude Code JSONL transcript for ordinary `autoindex`.

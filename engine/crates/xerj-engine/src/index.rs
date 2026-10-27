@@ -18697,7 +18697,20 @@ impl Index {
     /// not turn otherwise valid bulk items into failures.
     pub(crate) async fn apply_semantic_embeddings_batch(
         &self,
+        sources: Vec<Value>,
+    ) -> Vec<Result<Value>> {
+        self.apply_semantic_embeddings_batch_reserved(sources, None)
+            .await
+    }
+
+    /// [`Self::apply_semantic_embeddings_batch`] for a `_bulk` group whose
+    /// passages were reserved against the passage budget. Each embedding
+    /// window returns its passages to the ledger when it ends, whether it
+    /// succeeded or failed.
+    pub(crate) async fn apply_semantic_embeddings_batch_reserved(
+        &self,
         mut sources: Vec<Value>,
+        reservation: Option<&crate::admission::PassageGuard>,
     ) -> Vec<Result<Value>> {
         // Budget for starting embedding windows. Captured first so schema
         // reads and chunking count against it.
@@ -18911,19 +18924,25 @@ impl Index {
             let windows_ref = &windows;
             let window_texts_ref = &window_texts;
             let launch = move |ordinal: usize| async move {
-                let (start, end, _passages) = windows_ref[ordinal];
-                if embed_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    return Err(anyhow::Error::new(
+                let (start, end, passages) = windows_ref[ordinal];
+                let result = if embed_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    Err(anyhow::Error::new(
                         xerj_ai::embedder::EmbeddingAdmissionError {
                             reason: "bulk embedding deadline reached before this window \
                                      started; retry the remaining items"
                                 .into(),
                         },
-                    ));
+                    ))
+                } else {
+                    embedder_ref
+                        .embed_batch_gated(window_texts_ref(start, end))
+                        .await
+                };
+                // The window is done, so its passages no longer wait on the model.
+                if let Some(reservation) = reservation {
+                    reservation.release(passages as u64);
                 }
-                embedder_ref
-                    .embed_batch_gated(window_texts_ref(start, end))
-                    .await
+                result
             };
             if dual_session_scheduler_enabled(
                 onnx_pinned,

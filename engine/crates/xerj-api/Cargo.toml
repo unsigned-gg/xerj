@@ -75,6 +75,8 @@ sha2         = "0.10"
 
 [dev-dependencies]
 tempfile     = { workspace = true }
+# Passage-budget test seeds the measured embedding throughput.
+xerj-ai      = { path = "../xerj-ai" }
 # #2234: the HTTP refresh test holds one index inside `Index::refresh`.
 # The feature stays off the release graph (resolver v2, dev-dependency only).
 xerj-engine  = { path = "../xerj-engine", features = ["refresh-test-hook"] }

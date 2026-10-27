@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 59 of XERJ's 140 user-facing settings to their
+# This file sets 59 of XERJ's 141 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -491,6 +491,14 @@ timeout_ms = 5000
 # already running finish. An admission rejection fails the whole window.
 # 0 turns the deadline off. Default: 120000.
 # bulk_embed_deadline_ms = 120000
+
+# Seconds of embedding work a semantic _bulk may queue behind the model. The
+# budget is this many seconds times the measured embedding throughput
+# (passages per second). A _bulk whose estimated passages, added to those
+# already queued, exceed the budget is refused whole with HTTP 429 and a
+# Retry-After header. It is admitted while no throughput is measured yet.
+# 0 turns the rule off. Range: 0 - 3600. Default: 60.
+# bulk_passage_budget_secs = 60
 
 # ── Resource Limits (7 of 16 settings) ────────────────────────────────────────
 

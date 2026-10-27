@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **140 settings** versus
+//! Configuration is intentionally minimal: **141 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -73,7 +73,7 @@ pub struct Config {
     pub vector: VectorConfig,
     /// Log (time-series) retention — 2 settings.
     pub logs: LogsConfig,
-    /// External embedding service — 22 settings.
+    /// External embedding service — 23 settings.
     pub embedding: EmbeddingConfig,
     /// Resource limits — 16 settings.
     pub limits: LimitsConfig,
@@ -108,7 +108,7 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-// 24 sub-configs, 140 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 141 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -301,6 +301,11 @@ impl Config {
         if !(1..=64).contains(&self.embedding.neural_window_concurrency) {
             return Err(XerjError::config(
                 "embedding.neural_window_concurrency must be in 1..=64",
+            ));
+        }
+        if self.embedding.bulk_passage_budget_secs > 3_600 {
+            return Err(XerjError::config(
+                "embedding.bulk_passage_budget_secs must be in 0..=3600",
             ));
         }
         if !(1_000..=600_000).contains(&self.limits.bulk_admission_wait_ms) {
@@ -573,7 +578,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (140 user-facing settings total; counted by
+// Sub-configs  (141 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1614,7 +1619,7 @@ pub struct NeuralIngestProbe {
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
-/// **22 settings.**
+/// **23 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
@@ -1687,6 +1692,14 @@ pub struct EmbeddingConfig {
     /// whole window (every item in it answers 429) instead of retrying each
     /// item.
     pub bulk_embed_deadline_ms: u64,
+    /// Seconds of embedding work a semantic `_bulk` may queue behind the
+    /// model (default: `60`, range: `0..=3600`, `0` disables the rule). The
+    /// budget is this many seconds times the measured embedding throughput
+    /// in passages per second. A `_bulk` is refused whole, with HTTP 429 and
+    /// a `Retry-After` header, when the passages already queued plus its own
+    /// estimate exceed the budget. It is admitted while no throughput has
+    /// been measured yet.
+    pub bulk_passage_budget_secs: u64,
     /// Experimental ONNX backend: local FP32 all-MiniLM-L6-v2-compatible
     /// model with int64 BERT inputs and a width-384 token-embedding output.
     /// Required when `mode = "onnx-experimental"`; never auto-downloaded.
@@ -1771,6 +1784,7 @@ impl Default for EmbeddingConfig {
             neural_window_concurrency: 1,
             neural_max_inflight_calls: crate::resource::cores(),
             bulk_embed_deadline_ms: 120_000,
+            bulk_passage_budget_secs: 60,
             onnx_model_path: String::new(),
             onnx_tokenizer_path: String::new(),
             onnx_scheduling_window: 64,
@@ -3875,6 +3889,18 @@ mod tests {
     }
 
     #[test]
+    fn bulk_passage_budget_defaults_to_sixty_seconds_zero_disables_and_is_bounded() {
+        assert_eq!(Config::default().embedding.bulk_passage_budget_secs, 60);
+        for secs in [0u64, 1, 3_600] {
+            let cfg =
+                Config::from_toml_str(&format!("[embedding]\nbulk_passage_budget_secs = {secs}\n"))
+                    .unwrap_or_else(|e| panic!("{secs}: {e}"));
+            assert_eq!(cfg.embedding.bulk_passage_budget_secs, secs);
+        }
+        assert!(Config::from_toml_str("[embedding]\nbulk_passage_budget_secs = 3601\n").is_err());
+    }
+
+    #[test]
     fn bulk_embed_deadline_defaults_to_two_minutes_and_zero_disables() {
         assert_eq!(Config::default().embedding.bulk_embed_deadline_ms, 120_000);
         let cfg = Config::from_toml_str("[embedding]\nbulk_embed_deadline_ms = 0\n").unwrap();
@@ -3964,7 +3990,7 @@ mod tests {
         ("fts", 1),
         ("vector", 6),
         ("logs", 2),
-        ("embedding", 22),
+        ("embedding", 23),
         ("limits", 16),
         ("indexing", 3),
         ("engine", 6),
@@ -4020,7 +4046,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 140,
+            total, 141,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

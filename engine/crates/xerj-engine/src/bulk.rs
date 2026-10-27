@@ -1655,6 +1655,50 @@ pub async fn process_bulk_with_opts(
     }
     let parsed = non_index_actions;
 
+    // Passage budget: decide once for the whole request, after grouping and
+    // before any action runs, so a refusal leaves nothing written and the
+    // client can re-send the same body. Each group gets its own share of the
+    // reservation; a share is returned as its embedding windows finish, and
+    // whatever is left when the share drops (error, cancel) is returned too.
+    let mut passage_guards: HashMap<String, crate::admission::PassageGuard> = HashMap::new();
+    if !semantic_index_batches.is_empty() {
+        let group_costs: Vec<(String, u64)> = semantic_index_batches
+            .iter()
+            .map(|(name, batch)| {
+                let cost = batch
+                    .iter()
+                    .map(|(_, _, source)| crate::admission::estimate_passages(source.len()))
+                    .sum();
+                (name.clone(), cost)
+            })
+            .collect();
+        let cost: u64 = group_costs.iter().map(|(_, c)| c).sum();
+        let ledger = crate::admission::current_ledger();
+        let mu = crate::admission::current_throughput();
+        let budget_secs = engine.config().embedding.bulk_passage_budget_secs;
+        match ledger.admit(cost, mu, budget_secs) {
+            Ok(whole) => {
+                for (name, group_cost) in group_costs {
+                    passage_guards.insert(name, whole.split(group_cost));
+                }
+            }
+            Err(r) => {
+                if let Some(m) = xerj_common::metrics::global_metrics() {
+                    m.count_bulk_admission("reject");
+                }
+                return BulkRefusal {
+                    reason: format!(
+                        "embedding passage budget exceeded: {} passages are queued and this \
+                         request needs about {} more, over a budget of {}; retry the whole request",
+                        r.queued, r.cost, r.budget
+                    ),
+                    retry_after_secs: r.retry_after_secs,
+                }
+                .into_result(started);
+            }
+        }
+    }
+
     let group_ms = t_group.elapsed().as_millis() as u64;
     let t_exec = std::time::Instant::now();
     // Time spent inside apply_semantic_embeddings_batch, summed over groups.
@@ -1784,7 +1828,11 @@ pub async fn process_bulk_with_opts(
         // scratch are not yet logically attributed. Their effect remains
         // visible only as allocator/RSS physical delta; it is not zero.
         let t_embed = std::time::Instant::now();
-        let prepared = idx.apply_semantic_embeddings_batch(valid_sources).await;
+        let guard = passage_guards.remove(&index_name);
+        let prepared = idx
+            .apply_semantic_embeddings_batch_reserved(valid_sources, guard.as_ref())
+            .await;
+        drop(guard);
         embed_ms += t_embed.elapsed().as_millis() as u64;
         #[cfg(test)]
         let _ = semantic_lifecycle_hook(&index_name, SemanticLifecyclePoint::Prepared);
@@ -3829,6 +3877,166 @@ mod semantic_lifecycle_tests {
             "only the first window may reach the backend; rejected windows must not \
              be retried per item"
         );
+    }
+
+    /// Engine with proxy embedding and a `semantic_text` index per name.
+    fn proxy_semantic_engine(
+        names: &[&str],
+        url: String,
+        tune: impl FnOnce(&mut Config),
+    ) -> (TempDir, Engine) {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.embedding.mode = "proxy".into();
+        config.embedding.default_endpoint = url;
+        config.embedding.default_model = "m".into();
+        config.embedding.bulk_embed_deadline_ms = 0;
+        tune(&mut config);
+        let engine = Engine::new(config).unwrap();
+        for name in names {
+            let mut schema = Schema::empty();
+            let mut field = FieldConfig::new("content", FieldType::Text);
+            field.options.dimensions = Some(16);
+            field.embedding = Some(EmbeddingConfig {
+                endpoint: None,
+                model: None,
+                target_field: Some("content_vector".into()),
+            });
+            schema.fields.push(field);
+            engine.create_index(name, schema).unwrap();
+            engine
+                .put_index_mapping(
+                    name,
+                    json!({"properties": {"content": {"type": "semantic_text"}}}),
+                )
+                .unwrap();
+        }
+        (dir, engine)
+    }
+
+    /// One index action per entry of `sizes`, each with that many bytes of text.
+    fn semantic_body(name: &str, sizes: &[usize]) -> String {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let text = "word ".repeat(bytes / 5);
+                format!(
+                    "{{\"index\":{{\"_index\":\"{name}\",\"_id\":\"d{i}\"}}}}\n\
+                     {{\"content\":\"{text}\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    async fn wait_until(mut ready: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if ready() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within 4 s");
+    }
+
+    /// While one semantic bulk embeds, a second one that does not fit the
+    /// passage budget is refused whole. The first is undisturbed and the
+    /// ledger drains to zero.
+    #[tokio::test]
+    async fn second_semantic_bulk_is_refused_while_the_first_proceeds() {
+        use crate::admission::{with_test_scope, PassageLedger};
+        let name = "passage-budget-reject";
+        let (url, _calls) = slow_embedding_server(std::time::Duration::from_millis(600));
+        // Budget is 1 s * 10 passages/s = 10 passages. Each bulk costs 7.
+        let (_dir, engine) = proxy_semantic_engine(&[name], url, |c| {
+            c.embedding.bulk_passage_budget_secs = 1;
+        });
+        let engine = Arc::new(engine);
+        let ledger = Arc::new(PassageLedger::isolated());
+        let first = {
+            let (engine, ledger) = (Arc::clone(&engine), Arc::clone(&ledger));
+            let body = semantic_body(name, &[3000]);
+            tokio::spawn(with_test_scope(ledger, 10.0, async move {
+                process_bulk(&engine, None, &body).await
+            }))
+        };
+        wait_until(|| ledger.queued() > 0).await;
+
+        let refused = with_test_scope(Arc::clone(&ledger), 10.0, async {
+            process_bulk(&engine, None, &semantic_body(name, &[3000])).await
+        })
+        .await;
+        let refusal = refused
+            .refusal
+            .expect("the second bulk must be refused whole");
+        assert!(refused.items.is_empty() && refused.errors);
+        assert!(
+            refusal.reason.starts_with("embedding passage budget"),
+            "{}",
+            refusal.reason
+        );
+        assert!((1..=60).contains(&refusal.retry_after_secs));
+
+        let first = first.await.unwrap();
+        assert!(first.refusal.is_none());
+        assert_eq!(first.items[0].status, 201, "{:?}", first.items);
+        assert_eq!(ledger.queued(), 0);
+    }
+
+    /// The decision is one decision for the whole request: two indexes that
+    /// each fit the budget alone are refused together when their sum does not.
+    #[tokio::test]
+    async fn the_budget_covers_every_index_group_of_the_request() {
+        use crate::admission::{with_test_scope, PassageLedger};
+        let (url, calls) = slow_embedding_server(std::time::Duration::from_millis(5));
+        let (_dir, engine) = proxy_semantic_engine(&["budget-a", "budget-b"], url, |c| {
+            c.embedding.bulk_passage_budget_secs = 1;
+        });
+        let ledger = Arc::new(PassageLedger::isolated());
+        // 7 + 7 = 14 passages against a budget of 10.
+        let body = format!(
+            "{}{}",
+            semantic_body("budget-a", &[3000]),
+            semantic_body("budget-b", &[3000])
+        );
+        let refused = with_test_scope(Arc::clone(&ledger), 10.0, async {
+            process_bulk(&engine, None, &body).await
+        })
+        .await;
+        assert!(refused.refusal.is_some(), "{:?}", refused.items);
+        assert_eq!(ledger.queued(), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Either half alone fits.
+        let ok = with_test_scope(Arc::clone(&ledger), 10.0, async {
+            process_bulk(&engine, None, &semantic_body("budget-a", &[3000])).await
+        })
+        .await;
+        assert!(ok.refusal.is_none());
+        assert_eq!(ok.items[0].status, 201, "{:?}", ok.items);
+        assert_eq!(ledger.queued(), 0);
+    }
+
+    /// A bulk dropped while its passages are reserved gives them back.
+    #[tokio::test]
+    async fn cancelled_semantic_bulk_returns_its_passages() {
+        use crate::admission::{with_test_scope, PassageLedger};
+        let name = "passage-budget-cancel";
+        let (url, _calls) = slow_embedding_server(std::time::Duration::from_millis(1500));
+        let (_dir, engine) = proxy_semantic_engine(&[name], url, |_| {});
+        let engine = Arc::new(engine);
+        let ledger = Arc::new(PassageLedger::isolated());
+        let task = {
+            let (engine, ledger) = (Arc::clone(&engine), Arc::clone(&ledger));
+            let body = semantic_body(name, &[1000, 1000, 1000]);
+            tokio::spawn(with_test_scope(ledger, 0.0, async move {
+                process_bulk(&engine, None, &body).await
+            }))
+        };
+        wait_until(|| ledger.queued() > 0).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(ledger.queued(), 0);
     }
 
     #[tokio::test]
