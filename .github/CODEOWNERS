@@ -1,0 +1,5 @@
+# CODEOWNERS
+# Aria Pramesi (@sorcerai) owns xerj (this estate fork; nothing goes upstream to xerj-org/xerj) as agent-admin
+# (operator ruling 2026-10-27). @todie keeps code-owner authority.
+
+* @sorcerai @todie
