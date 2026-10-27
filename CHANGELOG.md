@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the same bulk forever (the embed deadline bounds that request).
   Only the built-in neural backend measures throughput, so with `proxy` or
   ONNX embedding the rule never refuses a request.
+  In cluster mode a primary that refuses a forwarded `_bulk` answers 429 with
+  the wait, and the accepting node refuses the whole request when every owner
+  group refused it. Otherwise each refused action gets its own 429 item.
   `/v1/metrics` gains `xerj_embed_passages_queued` and the `reject` value of
   `xerj_bulk_admission_total{decision}`. The new key raises the user-facing
   settings count to 141.
