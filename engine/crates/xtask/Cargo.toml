@@ -2,12 +2,15 @@
 name = "xtask"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
-description = "Scoped repository automation and Projectfile verification for XERJ"
+description = "Scoped repository automation and Cargo workspace manifest verification for XERJ"
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+toml = { workspace = true }

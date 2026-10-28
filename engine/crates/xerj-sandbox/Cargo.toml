@@ -1,10 +1,20 @@
+# Adapted from `unsigned-gg/sbx` (https://github.com/unsigned-gg/sbx), consolidating
+# `sbx-core`, `sbx-jail`, `sbx-evidence`, and `sbx-settle` into a zero-external-git-dep
+# workspace crate for XERJ.
+#
+# Open-source collaboration on OS-level isolate primitives (Landlock V2, Seatbelt,
+# out-of-band containment evidence verification, and retained-world custody) is
+# warmly invited upstream at https://github.com/unsigned-gg/sbx.
+
 [package]
 name = "xerj-sandbox"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "OS-level sandboxed execution (Landlock V2 on Linux, Seatbelt on macOS), containment evidence verification, and retained-run custody ported from sbx."
+repository.workspace = true
+description = "OS-level sandboxed execution (Landlock V2 on Linux, Seatbelt on macOS), containment evidence verification, and retained-run custody adapted from unsigned-gg/sbx."
 
 [dependencies]
 chrono = { workspace = true }

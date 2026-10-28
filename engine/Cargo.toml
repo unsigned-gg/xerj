@@ -27,8 +27,12 @@ members = [
 [workspace.package]
 version = "1.0.0-rc.100"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["xerj Contributors"]
+repository = "https://github.com/xerj-org/xerj"
+homepage = "https://xerj.org"
+description = "High-performance hybrid full-text, vector, log, and code search engine with neural embeddings and agent memory."
 
 [workspace.dependencies]
 # Async runtime
