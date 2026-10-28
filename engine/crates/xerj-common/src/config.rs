@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **130 settings** versus
+//! Configuration is intentionally minimal: **137 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -79,7 +79,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// High-throughput turbo indexing — 3 settings.
     pub indexing: IndexingConfig,
-    /// Engine parallelism — 4 settings.
+    /// Engine parallelism and flush deadlines — 6 settings.
     pub engine: EngineConfig,
     /// Cluster / Raft settings — 5 settings.
     pub cluster: ClusterConfig,
@@ -99,12 +99,16 @@ pub struct Config {
     /// Second-stage reranking provider — 3 settings. Inert until a key is set.
     pub rerank: RerankProviderConfig,
     /// Typed decisions answered from a labelled-history index by
-    /// nearest-neighbour vote — 8 settings. Inert until `decisions.index`
+    /// nearest-neighbour vote — 9 settings. Inert until `decisions.index`
     /// names an index that exists.
     pub decisions: DecisionsConfig,
+    /// Corpus Hub hosted read-only endpoints (`/_hub/v1/…`) — 2 settings.
+    /// Inert until `hub.catalogue_path` names a catalogue file; the routes
+    /// need an API key unless `hub.public` is switched on.
+    pub hub: HubConfig,
 }
 
-// 23 sub-configs, 130 leaf settings in total. Do not maintain that sum by hand
+// 24 sub-configs, 137 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -233,6 +237,17 @@ impl Config {
         // echoed by `GET /_xerj/rerank`. Same two rules as the WAL tap target.
         if let Err(reason) = RerankProviderConfig::check_endpoint(&self.rerank.endpoint) {
             return Err(XerjError::config(reason));
+        }
+
+        // Hub: a public node validates every corpus name against the
+        // catalogue, so a public node with no catalogue answers 404 to
+        // everything while appearing to be up. Refuse that at boot.
+        if self.hub.public && self.hub.catalogue_path.trim().is_empty() {
+            return Err(XerjError::config(
+                "hub.public = true requires hub.catalogue_path: the public routes validate \
+                 every corpus name against the catalogue, and with none every request \
+                 would be a 404",
+            ));
         }
 
         // Compression: block_size_docs is documented as 16–4096 and was
@@ -373,6 +388,19 @@ impl Config {
                  vote weight of history documents carrying human: true, and 1.0 disables the \
                  boost",
                 self.decisions.human_weight
+            )));
+        }
+
+        // Decisions: escalate_below is a winning-vote-share floor in 0.0..=1.0
+        // (0.0 disables confidence escalation; #1094).
+        if !self.decisions.escalate_below.is_finite()
+            || !(0.0..=1.0).contains(&self.decisions.escalate_below)
+        {
+            return Err(XerjError::config(format!(
+                "decisions.escalate_below must be in 0.0..=1.0 (got {}); it is the winning \
+                 vote-share floor below which tier 1 escalates to the local decision tier, and \
+                 0.0 disables confidence escalation",
+                self.decisions.escalate_below
             )));
         }
 
@@ -535,13 +563,13 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (130 user-facing settings total; counted by
+// Sub-configs  (137 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Network and data-directory settings.
 ///
-/// **7 settings.**
+/// **8 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -603,6 +631,12 @@ pub struct ServerConfig {
     /// right-most address that is *not* itself a listed proxy is used — the
     /// left end of the chain is written by the caller and cannot be trusted.
     pub trusted_proxies: Vec<String>,
+    /// Multi-instance opt-in (default `false`). When `true`, a listener port
+    /// that is already in use makes the node bind the next free one, and a
+    /// `data_dir` held by another live process makes it use `<data_dir>-N`.
+    /// Off by default so a taken port stays a fatal startup error (#465).
+    #[serde(default)]
+    pub auto_port: bool,
 }
 
 impl Default for ServerConfig {
@@ -618,6 +652,7 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             allow_insecure_network_bind: false,
             trusted_proxies: Vec::new(),
+            auto_port: false,
         }
     }
 }
@@ -1512,25 +1547,60 @@ impl LogsConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One measured neural-ingest sample. Advisory: it is not configuration,
+/// it is not serialized, and it is not part of the embedding identity.
+///
+/// Recorded once after the neural model loads. Autoindex turns it into a
+/// time estimate (`corpus bytes / (probe bytes / probe seconds)`). A missing
+/// probe means "not measured" — callers must not invent a rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeuralIngestProbe {
+    /// UTF-8 bytes of the timed passages.
+    pub bytes: u64,
+    /// Passages in the timed call.
+    pub passages: u32,
+    /// Wall time of that call, in milliseconds. Zero is not a measurement.
+    pub millis: u64,
+}
+
 /// Embedding backend settings.
 ///
-/// XERJ can embed `semantic_text` fields three ways, chosen by [`mode`]:
+/// XERJ can embed `semantic_text` fields four ways, chosen by
+/// [`mode`](Self::mode):
 ///   * `"lexical"` — the zero-dependency built-in feature-hash embedder
 ///     (deterministic, 384-dim, no model, no network). This is the honest
 ///     default: lexical, *not* neural semantic understanding.
 ///   * `"neural"` — a built-in BERT sentence embedder (all-MiniLM-L6-v2 by
 ///     default) that runs in-process via `candle`. The model weights are
-///     downloaded once on first use (or read from [`local_model_dir`] for
-///     air-gapped deployments). The neural backend ships in the standard
-///     binary; a `--no-default-features` slim build omits it and falls back
-///     to lexical.
-///   * `"proxy"` — call an external OpenAI-compatible `/v1/embeddings`
-///     endpoint ([`default_endpoint`]). Lets customers plug in ANY embedding
-///     model / provider they already run. An explicit `mode = "proxy"` with a
+///     downloaded and loaded at startup (or read from
+///     [`local_model_dir`](Self::local_model_dir) for
+///     air-gapped deployments; `HF_ENDPOINT` selects a Hub mirror). If that
+///     load fails, the process refuses to start (#1840) instead of accepting
+///     traffic and failing every ingest. It does not substitute the lexical
+///     embedder: those vectors are not comparable with neural vectors, the
+///     same fail-closed rule as explicit `"proxy"` (#1189). The neural
+///     backend ships in the standard binary; a `--no-default-features` slim
+///     build omits it and falls back to lexical, and identity reports lexical.
+///   * `"proxy"` — call an external OpenAI-compatible embeddings
+///     endpoint ([`default_endpoint`](Self::default_endpoint)). Lets
+///     customers plug in ANY embedding model / provider they already run.
+///     The configured value may be a base URL ending in `/v1` (trailing
+///     slash optional) or a bare host — `/embeddings` is appended — or the
+///     full path ending in `/embeddings`, which is used unchanged. Any other
+///     path is a startup ERROR that names the URL and the
+///     `{origin}/v1/embeddings` path to set. An explicit `mode = "proxy"` with a
 ///     missing or unusable endpoint is a startup ERROR (#1189): silently
 ///     running lexical instead would write the wrong vectors into the index
 ///     while every embedding request appears to succeed.
-///   * `"auto"` (default) — use the proxy when [`default_endpoint`] is set,
+///   * `"onnx-experimental"` — a local FP32 ONNX model and tokenizer
+///     ([`onnx_model_path`](Self::onnx_model_path),
+///     [`onnx_tokenizer_path`](Self::onnx_tokenizer_path)) run through ONNX
+///     Runtime; never auto-downloaded. Needs a build with the
+///     `onnx-experimental` feature and is fail-closed: a build without it, or
+///     a missing model or tokenizer, is a startup error, never a lexical
+///     fallback.
+///   * `"auto"` (default) — use the proxy when
+///     [`default_endpoint`](Self::default_endpoint) is set,
 ///     otherwise lexical; if the endpoint fails to initialize, fall back to
 ///     lexical with a warning. The fallback exists ONLY on this path (#1189).
 ///
@@ -1538,10 +1608,25 @@ impl LogsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`, or
-    /// `"proxy"`. Unknown values are treated as `"auto"`.
+    /// Backend selector: `"auto"` (default), `"lexical"`, `"neural"`,
+    /// `"proxy"`, or `"onnx-experimental"`. Unknown values are treated as
+    /// `"auto"`.
     pub mode: String,
-    /// OpenAI-compatible endpoint URL (default: `""` — disabled).
+    /// OpenAI-compatible embeddings URL (default: `""` — disabled).
+    ///
+    /// Accepted forms, trailing slash optional (#2355):
+    /// * a base whose path ends in `/v1` — `/embeddings` is appended
+    ///   (`http://localhost:8000/v1` becomes
+    ///   `http://localhost:8000/v1/embeddings`)
+    /// * a bare origin (`http://host:port` or with only `/`) — `/embeddings`
+    ///   is appended
+    /// * a path that already ends in `/embeddings` — used as given
+    ///
+    /// Any other path refuses to start when [`mode`](Self::mode) is
+    /// `"proxy"` and names this URL plus `{origin}/v1/embeddings`. The value
+    /// stored here is also the proxy half of the embedder identity, so
+    /// changing it after a corpus is indexed is a different embedder even
+    /// when the resolved request URL would be the same.
     pub default_endpoint: String,
     /// Model name to request from the endpoint (default: `""`).
     pub default_model: String,
@@ -1605,6 +1690,32 @@ pub struct EmbeddingConfig {
     #[serde(skip)]
     pub runtime_onnx_assets:
         std::sync::Arc<std::sync::OnceLock<Result<EmbeddingAssetSnapshot, String>>>,
+    /// Vector width last confirmed for this proxy endpoint and model (#2306).
+    ///
+    /// Filled by the engine, not by configuration. Cloned configs share the
+    /// cell. Empty until a probe (or the on-disk fallback) succeeds; identity
+    /// reporting then treats the proxy as resumable and publishes the width.
+    /// Serde skips it: it is not a setting and must not round-trip through a
+    /// config file.
+    #[serde(skip)]
+    pub runtime_proxy_width: std::sync::Arc<std::sync::RwLock<Option<ConfirmedProxyWidth>>>,
+    /// Neural ingest probe, shared by cloned configs (the server preloads
+    /// from a clone). `None` inside the cell means the probe ran and did not
+    /// produce a rate; an empty cell means it has not run. Not a setting.
+    #[serde(skip)]
+    pub neural_ingest_probe: std::sync::Arc<std::sync::OnceLock<Option<NeuralIngestProbe>>>,
+}
+
+/// Vector width a proxy embedder confirmed for one endpoint and model.
+///
+/// The digest of a proxy identity stays the configured model and endpoint
+/// (#533). This width is the other half of that identity: autoindex compares
+/// it on resume and refuses to mix a different width into an existing corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmedProxyWidth {
+    pub endpoint: String,
+    pub model: String,
+    pub dimensions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1639,6 +1750,8 @@ impl Default for EmbeddingConfig {
             onnx_max_input_bytes_per_call: 8 * 1024 * 1024,
             onnx_max_inflight_input_bytes: 32 * 1024 * 1024,
             runtime_onnx_assets: std::sync::Arc::new(std::sync::OnceLock::new()),
+            runtime_proxy_width: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            neural_ingest_probe: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -1646,9 +1759,10 @@ impl Default for EmbeddingConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sentinel value of [`LimitsConfig::max_process_memory_mb`] meaning **AUTO**:
-/// pick the process-memory cap from the machine size in binary-GiB steps
-/// (8 / 16 / 32 GiB) rather than a flat number. It is the serde default, so an
-/// omitted field resolves to AUTO; the governor intercepts it before any budget
+/// pick the process-memory cap from the machine size (half of RAM under
+/// 16 GiB, then 8 / 16 / 32 GiB) rather than a flat number. It is the serde
+/// default, so an omitted field resolves to AUTO; the governor intercepts it
+/// before any budget
 /// math, so this literal never reaches a budget as a byte count. `u64::MAX` is
 /// used because no operator sets a 16-EiB cap — it is a reserved, unmistakable
 /// "not a real MiB value" marker, distinct from `0` (uncapped, the whole
@@ -1657,7 +1771,7 @@ pub const AUTO_PROCESS_MEMORY_MB: u64 = u64::MAX;
 
 /// Resource limits.
 ///
-/// **14 settings.**
+/// **15 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -1687,6 +1801,22 @@ pub struct LimitsConfig {
     /// path inside `data_dir` or inside one of these bases.
     #[serde(default)]
     pub snapshot_repo_allowlist: Vec<String>,
+    /// Let a snapshot **restore** (never a create) read from the Corpus Hub pack
+    /// cache of the user the server runs as — `$XERJ_HUB_HOME/packs`, else
+    /// `~/.xerj/hub/packs` (`xerj_common::hub::hub_packs_dir`) — without listing
+    /// it in `snapshot_repo_allowlist` (default: `true`).
+    ///
+    /// `xerj hub pull` / `xerj ask` download a signed pack, verify it, extract it
+    /// under that directory and ask the server to restore it. Before this, only
+    /// the node XERJ starts for itself allowlisted the directory, so a server the
+    /// user started by hand refused every pull. The grant is deliberately
+    /// narrower than an allowlist entry: restore only (a client cannot write a
+    /// snapshot into the user's home), honoured only while the directory is a
+    /// real directory — not a symlink — owned by the server's own user, and the
+    /// repo location is still canonicalized, so a symlink inside the cache that
+    /// points elsewhere is refused. Set `false` to allow `data_dir` and the
+    /// allowlist only.
+    pub hub_pack_restore: bool,
     /// Maximum HTTP request body size in bytes (default: `100 * 1024 * 1024`,
     /// i.e. 100 MiB). Caps NDJSON bulk payloads, large mget bodies, etc.
     /// Raise this only if your client routinely sends bigger requests; the
@@ -1756,17 +1886,29 @@ pub struct LimitsConfig {
     /// Ceiling on the machine size every other memory budget is derived FROM,
     /// in MiB. **Omitted / default = AUTO** ([`AUTO_PROCESS_MEMORY_MB`]): XERJ
     /// picks the cap from the effective (cgroup-aware) memory it can actually
-    /// see, in binary-GiB steps —
+    /// see —
     ///
-    ///   effective < 64 GiB             → 8 GiB cap
+    ///   effective < 16 GiB             → half of that RAM
+    ///   16 GiB ≤ effective < 64 GiB    → 8 GiB cap
     ///   64 GiB ≤ effective < 128 GiB   → 16 GiB cap
     ///   effective ≥ 128 GiB            → 32 GiB cap
     ///
     /// so a laptop is never sized for ~20 GiB of memtables and a big server is
-    /// no longer starved by a flat 8 GiB. Every budget in `ResourceGovernor`
+    /// no longer starved by a flat 8 GiB. A host under 16 GiB used to take the
+    /// 8 GiB step and then the machine, so an 8 GiB box's budget was all of
+    /// its RAM; half of RAM leaves room for the OS during a merge (#1122).
+    /// At 16 GiB the half-RAM step and the 8 GiB step are the same number.
+    /// Every budget in `ResourceGovernor`
     /// derives from `effective_memory_limit_bytes()` = min(cgroup limit, total
     /// system RAM); capping that ONE base is what makes every dependent budget
     /// shrink coherently instead of each growing its own ceiling.
+    ///
+    /// On Windows that base is then lowered to what this process can still
+    /// commit (`GlobalMemoryStatusEx` commit limit and available commit, minus
+    /// a reserve). Physical RAM alone is not a commit budget: with no pagefile
+    /// the commit limit is about RAM, and other processes' commit charge is
+    /// already spent, so an allocation aborts the process while RSS is still
+    /// under the physical-RAM tier (#1122). Linux and macOS are unchanged.
     ///
     /// The cap only ever LOWERS the base — `min(machine, cap)`, never invented
     /// headroom: on a 40 GiB box the 8 GiB tier still yields 8, and under a
@@ -1792,6 +1934,7 @@ impl Default for LimitsConfig {
             max_fields_per_index: 500,
             max_actions_per_bulk: 50_000,
             snapshot_repo_allowlist: Vec::new(),
+            hub_pack_restore: true,
             max_body_bytes: 100 * 1024 * 1024,
             max_result_window: 10_000,
             max_mget_docs: 10_000,
@@ -1800,7 +1943,7 @@ impl Default for LimitsConfig {
             max_segment_hydration_cache_mb: 0, // 0 = 20% effective memory, no floor
             memory_watermark_percent: 95,
             disk_flood_stage_percent: 95,
-            // AUTO: tier the cap (8/16/32 GiB) off the machine at governor
+            // AUTO: half of RAM under 16 GiB, then 8/16/32 GiB, at governor
             // build time. 0 = uncapped (whole machine); N = a fixed MiB cap.
             max_process_memory_mb: AUTO_PROCESS_MEMORY_MB,
         }
@@ -1890,13 +2033,15 @@ impl IndexingConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Engine parallelism settings for vertical scaling.
+/// Engine parallelism and flush-deadline settings.
 ///
 /// Controls how many independent ingest/flush/search pipelines run in
-/// parallel.  The default is tuned for the host's core count.  Increase
-/// `ingest_shards` on high-core-count machines for linear throughput scaling.
+/// parallel, and how long a flush may wait before it fails instead of
+/// parking a refresh forever.  The worker defaults are tuned for the host's
+/// core count.  Increase `ingest_shards` on high-core-count machines for
+/// linear throughput scaling.
 ///
-/// **4 settings.**
+/// **6 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
@@ -1921,6 +2066,25 @@ pub struct EngineConfig {
     /// (default: every core).  Search is the path a user waits on, so it gets
     /// the whole machine unless you deliberately hold cores back.
     pub search_workers: usize,
+    /// How long a shard flush waits for a flush-admission permit — the
+    /// per-index `flush_sema` or the process-global finalize gate — before
+    /// failing (default: [`Self::DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS`]).
+    ///
+    /// The wait is before the memtable freeze, so a timeout drops no
+    /// documents and the flush can be retried. A healthy finalize is well
+    /// under a second; this bound exists so a permit held by a wedged
+    /// finalize cannot park every later flush (#1635).
+    /// `XERJ_FLUSH_ADMIT_TIMEOUT_SECS` overrides it for one run.
+    pub flush_admit_timeout_secs: u64,
+    /// How long `flush` / `refresh` waits for one index's flush before
+    /// returning an error that names the index (default:
+    /// [`Self::DEFAULT_FLUSH_TIMEOUT_SECS`]).
+    ///
+    /// Must be at least [`Self::flush_admit_timeout_secs`]. A publication
+    /// that has already frozen the memtable is not cancelled; the caller
+    /// stops waiting and can retry. `XERJ_FLUSH_TIMEOUT_SECS` overrides it
+    /// for one run.
+    pub flush_timeout_secs: u64,
 }
 
 impl Default for EngineConfig {
@@ -1932,11 +2096,23 @@ impl Default for EngineConfig {
             flush_workers: threads_for(Workload::Maintenance),
             merge_workers: threads_for(Workload::Maintenance),
             search_workers: threads_for(Workload::Latency),
+            flush_admit_timeout_secs: Self::DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS,
+            flush_timeout_secs: Self::DEFAULT_FLUSH_TIMEOUT_SECS,
         }
     }
 }
 
 impl EngineConfig {
+    /// How long a flush may wait for admission before failing, in seconds.
+    /// See [`Self::flush_admit_timeout_secs`].
+    pub const DEFAULT_FLUSH_ADMIT_TIMEOUT_SECS: u64 = 120;
+    /// How long a caller waits for one index's flush, in seconds.
+    /// See [`Self::flush_timeout_secs`].
+    pub const DEFAULT_FLUSH_TIMEOUT_SECS: u64 = 300;
+    /// Upper bound on either flush deadline. Past a day the value is a typo,
+    /// and an unbounded wait is the hang #1635 exists to end.
+    pub const MAX_FLUSH_TIMEOUT_SECS: u64 = 86_400;
+
     /// Upper bound on any of the worker knobs. Threads are not free: past this
     /// the request is far more likely to be a typo than an intention, and a
     /// silently clamped typo is the bug class in #204.
@@ -1969,6 +2145,30 @@ impl EngineConfig {
                     Self::MAX_WORKERS
                 )));
             }
+        }
+        // A zero deadline would fail every flush; a missing deadline is the
+        // #1635 hang. Refuse both rather than clamping.
+        if !(1..=Self::MAX_FLUSH_TIMEOUT_SECS).contains(&self.flush_admit_timeout_secs) {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_admit_timeout_secs must be from 1 to {} seconds, got {}",
+                Self::MAX_FLUSH_TIMEOUT_SECS,
+                self.flush_admit_timeout_secs
+            )));
+        }
+        if !(1..=Self::MAX_FLUSH_TIMEOUT_SECS).contains(&self.flush_timeout_secs) {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_timeout_secs must be from 1 to {} seconds, got {}",
+                Self::MAX_FLUSH_TIMEOUT_SECS,
+                self.flush_timeout_secs
+            )));
+        }
+        if self.flush_timeout_secs < self.flush_admit_timeout_secs {
+            return Err(crate::XerjError::config(format!(
+                "engine.flush_timeout_secs ({}) must be at least \
+                 engine.flush_admit_timeout_secs ({}) so a flush can finish \
+                 waiting for admission",
+                self.flush_timeout_secs, self.flush_admit_timeout_secs
+            )));
         }
         Ok(())
     }
@@ -2636,7 +2836,7 @@ impl RerankProviderConfig {
 /// weighted nearest-neighbour vote over a labelled-history index — the
 /// retrieval analogue of a judge model, with the evidence staying on the node.
 ///
-/// **8 settings.**
+/// **9 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DecisionsConfig {
@@ -2657,6 +2857,13 @@ pub struct DecisionsConfig {
     /// `/_decide` abstains below this vote share (0 = never abstain; the
     /// `/v1/systemone` wire has no abstain field and errors instead).
     pub min_confidence: f64,
+    /// Winning vote-share floor in `0.0..=1.0` below which a tier-1 history
+    /// vote escalates to the tier-2 local decision head when armed
+    /// (`XERJ_DECIDE_MODE=local`, issue #1094). Default `0.8` matches the
+    /// flywheel gate's confidence bar so low-confidence history hits do not
+    /// freeze write-back; `0.0` disables confidence escalation. With no local
+    /// tier armed, a vote below this floor still answers from history.
+    pub escalate_below: f64,
     /// How much more a human correction weighs in the vote than a cached or
     /// seeded example, when the history document carries `human: true`
     /// (issue #1061). 2.0 — the issue's ≥ 2x floor for corrections — is the
@@ -2679,11 +2886,43 @@ impl Default for DecisionsConfig {
             text_field: "text".to_string(),
             positive_label: "true".to_string(),
             min_confidence: 0.0,
+            escalate_below: 0.8,
             human_weight: 2.0,
             calibration: CalibrationMethod::None,
         }
     }
 }
+
+/// Corpus Hub hosted endpoints: four read-only `GET` routes under
+/// `/_hub/v1/` that answer from the pre-indexed packs restored on this node
+/// (`catalogue`, `def/{slug}/{symbol}`, `code/{slug}`, `search`). They are
+/// served on the Elasticsearch-compatible listener (`server.es_compat_port`),
+/// next to `/_memory`, not on the native one.
+///
+/// **2 settings.**
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubConfig {
+    /// Let those four routes — and nothing else — answer without an API key
+    /// (default: `false`, every route needs a key).
+    ///
+    /// With `true`, `GET /_hub/v1/catalogue`, `/_hub/v1/def/{slug}/{symbol}`,
+    /// `/_hub/v1/code/{slug}` and `/_hub/v1/search` skip authentication,
+    /// authorization and the audit log. Every other route on the node keeps
+    /// all three. The four routes are read-only, only ever query `xc-*`
+    /// indices, and are rate-limited to 60 requests a minute per client
+    /// address (`429` with `Retry-After`). Behind a reverse proxy, list the
+    /// proxy in `server.trusted_proxies`; without it every client shares the
+    /// proxy's address and therefore one 60-a-minute budget.
+    pub public: bool,
+    /// Path to the signed `catalogue.json` this node serves at
+    /// `GET /_hub/v1/catalogue` and validates every corpus name against
+    /// (default: `""` — none). A corpus name that is not in the file is a
+    /// `404`. Required when `public = true`. Prefer an absolute path: a
+    /// relative one resolves against the server's working directory.
+    pub catalogue_path: String,
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2710,6 +2949,35 @@ mod tests {
         // and not judged.
         assert!(RerankProviderConfig::check_resolved_endpoint(good, Some(bad)).is_ok());
         assert!(RerankProviderConfig::check_resolved_endpoint(bad, Some(good)).is_err());
+    }
+
+    /// `[hub]` is closed and fail-closed: a typo is a boot error, the
+    /// defaults leave every route behind the API key, and a public node with
+    /// no catalogue is refused rather than left answering 404 to everything.
+    #[test]
+    fn hub_section_defaults_closed_and_public_requires_a_catalogue() {
+        let d = Config::default();
+        assert!(!d.hub.public, "the hosted routes are keyed by default");
+        assert!(d.hub.catalogue_path.is_empty());
+
+        let ok = Config::from_toml_str(
+            "[hub]\npublic = true\ncatalogue_path = \"/srv/hub/catalogue.json\"\n",
+        )
+        .expect("a public node with a catalogue is valid");
+        assert!(ok.hub.public);
+        assert_eq!(ok.hub.catalogue_path, "/srv/hub/catalogue.json");
+
+        let err = Config::from_toml_str("[hub]\npublic = true\n")
+            .expect_err("public without a catalogue must be refused at boot");
+        assert!(
+            err.to_string().contains("hub.catalogue_path"),
+            "the error names the setting to set: {err}"
+        );
+        // A private node needs no catalogue to boot.
+        Config::from_toml_str("[hub]\npublic = false\n").expect("private, no catalogue");
+
+        // Closed: a misspelt key is an error, not a silently ignored line.
+        assert!(Config::from_toml_str("[hub]\npubic = true\n").is_err());
     }
 
     #[test]
@@ -2833,6 +3101,30 @@ mod tests {
         let cfg = Config::from_toml_str("[embedding]\ntimeout_ms = 900\n")
             .expect("a sub-second timeout is a valid timeout");
         assert_eq!(cfg.embedding.timeout_ms, 900);
+    }
+
+    #[test]
+    fn flush_deadlines_must_be_positive_and_ordered() {
+        let zero = Config::from_toml_str("[engine]\nflush_admit_timeout_secs = 0\n");
+        let err = zero.expect_err("a zero flush admission timeout must be refused");
+        assert!(
+            err.to_string().contains("flush_admit_timeout_secs"),
+            "the error must name the setting, got: {err}"
+        );
+        let inverted = Config::from_toml_str(
+            "[engine]\nflush_admit_timeout_secs = 90\nflush_timeout_secs = 30\n",
+        );
+        let err = inverted.expect_err("the flush timeout must cover admission");
+        assert!(
+            err.to_string().contains("flush_timeout_secs"),
+            "the error must name the setting, got: {err}"
+        );
+        let cfg = Config::from_toml_str(
+            "[engine]\nflush_admit_timeout_secs = 30\nflush_timeout_secs = 90\n",
+        )
+        .expect("a shorter admission bound inside the flush bound is valid");
+        assert_eq!(cfg.engine.flush_admit_timeout_secs, 30);
+        assert_eq!(cfg.engine.flush_timeout_secs, 90);
     }
 
     #[test]
@@ -3577,7 +3869,7 @@ mod tests {
     /// module header, in `xerj-common/src/lib.rs`, in `engine/README.md` and in
     /// `xerj.default.toml`) — change the table and the prose together.
     const SETTINGS_BY_SECTION: &[(&str, usize)] = &[
-        ("server", 7),
+        ("server", 8),
         ("auth", 3),
         ("cors", 2),
         ("tls", 4),
@@ -3588,9 +3880,9 @@ mod tests {
         ("vector", 6),
         ("logs", 2),
         ("embedding", 20),
-        ("limits", 14),
+        ("limits", 15),
         ("indexing", 3),
-        ("engine", 4),
+        ("engine", 6),
         ("cluster", 5),
         ("pit", 3),
         ("search_context", 7),
@@ -3599,7 +3891,8 @@ mod tests {
         ("lifecycle", 1),
         ("wal_tap", 10),
         ("rerank", 3),
-        ("decisions", 8),
+        ("decisions", 9),
+        ("hub", 2),
     ];
 
     /// Count the settings by *counting them*.
@@ -3642,7 +3935,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 130,
+            total, 137,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \

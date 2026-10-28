@@ -8,14 +8,15 @@
 //! (`xerj corpus index`). Exit codes: 0 hits / 1 no-match-or-incomplete /
 //! 2 usage-transport-stale / 3 corpus-in-state-but-not-loaded-here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use xerj_common::localauth::{discover_local_admin_key, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
 use xerj_common::xccode::{self, manifest, state, CodeOutcome, CodeParams, Mode, XcHttp};
 
 use crate::esclient::{Count, Es};
@@ -30,8 +31,9 @@ pub fn code_root() -> PathBuf {
             return PathBuf::from(home);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".xerj-code")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".xerj-code")
 }
 
 /// `--url` flag > `XERJ_URL` > `http://localhost:9200`. Unlike `autoindex`
@@ -54,7 +56,7 @@ fn build_es(url: &str, api_key: Option<String>) -> Result<Es> {
                 Some(k) => Some(k),
                 None => {
                     if url_is_loopback(url) {
-                        discover_local_admin_key().map(|(k, path)| {
+                        discover_local_admin_key_for_url(url).map(|(k, path)| {
                             eprintln!(
                                 "xerj code: no --api-key/XERJ_API_KEY given; using the admin \
                                  key at {}",
@@ -108,6 +110,183 @@ fn emit(out: &CodeOutcome) {
     }
 }
 
+// ── empty ledger, but the node already has autoindex prefixes (#2181) ──────
+//
+// `xerj code` / `xerj corpus` read `~/.xerj-code`. `xerj autoindex --prefix`
+// writes the node's catalog and does not touch that directory, so an empty
+// ledger used to read as "nothing is indexed" on a node that already answers
+// `xerj search --prefix`. The hint names those prefixes. It is one short
+// request: [`Es::search`] retries a dead node for ~8s of backoff, and this
+// path must stay quiet instead.
+
+/// How long the hint waits for a connect. A refused port returns at once;
+/// a blackhole must not hold `xerj corpus list`.
+const CATALOG_HINT_CONNECT: Duration = Duration::from_millis(800);
+/// Whole-request budget, connect included. One attempt, no retry.
+const CATALOG_HINT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Catalog replies larger than this are not a prefix list. Ignore them.
+const CATALOG_HINT_BODY_CAP: usize = 1024 * 1024;
+/// How many prefix names the hint prints before it says "N more".
+const CATALOG_HINT_PREFIX_CAP: usize = 8;
+
+/// `{root}/state` has no `*.json` ledger. A missing directory is empty.
+fn ledger_is_empty(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join("state")) else {
+        return true;
+    };
+    !entries
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+}
+
+/// A prefix safe to paste into the hint's command. Anything else (spaces,
+/// quotes, a newline) is dropped so a catalog value cannot forge a line.
+fn hintable_prefix(prefix: &str) -> bool {
+    (1..=128).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The lines to print. `None` when nothing safe remains.
+fn format_autoindex_prefix_hint(prefixes: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = prefixes
+        .iter()
+        .map(String::as_str)
+        .filter(|prefix| hintable_prefix(prefix))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let example = *names.first()?;
+    let shown = if names.len() <= CATALOG_HINT_PREFIX_CAP {
+        names.join(", ")
+    } else {
+        format!(
+            "{}, … ({} more)",
+            names[..CATALOG_HINT_PREFIX_CAP].join(", "),
+            names.len() - CATALOG_HINT_PREFIX_CAP
+        )
+    };
+    let each = if names.len() > 1 {
+        " (same --prefix for each)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "this node's autoindex catalog has prefixes: {shown}\n\
+         search them with `xerj search --prefix {example}` or `xerj def --prefix {example}`{each}; \
+         register a folder for `xerj code` with `xerj corpus add <name> <path>`"
+    ))
+}
+
+/// Explicit key, else `XERJ_API_KEY`, else the loopback admin key. Silent:
+/// the hint must not announce a key and then say nothing when the node is down.
+fn resolve_hint_key(url: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(key) = explicit.filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    if let Some(key) = std::env::var("XERJ_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key);
+    }
+    if url_is_loopback(url) {
+        discover_local_admin_key_for_url(url).map(|(key, _path)| key)
+    } else {
+        None
+    }
+}
+
+/// Distinct `prefix` values on catalog run documents.
+///
+/// Same query as `catalog_run_prefixes` in `search.rs`: `doc_kind: run`,
+/// `_source: prefix`, size 200. `None` when `/hits/hits` is absent — that is
+/// not an empty catalog.
+fn prefixes_from_catalog_hits(v: &Value) -> Option<Vec<String>> {
+    let hits = v.pointer("/hits/hits")?.as_array()?;
+    let mut prefixes = BTreeSet::new();
+    for hit in hits {
+        if let Some(prefix) = hit.pointer("/_source/prefix").and_then(Value::as_str) {
+            if !prefix.is_empty() {
+                prefixes.insert(prefix.to_string());
+            }
+        }
+    }
+    Some(prefixes.into_iter().collect())
+}
+
+/// One catalog read. `None` on any failure, including a node that is not
+/// there: callers print nothing in that case.
+fn fetch_catalog_run_prefixes(url: &str, explicit_key: Option<&str>) -> Option<Vec<String>> {
+    let http = crate::esclient::node_blocking_builder(url)
+        .connect_timeout(CATALOG_HINT_CONNECT)
+        .timeout(CATALOG_HINT_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok()?;
+    let body = json!({
+        "size": 200,
+        "query": { "term": { "doc_kind": "run" } },
+        "_source": ["prefix"]
+    });
+    let endpoint = format!(
+        "{}/{}/_search",
+        url.trim_end_matches('/'),
+        xerj_common::AUTOINDEX_CATALOG_INDEX
+    );
+    let mut req = http.post(endpoint).json(&body);
+    if let Some(key) = resolve_hint_key(url, explicit_key) {
+        req = req.header("Authorization", format!("ApiKey {key}"));
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?;
+    if bytes.len() > CATALOG_HINT_BODY_CAP {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&bytes).ok()?;
+    prefixes_from_catalog_hits(&parsed)
+}
+
+/// Hint text, or `None` when the node did not answer or has no safe prefix.
+fn catalog_prefix_hint(url: &str, explicit_key: Option<&str>) -> Option<String> {
+    format_autoindex_prefix_hint(&fetch_catalog_run_prefixes(url, explicit_key)?)
+}
+
+/// After a not-indexed refusal, when the ledger itself is empty. A stale
+/// index, a bad state file, or a transport error already names its own next
+/// step, and those ledgers are not empty.
+fn append_autoindex_prefix_hint(
+    out: &mut CodeOutcome,
+    root: &Path,
+    url: &str,
+    api_key: Option<&str>,
+) {
+    if out.exit != 2 || !out.to_stderr || !ledger_is_empty(root) {
+        return;
+    }
+    let Some(hint) = catalog_prefix_hint(url, api_key) else {
+        return;
+    };
+    if !out.text.is_empty() && !out.text.ends_with('\n') {
+        out.text.push('\n');
+    }
+    out.text.push_str(&hint);
+}
+
+fn push_prefix_hint(stderr: &mut String, url: &str) {
+    if let Some(hint) = catalog_prefix_hint(url, None) {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&hint);
+        stderr.push('\n');
+    }
+}
+
 // ── xerj code ───────────────────────────────────────────────────────────────
 
 const CODE_USAGE: &str =
@@ -118,6 +297,10 @@ const CODE_USAGE: &str =
 retrieval over a reference corpus (see `xerj corpus list`):
   -k N            passages to return (default 5)
   --mode MODE     bm25 (default, measured 12/12 top-3), semantic, or hybrid
+                  Default ranking is lexical: it matches the words you typed,
+                  and it is not a neural reading of the code. --mode semantic
+                  and --mode hybrid embed with lexical feature hashing unless
+                  the node was started with --embed-mode neural.
   --hybrid        shorthand for --mode hybrid
   --lang LG       filter to one language field (e.g. rust, go)
   --full N        max chars per passage (default 800; 0 = file head only)
@@ -131,16 +314,33 @@ retrieval over a reference corpus (see `xerj corpus list`):
 
 /// `xerj code …` — returns the process exit code.
 pub fn run_code_cli(args: &[String]) -> i32 {
+    match code_cli_outcome(args) {
+        CodeCliDone::Printed(code) => code,
+        CodeCliDone::Outcome(out) => {
+            let code = out.exit;
+            emit(&out);
+            code
+        }
+    }
+}
+
+enum CodeCliDone {
+    /// Usage and client-build failures already printed their own lines.
+    Printed(i32),
+    Outcome(CodeOutcome),
+}
+
+fn code_cli_outcome(args: &[String]) -> CodeCliDone {
     let mut corpus: Option<String> = None;
     let mut query: Option<String> = None;
     let mut url: Option<String> = None;
     let mut api_key: Option<String> = None;
     let mut p = CodeParams::new("", "");
     let mut i = 0;
-    let bad = |msg: String| -> i32 {
+    let bad = |msg: String| -> CodeCliDone {
         eprintln!("{msg}\n");
         eprintln!("{CODE_USAGE}");
-        2
+        CodeCliDone::Printed(2)
     };
     while i < args.len() {
         let a = &args[i];
@@ -158,7 +358,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{CODE_USAGE}");
-                return 0;
+                return CodeCliDone::Printed(0);
             }
             "-k" => {
                 let v = val!("-k");
@@ -167,7 +367,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
                     _ => return bad(format!("xerj code: -k must be 1..=50, got '{v}'")),
                 }
             }
-            "--lang" => p.lang = Some(val!("--lang")),
+            "--lang" => p.lang = Some(crate::extract::code::lang_filter_value(&val!("--lang"))),
             "--mode" => {
                 let v = val!("--mode");
                 match Mode::parse(&v) {
@@ -209,31 +409,41 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         return bad("xerj code: both <corpus> and \"<query>\" are required".to_string());
     };
     let url = resolve_url(url.as_deref());
-    let es = match build_es(&url, api_key) {
+    let es = match build_es(&url, api_key.clone()) {
         Ok(es) => es,
         Err(e) => {
             eprintln!("xerj code: cannot reach {url}: {e:#}");
-            return 2;
+            return CodeCliDone::Printed(2);
         }
     };
     p.corpus = corpus;
     p.query = query;
-    let out = xccode::run_code_query(&code_root(), &EsXc(&es), &url, &p, "`--stale-ok`");
-    emit(&out);
-    out.exit
+    let root = code_root();
+    let mut out = xccode::run_code_query(&root, &EsXc(&es), &url, &p, "`--stale-ok`");
+    append_autoindex_prefix_hint(&mut out, &root, &url, api_key.as_deref());
+    CodeCliDone::Outcome(out)
 }
 
 // ── xerj corpus add ─────────────────────────────────────────────────────────
 
 const CORPUS_USAGE: &str =
-    "usage: xerj corpus add <name> <git-url>... | --from <manifest.json|pack-dir|pack.zip> [--as <name>] [--verify-sig <pubkey-file>]
+    "usage: xerj corpus add [--own] <name> <git-url>... | --from <manifest.json|pack-dir|pack.zip> [--as <name>] [--verify-sig <pubkey-file>]
+       xerj corpus own <name> [--off]
        xerj corpus build <name> [--recipe <path>] [--fresh]
        xerj corpus sign <pack-dir> --key <seed-file>
        xerj corpus keygen --out <prefix>
-       xerj corpus index <name> [--fresh] [--url URL]
+       xerj corpus index <name> [--fresh] [--url URL] [--include-data]
+         (can outlive an agent tool timeout; stopping is safe, re-run to resume)
        xerj corpus list [--url URL]
 
+a flag may precede the verb (xerj corpus --url URL index <name>);
 clone the repos, detect licences, write corpora/<name>/corpus.json;
+a repo entry may set 'paths' to relative directories (for example data/osv)
+and the checkout harvests only those; omit it to harvest the whole pin, and
+the list is written back into corpus.json;
+a local checkout's root .xerjignore is copied into the clone when it differs
+from the committed file (git clone drops an untracked or uncommitted one);
+a pinned --from rebuild stays exact and does not copy it, and says so;
 --from takes the corpus name from the manifest's 'corpus' field (or the
 pack's 'pack' field) unless <name> or --as overrides it; a harvested pack
 also checksum-verifies and materializes records per source; --verify-sig
@@ -243,7 +453,21 @@ refuses the pack on failure (for a pack.zip, the sig cannot travel inside
 is where the lookup falls back to); build harvests recipe sources into a
 deterministic pack under builds/<name>/ (see tools/xerj-code/); sign/keygen
 are the publish step (ed25519 over SHA256SUMS);
-index builds/verifies/switches the corpus (exit 3 skips junk — normal);
+index builds/verifies/switches the corpus (exit 3 skips junk — normal); it
+skips CSV/HDF/simulation output by default (reference corpora are code and
+docs, and a test-output folder can out-record the whole corpus) —
+--include-data indexes those files too, reporting how many were left out;
+at the end it prints a short per-file-class summary of what was indexed
+and what data files were left out;
+--own marks THIS corpus as your own first-party code and writes \"own\":true
+in its corpus.json. An unidentified licence (UNKNOWN or NONE-FOUND) stays
+recorded and is still printed on each hit, but xerj code and xerj_code_search
+omit the do-not-copy banner for that unidentified licence. A licence the
+detector actually named (GPL, AGPL, MPL, …) still warns. A local path is
+not marked own unless you pass the flag, and a --from manifest cannot set
+it — that file is untrusted. Re-adding the corpus keeps a marker already
+recorded. `xerj corpus own <name>` sets it on an existing corpus; `--off`
+clears it. Hub pack licence classes are unchanged;
 list shows what is loaded on this node.";
 
 pub(crate) fn git(dir: Option<&Path>, args: &[&str]) -> Result<(i32, String)> {
@@ -262,24 +486,114 @@ pub(crate) fn git(dir: Option<&Path>, args: &[&str]) -> Result<(i32, String)> {
     ))
 }
 
+/// How much of git's own stdout/stderr a fetch failure keeps. A TLS
+/// intercept or a rejected pin is a paragraph; the rest of the bail stays
+/// one line an agent can read.
+const GIT_FETCH_OUTPUT_CAP: usize = 500;
+
+/// `git fetch <sha>` failed. Keep git's text (capped) and, when that text
+/// names the failure, say what to do. A GnuTLS/TLS line is the intercepting
+/// proxy from the 2026-10-17 workstation report; `not our ref` is a pin the
+/// remote does not have (go-vulndb). Neither hint invents a replacement sha.
+pub(crate) fn git_fetch_failure(sha: &str, output: &str) -> String {
+    let trimmed = output.trim();
+    let shown: String = trimmed.chars().take(GIT_FETCH_OUTPUT_CAP).collect();
+    let mut msg = if shown.is_empty() {
+        format!("git fetch {sha} failed")
+    } else {
+        format!("git fetch {sha} failed: {shown}")
+    };
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("gnutls")
+        || lower.contains("ssl")
+        || lower.contains("certificate")
+        || lower.contains("tls")
+    {
+        msg.push_str(
+            ". HTTPS failed before any objects arrived: check HTTPS_PROXY and \
+             SSL_CERT_FILE or GIT_SSL_CAINFO, or index a local checkout instead of \
+             `xerj corpus add --from`",
+        );
+    } else if lower.contains("not our ref")
+        || lower.contains("couldn't find remote ref")
+        || lower.contains("could not find remote ref")
+    {
+        msg.push_str(
+            ". The pinned commit is not on the remote. Do not invent a replacement \
+             pin; check the manifest sha against the upstream repo",
+        );
+    }
+    msg
+}
+
 /// Move a clone to `sha` (shallow). Never a shell string: the sha comes from
 /// an untrusted manifest, and `Command` passes it as ONE argv element.
+/// An empty `paths` list checks out the whole pin — every caller that is not
+/// a subpath harvest.
 pub(crate) fn checkout_at_sha(target: &Path, url: &str, sha: &str) -> Result<()> {
-    if !target.join(".git").exists() {
-        std::fs::create_dir_all(target)?;
-        git(Some(target), &["init", "--quiet"])?;
-        git(Some(target), &["remote", "add", "origin", url]).ok();
-        git(Some(target), &["config", "remote.origin.promisor", "true"]).ok();
-        git(
-            Some(target),
-            &["config", "remote.origin.partialclonefilter", "blob:none"],
-        )
-        .ok();
+    checkout_at_sha_paths(target, url, sha, &[])
+}
+
+/// [`checkout_at_sha`] that harvests only `paths` when the list is non-empty
+/// (#1842). `paths` is validated again here: this is the function that turns
+/// the strings into a git argv.
+pub(crate) fn checkout_at_sha_paths(
+    target: &Path,
+    url: &str,
+    sha: &str,
+    paths: &[String],
+) -> Result<()> {
+    ensure_pin_origin(target, url)?;
+    fetch_pin(target, sha)?;
+    // Refuse a path the pin does not contain BEFORE the sparse rules change
+    // the worktree. A typo must not delete the previous checkout.
+    confirm_paths_are_trees(target, sha, paths)?;
+    apply_sparse_limit(target, paths)?;
+    checkout_pin(target, sha)?;
+    git(Some(target), &["clean", "-qfd"]).ok();
+    confirm_paths_materialized(target, paths)?;
+    Ok(())
+}
+
+/// The worktree is already at `sha`. Apply or clear the subpath limit without
+/// fetching again. A re-run of a manifest that gained `paths` narrows a
+/// previous whole-repo checkout; a re-run that dropped `paths` restores it.
+pub(crate) fn limit_checked_out_pin(target: &Path, sha: &str, paths: &[String]) -> Result<()> {
+    confirm_paths_are_trees(target, sha, paths)?;
+    let was_sparse = sparse_checkout_enabled(target);
+    apply_sparse_limit(target, paths)?;
+    if !paths.is_empty() || was_sparse {
+        git(Some(target), &["clean", "-qfd"]).ok();
     }
-    let fetch = git(Some(target), &["fetch", "--depth", "1", "origin", sha]);
-    if !fetch.map(|(rc, _)| rc == 0).unwrap_or(false) {
-        anyhow::bail!("git fetch {sha} failed");
+    confirm_paths_materialized(target, paths)?;
+    Ok(())
+}
+
+fn ensure_pin_origin(target: &Path, url: &str) -> Result<()> {
+    if target.join(".git").exists() {
+        return Ok(());
     }
+    std::fs::create_dir_all(target)?;
+    git(Some(target), &["init", "--quiet"])?;
+    git(Some(target), &["remote", "add", "origin", url]).ok();
+    git(Some(target), &["config", "remote.origin.promisor", "true"]).ok();
+    git(
+        Some(target),
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    )
+    .ok();
+    Ok(())
+}
+
+fn fetch_pin(target: &Path, sha: &str) -> Result<()> {
+    match git(Some(target), &["fetch", "--depth", "1", "origin", sha]) {
+        Ok((0, _)) => Ok(()),
+        Ok((_, output)) => anyhow::bail!("{}", git_fetch_failure(sha, &output)),
+        Err(e) => anyhow::bail!("{}", git_fetch_failure(sha, &e.to_string())),
+    }
+}
+
+fn checkout_pin(target: &Path, sha: &str) -> Result<()> {
     let co = git(
         Some(target),
         &["checkout", "--quiet", "--force", "--detach", sha],
@@ -287,8 +601,123 @@ pub(crate) fn checkout_at_sha(target: &Path, url: &str, sha: &str) -> Result<()>
     if !co.map(|(rc, _)| rc == 0).unwrap_or(false) {
         anyhow::bail!("git checkout {sha} failed");
     }
-    git(Some(target), &["clean", "-qfd"]).ok();
     Ok(())
+}
+
+/// `git()` glues stderr onto stdout. Object types and config values are one
+/// word on stdout; a fetch warning on stderr must not change the word.
+/// Stderr is returned separately so a failed command can still quote git.
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<(i32, String, String)> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.first().unwrap_or(&"")))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+fn sparse_checkout_enabled(target: &Path) -> bool {
+    match git_stdout(
+        target,
+        &[
+            "config",
+            "--get",
+            "--default",
+            "false",
+            "core.sparseCheckout",
+        ],
+    ) {
+        Ok((0, out, _)) => out.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Limit the worktree to `paths`, or clear a previous limit.
+///
+/// Cone mode is the wrong shape here. `git sparse-checkout set --cone
+/// data/osv` also materializes every file in ancestor directories (the
+/// licence, the module file, the root tests). `corpus index` walks whatever
+/// is on disk, and those extra files are how a "subpath" harvest still
+/// becomes another dataset. Non-cone pattern `/{path}/` is the directory and
+/// everything under it, and not a sibling whose name merely starts with the
+/// same prefix (`data/osv-extra`). Git 2.43 accepts `--no-cone`. If a future
+/// git removes it, this fails closed instead of cloning the whole pin.
+fn apply_sparse_limit(target: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        if !sparse_checkout_enabled(target) {
+            return Ok(());
+        }
+        let (rc, out) = git(Some(target), &["sparse-checkout", "disable"])?;
+        if rc != 0 {
+            anyhow::bail!("git sparse-checkout disable failed: {out}");
+        }
+        return Ok(());
+    }
+    for path in paths {
+        xccode::pathgate::valid_sparse_path(path).map_err(anyhow::Error::msg)?;
+    }
+    let patterns: Vec<String> = paths.iter().map(|path| format!("/{path}/")).collect();
+    let mut args: Vec<&str> = vec!["sparse-checkout", "set", "--no-cone", "--"];
+    for pattern in &patterns {
+        args.push(pattern);
+    }
+    let (rc, out) = git(Some(target), &args)?;
+    if rc != 0 {
+        anyhow::bail!(
+            "git sparse-checkout set failed for {}: {out}",
+            paths.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn confirm_paths_are_trees(target: &Path, sha: &str, paths: &[String]) -> Result<()> {
+    for path in paths {
+        let spec = format!("{sha}:{path}");
+        match git_stdout(target, &["cat-file", "-t", &spec]) {
+            Ok((0, out, _)) => {
+                let kind = out.split_whitespace().next().unwrap_or("");
+                if kind != "tree" {
+                    anyhow::bail!(
+                        "paths entry '{path}' is a {kind} at {sha}, not a directory. \
+                         Name the directory to harvest (for example \"data/osv\")"
+                    );
+                }
+            }
+            Ok((_, _, err)) => anyhow::bail!(
+                "paths entry '{path}' is not a directory at {sha}. The pin has no \
+                 such tree, so nothing was checked out. git: {err}"
+            ),
+            Err(e) => anyhow::bail!("could not inspect '{path}' at {sha}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn confirm_paths_materialized(target: &Path, paths: &[String]) -> Result<()> {
+    for path in paths {
+        if !target.join(path).is_dir() {
+            anyhow::bail!(
+                "sparse checkout did not materialize '{path}'. The pin lists that \
+                 directory, but the worktree does not contain it"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn paths_note(paths: &[String]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" (only {})", paths.join(", "))
+    }
 }
 
 fn dir_stats(target: &Path) -> (String, u64, u64) {
@@ -320,6 +749,153 @@ fn dir_stats(target: &Path) -> (String, u64, u64) {
     (sha, files, bytes)
 }
 
+/// What to do with a local source's root `.xerjignore` once the clone exists.
+enum XerjignoreCarry {
+    /// Unpinned `corpus add <name> <path>`: the working tree is what the
+    /// caller pointed at. Copy when the clone's bytes differ.
+    Copy,
+    /// Pinned `--from`: the recorded sha is the contract. Do not copy.
+    WarnPinned,
+}
+
+/// Ignore files are a few lines. Above this, refuse rather than pour a
+/// symlink-to-a-dataset into the clone.
+const XERJIGNORE_CARRY_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Repo directory name for a plain-URL or local-path source: its last path
+/// segment without `.git`. #2472: a Windows path (`F:\Projects\Foo`) has
+/// `\`-separated segments, so both separators split.
+fn repo_name_from_source(url: &str) -> String {
+    url.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+/// Filesystem root of a local checkout named by `url`, if `url` is one.
+///
+/// `git clone` of a filesystem path or a `file://` URL checks out committed
+/// files only. A remote URL has no working tree to read. `git@host:path`
+/// is not a directory, so it falls out through `is_dir`.
+fn local_checkout_root(url: &str) -> Option<PathBuf> {
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        file_url_path(rest)?
+    } else if url.contains("://") {
+        return None;
+    } else {
+        PathBuf::from(url)
+    };
+    path.is_dir().then_some(path)
+}
+
+/// `file:///abs/path` → `/abs/path`. `file://localhost/abs/path` → `/abs/path`.
+fn file_url_path(rest: &str) -> Option<PathBuf> {
+    let path = if rest.starts_with('/') {
+        rest
+    } else {
+        let slash = rest.find('/')?;
+        &rest[slash..]
+    };
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// #2199: `git clone` does not carry a root `.xerjignore` that is untracked
+/// or edited and uncommitted, so the index then applies built-in rules only.
+/// For an unpinned local checkout, copy the working-tree file when its bytes
+/// differ. For a pin, leave the recorded tree alone and say the file was not
+/// copied. Remote URLs and a missing file are silent. Nested `.xerjignore`
+/// files are not carried.
+fn settle_local_xerjignore(url: &str, target: &Path, repo_name: &str, mode: XerjignoreCarry) {
+    let Some(source) = local_checkout_root(url) else {
+        return;
+    };
+    let src = source.join(crate::ignore_rules::XERJIGNORE);
+    let src_meta = match std::fs::metadata(&src) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!(
+                "  [ignore] {repo_name}: could not read {} ({e}); it was NOT copied into the clone, so indexing will not see those rules",
+                src.display()
+            );
+            return;
+        }
+    };
+    if !src_meta.is_file() {
+        eprintln!(
+            "  [ignore] {repo_name}: {} is not a regular file and was NOT copied into the clone, so indexing will not see those rules",
+            src.display()
+        );
+        return;
+    }
+    if src_meta.len() > XERJIGNORE_CARRY_MAX_BYTES {
+        eprintln!(
+            "  [ignore] {repo_name}: {} is {} bytes, over the {XERJIGNORE_CARRY_MAX_BYTES} byte carry limit, and was NOT copied into the clone, so indexing will not see those rules",
+            src.display(),
+            src_meta.len()
+        );
+        return;
+    }
+    let src_bytes = match std::fs::read(&src) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "  [ignore] {repo_name}: could not read {} ({e}); it was NOT copied into the clone, so indexing will not see those rules",
+                src.display()
+            );
+            return;
+        }
+    };
+    let dest = target.join(crate::ignore_rules::XERJIGNORE);
+    let same = match std::fs::metadata(&dest) {
+        Ok(m) if m.is_file() && m.len() == src_bytes.len() as u64 => {
+            std::fs::read(&dest).ok().as_deref() == Some(src_bytes.as_slice())
+        }
+        _ => false,
+    };
+    if same {
+        return;
+    }
+    match mode {
+        XerjignoreCarry::Copy => {
+            // A committed symlink must not be written through: that would
+            // change the link target instead of the clone's ignore file.
+            if std::fs::symlink_metadata(&dest)
+                .ok()
+                .is_some_and(|m| m.file_type().is_symlink())
+            {
+                if let Err(e) = std::fs::remove_file(&dest) {
+                    eprintln!(
+                        "  [ignore] {repo_name}: could not replace symlink {} ({e}); indexing will not see the source rules",
+                        dest.display()
+                    );
+                    return;
+                }
+            }
+            match std::fs::write(&dest, &src_bytes) {
+                Ok(()) => eprintln!(
+                    "  [ignore] {repo_name}: copied the source working tree's .xerjignore from {} into the clone (git clone only checks out committed files)",
+                    source.display()
+                ),
+                Err(e) => eprintln!(
+                    "  [ignore] {repo_name}: could not copy {} into the clone ({e}); indexing will not see those rules",
+                    src.display()
+                ),
+            }
+        }
+        XerjignoreCarry::WarnPinned => eprintln!(
+            "  [ignore] {repo_name}: source .xerjignore at {} differs from the pinned checkout and was NOT copied (a pinned rebuild stays at the recorded sha)",
+            src.display()
+        ),
+    }
+}
+
 /// Corpus-name resolution for `add`: an explicit <name> (positional, then
 /// `--as`) wins; otherwise the manifest's own `corpus` field supplies it.
 /// `--from` with neither is a usage error, not a guess.
@@ -335,11 +911,21 @@ fn resolve_corpus_name(
         })
 }
 
+/// One repo `corpus add` will materialize. `paths` empty means the whole pin.
+struct CorpusSource {
+    repo: String,
+    url: String,
+    sha: String,
+    declared: String,
+    paths: Vec<String>,
+}
+
 fn run_corpus_add(args: &[String]) -> i32 {
     let mut name: Option<String> = None;
     let mut as_name: Option<String> = None;
     let mut from: Option<String> = None;
     let mut verify_sig: Option<String> = None;
+    let mut own_flag = false;
     let mut urls: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -370,6 +956,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
                     return 2;
                 }
             },
+            "--own" => own_flag = true,
             "--as" => match args.get(i + 1) {
                 Some(v) => {
                     as_name = Some(v.clone());
@@ -417,7 +1004,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
             Ok(FromPack::NotAPack) => {}
             Ok(FromPack::Dir(dir)) => {
                 let share = dir.display().to_string();
-                return run_corpus_add_pack(&dir, explicit_name, &share, verify_sig.as_deref());
+                return run_corpus_add_pack(
+                    &dir,
+                    explicit_name,
+                    &share,
+                    verify_sig.as_deref(),
+                    own_flag,
+                );
             }
             Ok(FromPack::Zip(zip)) => {
                 // transient staging, never build state — it dies with this
@@ -449,7 +1042,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
                         }
                     }
                 }
-                return run_corpus_add_pack(&dir, explicit_name, &zip, verify_sig.as_deref());
+                return run_corpus_add_pack(
+                    &dir,
+                    explicit_name,
+                    &zip,
+                    verify_sig.as_deref(),
+                    own_flag,
+                );
             }
             Err(e) => {
                 eprintln!("xerj corpus add: {e}");
@@ -467,11 +1066,15 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // no explicit <name>/--as, the manifest's own 'corpus' field supplies
     // it. Everything downstream (dest, carry, entries) needs the resolved
     // name, so resolution lives here and nowhere else. The pin's query
-    // hints (#1254) ride beside the tuple rather than inside it — a
+    // hints (#1254) ride beside the rows rather than inside them — a
     // three-slot tuple tripped clippy's type_complexity on the pinned
-    // CI toolchain.
+    // CI toolchain. `paths` (#1842) stays on the row: it is per repo.
     let mut pin_query: Option<manifest::QueryHints> = None;
-    let (name, rows): (String, Vec<(String, String, String, String)>) = if let Some(path) = &from {
+    // repo -> (sha, review) from the hub pin: a human's licence review of the
+    // repo at that sha, recorded when the checkout lands there (#1893).
+    let mut pin_reviews: std::collections::HashMap<String, (String, Value)> =
+        std::collections::HashMap::new();
+    let (name, rows): (String, Vec<CorpusSource>) = if let Some(path) = &from {
         let hub = match manifest::read_hub_manifest(Path::new(path)) {
             Ok(h) => h,
             Err(e) => {
@@ -488,11 +1091,22 @@ fn run_corpus_add(args: &[String]) -> i32 {
         };
         println!("rebuilding corpus '{resolved}' from {path}");
         pin_query = hub.query;
+        for r in &hub.rows {
+            if let (Some(review), false) = (&r.review, r.sha.is_empty()) {
+                pin_reviews.insert(r.repo.clone(), (r.sha.clone(), review.clone()));
+            }
+        }
         (
             resolved,
             hub.rows
                 .into_iter()
-                .map(|r| (r.repo, r.url, r.sha, r.declared_licence))
+                .map(|r| CorpusSource {
+                    repo: r.repo,
+                    url: r.url,
+                    sha: r.sha,
+                    declared: r.declared_licence,
+                    paths: r.paths,
+                })
                 .collect(),
         )
     } else {
@@ -503,15 +1117,12 @@ fn run_corpus_add(args: &[String]) -> i32 {
         (
             resolved,
             urls.iter()
-                .map(|u| {
-                    let repo = u
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("")
-                        .trim_end_matches(".git")
-                        .to_string();
-                    (repo, u.clone(), String::new(), String::new())
+                .map(|u| CorpusSource {
+                    repo: repo_name_from_source(u),
+                    url: u.clone(),
+                    sha: String::new(),
+                    declared: String::new(),
+                    paths: Vec::new(),
                 })
                 .collect(),
         )
@@ -546,19 +1157,40 @@ fn run_corpus_add(args: &[String]) -> i32 {
     // review{} blocks are PRESERVED across a rebuild when repo+sha match —
     // a human's licence review survives a re-clone (additive, never edited).
     let previous = manifest::read_corpus_manifest(&dest.join("corpus.json")).ok();
+    // #2339: the marker is the operator's, not the manifest they handed us.
+    // `--own` sets it; a re-add without the flag keeps one already recorded
+    // so a refresh cannot silently drop it. A `--from` file's own key is
+    // never read.
+    let own = own_flag || previous.as_ref().is_some_and(|m| m.own);
+    // A hub pin's review of the same repo at the same sha comes next: it is
+    // the review the registry shipped for exactly this checkout (#1893).
     let carry = |repo: &str, sha: &str| -> Option<Value> {
-        let m = previous.as_ref()?;
-        m.repos.iter().find_map(|r| {
-            (r.repo == repo && r.sha == sha)
-                .then(|| r.review.clone())
-                .flatten()
+        let kept = previous.as_ref().and_then(|m| {
+            m.repos.iter().find_map(|r| {
+                (r.repo == repo && r.sha == sha)
+                    .then(|| r.review.clone())
+                    .flatten()
+            })
+        });
+        kept.or_else(|| {
+            pin_reviews
+                .get(repo)
+                .filter(|(pinned, _)| !sha.is_empty() && pinned == sha)
+                .map(|(_, review)| review.clone())
         })
     };
 
     let mut entries: Vec<manifest::ManifestRepo> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
-    for (repo_name, url, sha, declared) in rows {
+    for source in rows {
+        let CorpusSource {
+            repo: repo_name,
+            url,
+            sha,
+            declared,
+            paths,
+        } = source;
         // The one destructive step (checkout --force + clean -fd) runs inside
         // this path: gate the name HERE, again, even though read_hub_manifest
         // already did — the plain-URL arm has no other gate.
@@ -568,31 +1200,85 @@ fn run_corpus_add(args: &[String]) -> i32 {
             continue;
         }
         let target = dest.join(&repo_name);
+        let note = paths_note(&paths);
+        // After the checkout exists and before the manifest counts files.
+        // A pin warns instead of copying; an unpinned local path copies.
+        let carry_ignore = |checkout: &Path| {
+            settle_local_xerjignore(
+                &url,
+                checkout,
+                &repo_name,
+                if sha.is_empty() {
+                    XerjignoreCarry::Copy
+                } else {
+                    XerjignoreCarry::WarnPinned
+                },
+            );
+        };
         if target.join(".git").exists() && !sha.is_empty() {
             let at = git(Some(&target), &["rev-parse", "HEAD"])
                 .ok()
                 .filter(|(rc, _)| *rc == 0)
                 .map(|(_, out)| out);
             if at.as_deref() == Some(sha.as_str()) {
+                // HEAD matching the pin is not the harvest. A previous run
+                // may have checked out the whole repo; `paths` still has to
+                // narrow it, and a manifest that dropped `paths` has to
+                // widen it back.
+                if let Err(e) = limit_checked_out_pin(&target, &sha, &paths) {
+                    eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
+                    skipped.push(repo_name);
+                    continue;
+                }
                 println!(
-                    "  [ok] {repo_name} already at {}",
+                    "  [ok] {repo_name} already at {}{note}",
                     &sha[..12.min(sha.len())]
                 );
-                record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+                carry_ignore(&target);
+                record(
+                    &mut entries,
+                    &repo_name,
+                    &url,
+                    &target,
+                    &declared,
+                    &paths,
+                    &carry,
+                    own,
+                );
                 continue;
             }
-            println!("  [pin] {repo_name} -> {}", &sha[..12.min(sha.len())]);
-            if let Err(e) = checkout_at_sha(&target, &url, &sha) {
+            println!("  [pin] {repo_name} -> {}{note}", &sha[..12.min(sha.len())]);
+            if let Err(e) = checkout_at_sha_paths(&target, &url, &sha, &paths) {
                 eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
                 skipped.push(repo_name);
                 continue;
             }
-            record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+            carry_ignore(&target);
+            record(
+                &mut entries,
+                &repo_name,
+                &url,
+                &target,
+                &declared,
+                &paths,
+                &carry,
+                own,
+            );
             continue;
         }
         if target.join(".git").exists() {
             println!("  [skip] {repo_name} already cloned");
-            record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+            carry_ignore(&target);
+            record(
+                &mut entries,
+                &repo_name,
+                &url,
+                &target,
+                &declared,
+                &paths,
+                &carry,
+                own,
+            );
             continue;
         }
         println!("  [clone] {repo_name}");
@@ -615,14 +1301,24 @@ fn run_corpus_add(args: &[String]) -> i32 {
                 }
             }
         } else {
-            println!("  [pin] {repo_name} -> {}", &sha[..12.min(sha.len())]);
-            if let Err(e) = checkout_at_sha(&target, &url, &sha) {
+            println!("  [pin] {repo_name} -> {}{note}", &sha[..12.min(sha.len())]);
+            if let Err(e) = checkout_at_sha_paths(&target, &url, &sha, &paths) {
                 eprintln!("  [FAIL] {repo_name}: {e:#}; continuing");
                 skipped.push(repo_name);
                 continue;
             }
         }
-        record(&mut entries, &repo_name, &url, &target, &declared, &carry);
+        carry_ignore(&target);
+        record(
+            &mut entries,
+            &repo_name,
+            &url,
+            &target,
+            &declared,
+            &paths,
+            &carry,
+            own,
+        );
     }
 
     if entries.is_empty() {
@@ -631,10 +1327,10 @@ fn run_corpus_add(args: &[String]) -> i32 {
     }
 
     // Regenerated FROM DISK, never copied through from the input — except
-    // the pin's query hints (#1254), which are author DECLARATION, not
-    // derived state: they travel from the hub pin into the corpus.json the
-    // clone writes, so a re-clone cannot silently drop the corpus's
-    // retrieval posture.
+    // the pin's query hints (#1254) and per-repo `paths` (#1842), which are
+    // author DECLARATION, not derived state: they travel from the hub pin
+    // into the corpus.json the clone writes, so a re-clone cannot silently
+    // drop the corpus's retrieval posture or widen a subpath harvest.
     let cloned_at = chrono_now_stamp();
     let manifest_path = dest.join("corpus.json");
     manifest::write_corpus_manifest_kind(
@@ -644,6 +1340,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
         &cloned_at,
         &entries,
         pin_query.as_ref(),
+        own,
     );
     println!();
     println!(
@@ -655,6 +1352,12 @@ fn run_corpus_add(args: &[String]) -> i32 {
         "share it: {}  (rebuild with xerj corpus add <name> --from <that file>)",
         manifest_path.display()
     );
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
+    }
 
     if !skipped.is_empty() {
         eprintln!();
@@ -746,6 +1449,7 @@ fn run_corpus_add_pack(
     explicit_name: Option<String>,
     share_path: &str,
     verify_sig: Option<&str>,
+    own_flag: bool,
 ) -> i32 {
     // Origin check first, before a byte of the pack is trusted: checksums
     // prove integrity, the signature proves who built it. A pack that
@@ -821,6 +1525,10 @@ fn run_corpus_add_pack(
     let root = code_root();
     let dest = root.join("corpora").join(&name);
     // Same one-kind-per-name rule the git arm enforces, from the other side.
+    let previous_own = manifest::read_corpus_manifest(&dest.join("corpus.json"))
+        .ok()
+        .is_some_and(|m| m.own);
+    let own = own_flag || previous_own;
     if let Ok(prev) = manifest::read_corpus_manifest(&dest.join("corpus.json")) {
         if prev.kind.as_deref() != Some("harvested") {
             eprintln!(
@@ -835,7 +1543,7 @@ fn run_corpus_add_pack(
         "materializing corpus '{name}' from pack generation {}",
         meta.generation
     );
-    if let Err(e) = add_pack_materialize(&dest, pack_dir, &meta) {
+    if let Err(e) = add_pack_materialize(&dest, pack_dir, &meta, own) {
         eprintln!("xerj corpus add: {e:#}");
         return 1;
     }
@@ -846,9 +1554,17 @@ fn run_corpus_add_pack(
             .unwrap_or(0);
         total += count;
         println!("  [pack] {}: {} record(s) ({})", s.slug, count, s.licence);
-        if let Some(w) = xccode::licence::clone_warning_line(&s.licence) {
-            eprintln!("{w}");
+        if xccode::licence::copy_warning_applies(&s.licence, own) {
+            if let Some(w) = xccode::licence::clone_warning_line(&s.licence) {
+                eprintln!("{w}");
+            }
         }
+    }
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
     }
     println!(
         "corpus '{name}': {} records from {} source(s) at {}",
@@ -875,6 +1591,7 @@ fn add_pack_materialize(
     dest: &Path,
     pack_dir: &Path,
     meta: &crate::harvest::pack::PackMeta,
+    own: bool,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use std::io::{BufRead, BufReader, Write};
@@ -959,6 +1676,7 @@ fn add_pack_materialize(
             files: Some(*counts.get(&s.slug).unwrap_or(&0)),
             bytes: Some(bytes),
             review: None,
+            paths: Vec::new(),
         });
     }
     manifest::write_corpus_manifest_kind(
@@ -968,17 +1686,21 @@ fn add_pack_materialize(
         &chrono_now_stamp(),
         &entries,
         None,
+        own,
     );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record(
     entries: &mut Vec<manifest::ManifestRepo>,
     repo_name: &str,
     url: &str,
     target: &Path,
     declared: &str,
+    paths: &[String],
     carry: &dyn Fn(&str, &str) -> Option<Value>,
+    own: bool,
 ) {
     let lic = xccode::licence::detect_licence(target);
     let (sha, files, bytes) = dir_stats(target);
@@ -986,16 +1708,35 @@ fn record(
         "          licence={lic} sha={} files={files}",
         &sha[..12.min(sha.len())]
     );
-    if let Some(w) = xccode::licence::clone_warning_line(&lic) {
-        eprintln!("{w}");
+    let review = carry(repo_name, &sha);
+    // The recorded `licence` stays the detector's reading; a completed human
+    // review fills in a licence the detector could not identify (#1893), and
+    // that is what `xerj code` labels passages with.
+    let shown = xccode::licence::effective_licence(&lic, review.as_ref());
+    if shown != lic {
+        let by = review
+            .as_ref()
+            .and_then(|r| r.get("by"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        println!(
+            "          licence {shown} per the manifest's review by {by} (the detector read {lic})"
+        );
+    }
+    if xccode::licence::copy_warning_applies(&shown, own) {
+        if let Some(w) = xccode::licence::clone_warning_line(&shown) {
+            eprintln!("{w}");
+        }
     }
     // The detector is text-matching heuristics and has been wrong before.
     // When a manifest disagrees with the checkout, say so rather than
     // overwrite quietly.
-    if !declared.is_empty() && declared != lic {
+    // `shown` is the detector's reading, or a completed review's licence
+    // when the detector read UNKNOWN (#1893). A coarse `BSD` reading agrees
+    // with a manifest that names the BSD clause.
+    if !declared.is_empty() && !xccode::licence::licence_readings_agree(declared, &shown) {
         eprintln!("          ! manifest says licence={declared}, checkout reads {lic} — verify before copying");
     }
-    let review = carry(repo_name, &sha);
     entries.push(manifest::ManifestRepo {
         repo: repo_name.to_string(),
         url: url.to_string(),
@@ -1004,11 +1745,72 @@ fn record(
         files: Some(files),
         bytes: Some(bytes),
         review,
+        paths: paths.to_vec(),
     });
 }
 
 fn chrono_now_stamp() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+// ── xerj corpus own ─────────────────────────────────────────────────────────
+
+/// Set or clear the first-party marker on a corpus that already exists.
+/// Does not clone, detect licences, or touch the index.
+fn run_corpus_own(args: &[String]) -> i32 {
+    let mut name: Option<String> = None;
+    let mut off = false;
+    for a in args {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{CORPUS_USAGE}");
+                return 0;
+            }
+            "--off" => off = true,
+            a if a.starts_with('-') => {
+                eprintln!("xerj corpus own: unknown flag '{a}'\n\n{CORPUS_USAGE}");
+                return 2;
+            }
+            a if name.is_none() => name = Some(a.to_string()),
+            a => {
+                eprintln!("xerj corpus own: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("xerj corpus own: <name> is required\n\n{CORPUS_USAGE}");
+        return 2;
+    };
+    if let Err(e) = xccode::pathgate::valid_corpus_name(&name) {
+        eprintln!("xerj corpus own: {e}");
+        return 2;
+    }
+    let path = code_root().join("corpora").join(&name).join("corpus.json");
+    if !path.is_file() {
+        eprintln!(
+            "xerj corpus own: no corpus '{name}' at {} — run `xerj corpus add {name} …` first",
+            path.display()
+        );
+        return 2;
+    }
+    let own = !off;
+    if let Err(e) = manifest::set_corpus_own(&path, &name, own) {
+        eprintln!("xerj corpus own: {e}");
+        return 1;
+    }
+    if own {
+        println!(
+            "corpus '{name}' is marked own (first-party): an unidentified licence stays recorded, \
+             and xerj code omits the do-not-copy banner for it. Clear with: xerj corpus own {name} --off"
+        );
+    } else {
+        println!(
+            "corpus '{name}' is no longer marked own. Unidentified licences warn again: \
+             adapt the approach, do not copy the code."
+        );
+    }
+    0
 }
 
 // ── xerj corpus index ───────────────────────────────────────────────────────
@@ -1264,54 +2066,128 @@ fn delete_indices(node: &dyn CorpusNode, names: &[String]) -> usize {
     failed
 }
 
-fn report(name: &str, rc: i32, docs: &str) {
+/// The terminal verdict lines, as a pure function so the footer can be
+/// asserted on (the live failures on this path were all about what the LAST
+/// line claims). `rc` is the autoindex exit the flow carried in:
+///
+/// - 0 / 3 are the clean outcomes (3 = some files skipped as junk, normal for
+///   real repos) — the store verified, so "searchable: N records" is earned.
+/// - any other `rc` only reaches here through a #367 salvage: autoindex
+///   aborted in finalisation but the written store passed the verification
+///   search, so it is kept and queryable. It is NOT a clean build. An aborted
+///   run that prints the plain `searchable: N records` success footer is the
+///   last live half of #1183's dishonest-resume item: the 2026-10-08 standing
+///   rebuild ended `xerj-done ok=false exit=1 reason=aborted` and still
+///   printed `corpus 'xerj-search' searchable: 1011181 records`, overstating
+///   the kept set by the 348 docs the re-walk had just dropped. A salvaged
+///   build says so, and never the word "searchable".
+fn report_footer(name: &str, rc: i32, docs: &str) -> Vec<String> {
     match rc {
-        0 => println!("indexed cleanly"),
-        3 => println!("indexed (exit 3: some files skipped as junk — normal for real repos)"),
-        _ => {}
+        0 | 3 => {
+            let head = if rc == 0 {
+                "indexed cleanly".to_string()
+            } else {
+                "indexed (exit 3: some files skipped as junk — normal for real repos)".to_string()
+            };
+            vec![
+                head,
+                format!("corpus '{name}' searchable: {docs} records"),
+                format!("next: xerj code {name} \"<what you need>\""),
+            ]
+        }
+        _ => vec![
+            format!(
+                "corpus '{name}' indexed with errors (autoindex exit {rc}): {docs} records \
+                 are present and queryable, but coverage is NOT guaranteed — read the error \
+                 above before relying on this corpus."
+            ),
+            format!(
+                "next: xerj code {name} \"<what you need>\"  (verify coverage first; a clean \
+                 rebuild is `xerj corpus index {name} --fresh`)"
+            ),
+        ],
     }
-    println!("corpus '{name}' searchable: {docs} records");
-    println!("next: xerj code {name} \"<what you need>\"");
 }
 
-fn run_corpus_index(args: &[String]) -> i32 {
-    let mut name: Option<String> = None;
-    let mut fresh = false;
-    let mut url: Option<String> = None;
+fn report(root: &Path, name: &str, rc: i32, docs: &str, include_data: bool) {
+    // #2339 / #1985: the walk's file-class accounting, printed with the
+    // verdict so it is in the tail of `xerj corpus index` rather than only
+    // in the progress notes from the start of the run.
+    for line in crate::corpus_file_class_summary(&root.join("corpora").join(name), include_data) {
+        println!("xerj corpus index: {line}");
+    }
+    for line in report_footer(name, rc, docs) {
+        println!("{line}");
+    }
+}
+
+/// Printed before the long part of `corpus index`. An agent tool timeout
+/// kills the process and looks like a silent failure; the run itself resumes.
+pub(crate) fn corpus_index_duration_note() -> &'static str {
+    "xerj corpus index: this often runs longer than an agent tool timeout \
+     (minutes, longer with a neural embedder). Stopping is safe: re-run the \
+     same command to resume. To keep it off the tool clock, start it in the \
+     background and wait for the xerj-done line."
+}
+
+/// Parsed `xerj corpus index` arguments, separated from the run so the flag
+/// set (including #1985's `--include-data`) is testable without a node.
+#[derive(Debug, Default, PartialEq)]
+struct CorpusIndexArgs {
+    name: Option<String>,
+    fresh: bool,
+    include_data: bool,
+    url: Option<String>,
+    help: bool,
+}
+
+fn parse_corpus_index_args(args: &[String]) -> Result<CorpusIndexArgs, String> {
+    let mut out = CorpusIndexArgs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                println!("{CORPUS_USAGE}");
-                return 0;
+                out.help = true;
+                return Ok(out);
             }
-            "--fresh" => fresh = true,
+            "--fresh" => out.fresh = true,
+            // #1985: CSV/HDF/simulation output is skipped by default in a
+            // reference corpus; this flag indexes it anyway.
+            "--include-data" => out.include_data = true,
             "--url" => match args.get(i + 1) {
                 Some(v) => {
-                    url = Some(v.clone());
+                    out.url = Some(v.clone());
                     i += 1;
                 }
-                None => {
-                    eprintln!("xerj corpus index: --url needs a value\n\n{CORPUS_USAGE}");
-                    return 2;
-                }
+                None => return Err("--url needs a value".into()),
             },
-            a if a.starts_with('-') => {
-                eprintln!("xerj corpus index: unknown flag '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
-            }
-            a if name.is_none() => name = Some(a.to_string()),
-            a => {
-                eprintln!("xerj corpus index: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
-            }
+            a if a.starts_with('-') => return Err(format!("unknown flag '{a}'")),
+            a if out.name.is_none() => out.name = Some(a.to_string()),
+            a => return Err(format!("unexpected argument '{a}'")),
         }
         i += 1;
     }
-    let Some(name) = name else {
+    Ok(out)
+}
+
+fn run_corpus_index(args: &[String]) -> i32 {
+    let parsed = match parse_corpus_index_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("xerj corpus index: {e}\n\n{CORPUS_USAGE}");
+            return 2;
+        }
+    };
+    if parsed.help {
+        println!("{CORPUS_USAGE}");
+        return 0;
+    }
+    let Some(name) = parsed.name else {
         eprintln!("xerj corpus index: <name> is required\n\n{CORPUS_USAGE}");
         return 2;
     };
+    let fresh = parsed.fresh;
+    let include_data = parsed.include_data;
     if let Err(e) = xccode::pathgate::valid_corpus_name(&name) {
         eprintln!("xerj corpus index: {e}");
         return 2;
@@ -1325,7 +2201,8 @@ fn run_corpus_index(args: &[String]) -> i32 {
         );
         return 2;
     }
-    let url = resolve_url(url.as_deref());
+    eprintln!("{}", corpus_index_duration_note());
+    let url = resolve_url(parsed.url.as_deref());
     let es = match build_es(&url, None) {
         Ok(es) => es,
         Err(e) => {
@@ -1335,12 +2212,15 @@ fn run_corpus_index(args: &[String]) -> i32 {
     };
     corpus_index_flow(
         &es,
-        &|prefix, state_dir| crate::run_with_options(&dir, &url, prefix, state_dir, true),
+        &|prefix, state_dir| {
+            crate::run_with_options(&dir, &url, prefix, state_dir, true, include_data)
+        },
         &stamp_secs,
         &root,
         &url,
         &name,
         fresh,
+        include_data,
     )
 }
 
@@ -1426,6 +2306,394 @@ fn legacy_failure_verdict(before: Option<u64>, after: Option<u64>) -> LegacyFail
     }
 }
 
+/// One `autoindex-state/<corpus>/b<stamp>` directory left by a `corpus index`
+/// that was killed before the ledger recorded the build.
+#[derive(Debug, Clone)]
+struct UnfinishedBuild {
+    build: String,
+    prefix: String,
+    state_dir: PathBuf,
+    /// A `sync_begin` the journal has not closed with `sync_commit`. That is
+    /// the generation the index phase replays; autoindex does not hash the
+    /// corpus again on that path.
+    generation_pending: bool,
+}
+
+/// What a resumed build may be recorded as, once autoindex has returned and
+/// the node has been counted and searched.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeVerdict {
+    /// Clean autoindex exit, records present, search answered.
+    Verified,
+    /// Records present and searchable, but autoindex did not exit cleanly.
+    /// The build is kept and marked salvaged so status explains the gap.
+    Salvaged,
+    /// Autoindex exited cleanly and records are present, but the store did
+    /// not answer a search. Recorded as unverified, not as "no build".
+    Unverified,
+    /// Do not write a ledger. The journal stays the resume point. Writing a
+    /// ledger with no build is what made a finished resume say "no verified
+    /// build recorded".
+    KeepJournal,
+}
+
+fn resume_verdict(rc: i32, docs: Option<u64>, queryable: bool) -> ResumeVerdict {
+    let positive = matches!(docs, Some(n) if n > 0);
+    let clean = rc == 0 || rc == 3;
+    match (clean, positive, queryable) {
+        (true, true, true) => ResumeVerdict::Verified,
+        (false, true, true) => ResumeVerdict::Salvaged,
+        (true, true, false) => ResumeVerdict::Unverified,
+        _ => ResumeVerdict::KeepJournal,
+    }
+}
+
+fn resume_build_note(name: &str, unfinished: &UnfinishedBuild) -> String {
+    if unfinished.generation_pending {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from its journal at {} — \
+             indexing continues at the operations still uncommitted, and files already \
+             applied are not hashed again",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    } else {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from {} — the journal has no \
+             generation in progress, so this run re-walks and re-hashes the corpus, then \
+             reuses a sealed snapshot when one is already present",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    }
+}
+
+fn is_build_dir_name(name: &str) -> bool {
+    let Some(stamp) = name.strip_prefix('b') else {
+        return false;
+    };
+    !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The build id of a stamped index (`xc-<corpus>-b<stamp>-<dataset>`), or
+/// `None` for an unstamped legacy index.
+fn index_build_id(name: &str, index: &str) -> Option<String> {
+    let prefix = stamped_prefix(name, index)?;
+    prefix
+        .strip_prefix(&format!("xc-{name}-"))
+        .map(str::to_string)
+}
+
+struct BuildJournalScan {
+    runs: Vec<(String, String, String)>,
+    generation_pending: bool,
+}
+
+impl BuildJournalScan {
+    fn matches(&self, root: &str, url: &str, prefix: &str) -> bool {
+        !self.runs.is_empty()
+            && self
+                .runs
+                .iter()
+                .all(|(recorded_root, recorded_url, recorded_prefix)| {
+                    recorded_root == root && recorded_url == url && recorded_prefix == prefix
+                })
+    }
+}
+
+/// Read a build journal the way the resume journal does: a trailing line with
+/// no newline is a torn record from a kill and is discarded. A corrupt line
+/// that was newline-terminated is an error — resuming past it would guess.
+fn read_build_journal(path: &Path) -> Result<BuildJournalScan, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    let mut scan = BuildJournalScan {
+        runs: Vec::new(),
+        generation_pending: false,
+    };
+    for (i, line) in lines.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "journal line {} of {} is not valid JSON ({e})",
+                i + 1,
+                path.display()
+            )
+        })?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("run") => scan.runs.push((
+                value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            Some("sync_begin") => scan.generation_pending = true,
+            Some("sync_commit") => scan.generation_pending = false,
+            _ => {}
+        }
+    }
+    Ok(scan)
+}
+
+/// The root string autoindex writes into the journal: the canonical corpus
+/// directory, or the path unchanged when canonicalization fails.
+fn corpus_journal_root(corpus_dir: &Path) -> String {
+    corpus_dir
+        .canonicalize()
+        .unwrap_or_else(|_| corpus_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// An unfinished build to resume, or a refusal when more than one journal
+/// could be the one a kill left behind.
+fn find_unfinished_build(
+    state_root: &Path,
+    name: &str,
+    corpus_dir: &Path,
+    url: &str,
+    live_indices: &[String],
+) -> Result<Option<UnfinishedBuild>, String> {
+    let parent = state_root.join(name);
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return Ok(None);
+    };
+    let root_str = corpus_journal_root(corpus_dir);
+    let mut matching: std::collections::BTreeMap<String, UnfinishedBuild> =
+        std::collections::BTreeMap::new();
+    // Build ids whose journal does not match this root/url/prefix, but which
+    // the node is already serving. Falling through to legacy mode would
+    // re-hash under another prefix and can retire those indices.
+    let mut foreign_live: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !is_build_dir_name(&fname) {
+            continue;
+        }
+        let dir = entry.path();
+        let journal = dir.join("journal.ndjson");
+        if !journal.is_file() {
+            continue;
+        }
+        let prefix = format!("xc-{name}-{fname}");
+        let scan = read_build_journal(&journal).map_err(|reason| {
+            format!(
+                "xerj corpus index: build {fname} of '{name}' has a journal that cannot be \
+                 resumed ({reason}). Nothing was changed. Repair the journal, or build a \
+                 verified replacement with: xerj corpus index {name} --fresh"
+            )
+        })?;
+        if scan.runs.is_empty() {
+            continue;
+        }
+        if scan.matches(&root_str, url, &prefix) {
+            matching.insert(
+                fname.clone(),
+                UnfinishedBuild {
+                    build: fname,
+                    prefix,
+                    state_dir: dir,
+                    generation_pending: scan.generation_pending,
+                },
+            );
+        } else if live_indices
+            .iter()
+            .any(|index| index_build_id(name, index).as_deref() == Some(fname.as_str()))
+        {
+            let recorded_url = scan
+                .runs
+                .first()
+                .map(|(_, recorded, _)| recorded.clone())
+                .unwrap_or_else(|| "(none)".to_string());
+            foreign_live.push((fname, recorded_url));
+        }
+    }
+    let live: std::collections::BTreeSet<String> = live_indices
+        .iter()
+        .filter_map(|index| index_build_id(name, index))
+        .collect();
+    let pool: Vec<UnfinishedBuild> = if live.is_empty() {
+        matching.into_values().collect()
+    } else {
+        matching
+            .into_values()
+            .filter(|build| live.contains(&build.build))
+            .collect()
+    };
+    if pool.is_empty() {
+        if foreign_live.is_empty() {
+            return Ok(None);
+        }
+        foreign_live.sort();
+        let listed = foreign_live
+            .iter()
+            .map(|(build, recorded_url)| format!("{build} (journal url {recorded_url})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "xerj corpus index: {url} holds indices for unfinished build(s) of '{name}' whose \
+             journal does not match this corpus directory or this url: {listed}. Refusing to \
+             continue in legacy mode — that would re-hash the corpus under another prefix and \
+             can retire this build. Nothing was changed. Re-run with the url the journal was \
+             started against, or build a verified replacement with: xerj corpus index {name} \
+             --fresh"
+        ));
+    }
+    if pool.len() == 1 {
+        return Ok(pool.into_iter().next());
+    }
+    let pending: Vec<UnfinishedBuild> = pool
+        .iter()
+        .filter(|build| build.generation_pending)
+        .cloned()
+        .collect();
+    if pending.len() == 1 {
+        return Ok(pending.into_iter().next());
+    }
+    let listed = pool
+        .iter()
+        .map(|build| build.build.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "xerj corpus index: '{name}' has unfinished builds {listed} and this run will not guess \
+         which journal to resume. Nothing was changed. Re-run `xerj corpus index {name} --fresh` \
+         to build a verified replacement beside them, or remove the state directory of the build \
+         you do not want and re-run the same command."
+    ))
+}
+
+/// Continue a build whose journal exists and whose ledger does not name it yet.
+///
+/// A kill during the index phase leaves `sync_begin` (and any committed
+/// operations) in that journal and indices under `xc-<corpus>-b<stamp>`. The
+/// ledger is written only after verification, so the next plain run used to
+/// see "indices exist, no build recorded" and take the legacy arm: a new
+/// prefix, no `--state-dir`, a full re-hash, and a ledger with no
+/// `index_prefix` — the "no verified build recorded" notice.
+fn resume_unfinished_build(
+    node: &dyn CorpusNode,
+    run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
+    root: &Path,
+    url: &str,
+    name: &str,
+    unfinished: &UnfinishedBuild,
+    include_data: bool,
+) -> i32 {
+    let build = &unfinished.build;
+    let prefix = &unfinished.prefix;
+    let state_dir = &unfinished.state_dir;
+    println!("{}", resume_build_note(name, unfinished));
+    let rc = run_autoindex(prefix, Some(state_dir));
+    let docs = count_under(node, prefix);
+    let queryable = queryable_store(node, name, prefix);
+    let Some(state_dir_str) = state_dir.to_str() else {
+        eprintln!(
+            "xerj corpus index: build {build} resumed (autoindex exit {rc}) but its state \
+             directory {} is not valid Unicode, so the ledger cannot record it. The journal is \
+             unchanged.",
+            state_dir.display()
+        );
+        return if rc == 0 || rc == 3 { 1 } else { rc };
+    };
+    let verdict = resume_verdict(rc, docs, queryable);
+    let record = |salvaged: bool| {
+        let _ = state::write_state(
+            root,
+            name,
+            url,
+            rc as i64,
+            salvaged,
+            Some(build),
+            Some(prefix),
+            Some(state_dir_str),
+        );
+    };
+    match verdict {
+        ResumeVerdict::Verified => {
+            let n = docs.expect("verified verdict has a positive count");
+            warn_short_of_pack_records(name, root, Some(n));
+            record(false);
+            report_leftovers(node, name, root, prefix);
+            report(root, name, rc, &n.to_string(), include_data);
+            0
+        }
+        ResumeVerdict::Salvaged => {
+            let n = docs.expect("salvaged verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: WARNING — autoindex exited {rc}, but resumed build {build} \
+                 has {n} records and answers a search. Recording it as UNVERIFIED (salvaged)."
+            );
+            eprintln!(
+                "xerj corpus index: coverage is not guaranteed. Re-run `xerj corpus index \
+                 {name}` to resume the journal, or `xerj corpus index {name} --fresh` for a \
+                 clean build."
+            );
+            record(true);
+            report_leftovers(node, name, root, prefix);
+            report(root, name, rc, &n.to_string(), include_data);
+            0
+        }
+        ResumeVerdict::Unverified => {
+            let n = docs.expect("unverified verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: resumed build {build} finished (autoindex exit {rc}, {n} \
+                 records) but the verification search failed. Recording it as UNVERIFIED."
+            );
+            eprintln!(
+                "xerj corpus index: `xerj code` will say the index was not verified complete. \
+                 Re-run `xerj corpus index {name}` to resume the journal at {}.",
+                state_dir.display()
+            );
+            record(true);
+            1
+        }
+        ResumeVerdict::KeepJournal => {
+            let why = match docs {
+                None => "the node did not answer a record count".to_string(),
+                Some(0) => "the node reported 0 records".to_string(),
+                Some(n) => format!(
+                    "{n} records are present, but the store did not answer a search and autoindex \
+                     exited {rc}"
+                ),
+            };
+            eprintln!(
+                "xerj corpus index: resumed build {build} is not verified ({why}; autoindex exit \
+                 {rc})."
+            );
+            eprintln!(
+                "xerj corpus index: nothing was recorded as a verified build, and no ledger \
+                 without a build was written. The journal at {} is kept — re-run `xerj corpus \
+                 index {name}` to resume it. A replacement beside it is `xerj corpus index \
+                 {name} --fresh`.",
+                state_dir.display()
+            );
+            if rc != 0 && rc != 3 {
+                rc
+            } else {
+                1
+            }
+        }
+    }
+}
+
 /// The build/verify/swap flow over an injected node, autoindex runner and
 /// clock (#1004) — the destructive-operation contracts are pinned by the
 /// tests below against a [`FakeNode`](tests::FakeNode), which is why none of
@@ -1433,6 +2701,7 @@ fn legacy_failure_verdict(before: Option<u64>, after: Option<u64>) -> LegacyFail
 /// real `crate::run_with_options` in production, with `--no-graph` set
 /// (reference code needs ranked passages, not a relationship map) — and
 /// `--fresh` is NEVER forwarded: this flow owns the swap.
+#[allow(clippy::too_many_arguments)]
 fn corpus_index_flow(
     node: &dyn CorpusNode,
     run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
@@ -1441,6 +2710,7 @@ fn corpus_index_flow(
     url: &str,
     name: &str,
     fresh: bool,
+    include_data: bool,
 ) -> i32 {
     let state_file = root.join("state").join(format!("{name}.json"));
     let state_root = root.join("autoindex-state");
@@ -1450,11 +2720,27 @@ fn corpus_index_flow(
     let old_state_dir = old.as_ref().and_then(|s| s.state_dir.clone());
     let old_url = old.as_ref().and_then(|s| s.url.clone());
 
-    // Which run is this? build (--fresh / first / ledger-names-a-build-this-
-    // node-does-not-hold), update (reconcile the recorded build in place), or
-    // legacy (a corpus indexed before builds existed).
+    // Which run is this?
+    // - build: --fresh, a first index, or a recorded build this node does not hold
+    // - update: reconcile the recorded build in place
+    // - resume: a build was killed before the ledger named it; continue its journal
+    // - legacy: indexed before builds existed (no build journal on disk)
     let mut mode = "legacy";
     let (old_indices, _listed_ok) = corpus_indices(node, name, root);
+    let corpus_dir = root.join("corpora").join(name);
+    // Look only when the ledger does not already name a build. A recorded
+    // build takes the update / #1214 refusal above; --fresh builds a new one.
+    let unfinished = if fresh || old_build.is_some() {
+        None
+    } else {
+        match find_unfinished_build(&state_root, name, &corpus_dir, url, &old_indices) {
+            Ok(found) => found,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return 2;
+            }
+        }
+    };
     if fresh {
         mode = "build";
     } else if old_build.is_some() {
@@ -1517,6 +2803,11 @@ fn corpus_index_flow(
                 mode = "build";
             }
         }
+    } else if unfinished.is_some() {
+        // Indices from the killed run must not select legacy mode. Legacy
+        // opens a different prefix with no state dir, re-hashes the corpus,
+        // and writes a ledger that names no build (#2239).
+        mode = "resume";
     } else if !state_file.exists() && old_indices.is_empty() {
         mode = "build"; // first index of this corpus: same path as --fresh
     }
@@ -1719,7 +3010,7 @@ fn corpus_index_flow(
                     }
                 }
             }
-            report(name, rc, &docs.to_string());
+            report(root, name, rc, &docs.to_string(), include_data);
             0
         }
         "update" => {
@@ -1757,8 +3048,22 @@ fn corpus_index_flow(
                 Some(&prefix),
                 old_state_dir.as_deref(),
             );
-            report(name, rc, &docs);
+            report(root, name, rc, &docs, include_data);
             0
+        }
+        "resume" => {
+            let unfinished = unfinished
+                .as_ref()
+                .expect("resume mode is set only when an unfinished build was found");
+            resume_unfinished_build(
+                node,
+                run_autoindex,
+                root,
+                url,
+                name,
+                unfinished,
+                include_data,
+            )
         }
         _ => {
             // Legacy: recorded before the run so a failure can tell "this run
@@ -1830,7 +3135,7 @@ fn corpus_index_flow(
                      stale generations (if any) were NOT retired; re-run when the node answers."
                 );
             }
-            report(name, rc, &docs_s);
+            report(root, name, rc, &docs_s, include_data);
             0
         }
     }
@@ -1846,14 +3151,42 @@ fn stamp_secs() -> i64 {
 
 // ── xerj corpus list ────────────────────────────────────────────────────────
 
+struct Captured {
+    stdout: String,
+    stderr: String,
+}
+
+fn push_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    buf.push('\n');
+}
+
 fn run_corpus_list(args: &[String]) -> i32 {
+    let (code, text) = corpus_list_text(args);
+    if !text.stdout.is_empty() {
+        print!("{}", text.stdout);
+    }
+    if !text.stderr.is_empty() {
+        eprint!("{}", text.stderr);
+    }
+    code
+}
+
+fn corpus_list_text(args: &[String]) -> (i32, Captured) {
     let mut url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                println!("{CORPUS_USAGE}");
-                return 0;
+                let mut stdout = String::new();
+                push_line(&mut stdout, CORPUS_USAGE);
+                return (
+                    0,
+                    Captured {
+                        stdout,
+                        stderr: String::new(),
+                    },
+                );
             }
             "--url" => match args.get(i + 1) {
                 Some(v) => {
@@ -1861,13 +3194,33 @@ fn run_corpus_list(args: &[String]) -> i32 {
                     i += 1;
                 }
                 None => {
-                    eprintln!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}");
-                    return 2;
+                    let mut stderr = String::new();
+                    push_line(
+                        &mut stderr,
+                        &format!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}"),
+                    );
+                    return (
+                        2,
+                        Captured {
+                            stdout: String::new(),
+                            stderr,
+                        },
+                    );
                 }
             },
             a => {
-                eprintln!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
+                let mut stderr = String::new();
+                push_line(
+                    &mut stderr,
+                    &format!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}"),
+                );
+                return (
+                    2,
+                    Captured {
+                        stdout: String::new(),
+                        stderr,
+                    },
+                );
             }
         }
         i += 1;
@@ -1875,18 +3228,41 @@ fn run_corpus_list(args: &[String]) -> i32 {
     let root = code_root();
     let state_dir = root.join("state");
     if !state_dir.is_dir() {
-        eprintln!(
-            "no state directory at {} — nothing has been indexed on this machine",
-            state_dir.display()
+        let mut stderr = String::new();
+        push_line(
+            &mut stderr,
+            &format!(
+                "no state directory at {} — nothing has been indexed on this machine",
+                state_dir.display()
+            ),
         );
-        return 2;
+        // The ledger is empty. A node that already has autoindex prefixes
+        // should say so; a node that does not answer adds nothing.
+        push_prefix_hint(&mut stderr, &resolve_url(url.as_deref()));
+        return (
+            2,
+            Captured {
+                stdout: String::new(),
+                stderr,
+            },
+        );
     }
     let url = resolve_url(url.as_deref());
     let es = match build_es(&url, None) {
         Ok(es) => es,
         Err(e) => {
-            eprintln!("xerj corpus list: cannot reach {url}: {e:#}");
-            return 2;
+            let mut stderr = String::new();
+            push_line(
+                &mut stderr,
+                &format!("xerj corpus list: cannot reach {url}: {e:#}"),
+            );
+            return (
+                2,
+                Captured {
+                    stdout: String::new(),
+                    stderr,
+                },
+            );
         }
     };
     let mut names: Vec<String> = std::fs::read_dir(&state_dir)
@@ -1902,12 +3278,13 @@ fn run_corpus_list(args: &[String]) -> i32 {
         })
         .collect();
     names.sort();
+    let mut stdout = String::new();
     let mut loaded = 0usize;
     for name in &names {
         let st = match state::load_state(&root, name) {
             Ok(st) => st,
             Err(e) => {
-                println!("{name}: unreadable state ({e})");
+                push_line(&mut stdout, &format!("{name}: unreadable state ({e})"));
                 continue;
             }
         };
@@ -1925,6 +3302,11 @@ fn run_corpus_list(args: &[String]) -> i32 {
             Ok(v) => v.len(),
             Err(_) => usize::MAX,
         };
+        let own_note = if xccode::manifest::corpus_is_own(&root, name) {
+            ", own"
+        } else {
+            ""
+        };
         let uses = xccode::corpus_review_uses(&root, name);
         let use_note = uses
             .keys()
@@ -1932,30 +3314,55 @@ fn run_corpus_list(args: &[String]) -> i32 {
             .and_then(|k| uses.get(k).map(|u| format!("\n  use: {u}")))
             .unwrap_or_default();
         match live {
-            usize::MAX => println!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}"),
-            0 => println!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"),
+            usize::MAX => push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — server unreachable/ambiguous at {url}")),
+            0 => {
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"));
+                // #1846: a name the index prefix rewrites (`curl_cffi`) was
+                // indexed under another spelling, so "0 indices" is not the
+                // whole story — say which name to move it to.
+                if let Err(why) = xccode::pathgate::valid_corpus_name(name) {
+                    push_line(&mut stdout, &format!("  {why}"));
+                }
+            }
             n => {
                 loaded += 1;
-                println!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}");
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}{own_note}, prefix {prefix}) — loaded — {n} index(es){use_note}"));
             }
         }
         if let Some(w) = state::incomplete_coverage(&st) {
-            println!("  {w}");
+            push_line(&mut stdout, &format!("  {w}"));
         }
     }
-    println!();
-    println!(
-        "{} of {} corpora are actually loaded on {url}.",
-        loaded,
-        names.len()
+    stdout.push('\n');
+    push_line(
+        &mut stdout,
+        &format!(
+            "{} of {} corpora are actually loaded on {url}.",
+            loaded,
+            names.len()
+        ),
     );
-    0
+    let mut stderr = String::new();
+    if names.is_empty() {
+        push_prefix_hint(&mut stderr, &url);
+    }
+    (0, Captured { stdout, stderr })
 }
 
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 /// `xerj corpus <add|build|index|list> …` — returns the process exit code.
+fn corpus_verb(arg: &str) -> bool {
+    matches!(
+        arg,
+        "add" | "build" | "sign" | "keygen" | "index" | "list" | "own" | "help" | "-h" | "--help"
+    )
+}
+
 pub fn run_corpus_cli(args: &[String]) -> i32 {
+    // `xerj corpus --url URL index <name>`: the verb is not the first token.
+    let promoted = xerj_common::argv::reorder_flags_before_command(args, corpus_verb);
+    let args: &[String] = promoted.as_deref().unwrap_or(args);
     let Some(sub) = args.first() else {
         eprintln!("{CORPUS_USAGE}");
         return 2;
@@ -1963,6 +3370,7 @@ pub fn run_corpus_cli(args: &[String]) -> i32 {
     let rest: Vec<String> = args[1..].to_vec();
     match sub.as_str() {
         "add" => run_corpus_add(&rest),
+        "own" => run_corpus_own(&rest),
         "build" => crate::harvest::run_build(&rest),
         "sign" | "keygen" => crate::harvest::sign::run_sign_cli(sub, &rest),
         "index" => run_corpus_index(&rest),
@@ -1986,6 +3394,76 @@ pub fn licence_map_for(root: &Path, corpus: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_fetch_failure_names_tls_and_a_stale_pin() {
+        let tls = git_fetch_failure(
+            "abc",
+            "fatal: unable to access 'https://example.com/': GnuTLS recv error (-110): The TLS connection was non-properly terminated.",
+        );
+        assert!(tls.contains("git fetch abc failed:"), "{tls}");
+        assert!(tls.contains("GnuTLS"), "{tls}");
+        assert!(tls.contains("HTTPS_PROXY"), "{tls}");
+        assert!(tls.contains("GIT_SSL_CAINFO"), "{tls}");
+
+        let pin = git_fetch_failure(
+            "6f4f07681f45",
+            "fatal: remote error: upload-pack: not our ref 6f4f07681f45",
+        );
+        assert!(pin.contains("not our ref"), "{pin}");
+        assert!(pin.contains("pinned commit is not on the remote"), "{pin}");
+        assert!(!pin.contains("HTTPS_PROXY"), "{pin}");
+
+        let bare = git_fetch_failure("abc", "   ");
+        assert_eq!(bare, "git fetch abc failed");
+
+        let long = git_fetch_failure("abc", &"x".repeat(800));
+        assert!(long.chars().filter(|c| *c == 'x').count() <= 500, "{long}");
+    }
+
+    #[test]
+    fn a_flag_before_the_corpus_verb_is_not_an_unknown_subcommand() {
+        // Before the hoist, `--url` was the verb and this returned 2
+        // ("unknown subcommand"). `--help` is the verb; it must run.
+        let code = run_corpus_cli(&["--url".into(), "http://127.0.0.1:9".into(), "--help".into()]);
+        assert_eq!(code, 0);
+    }
+
+    /// #1985: `--include-data` is the opt-out of the corpus data-file gate.
+    /// Parsing is separated from the run so this needs no node.
+    #[test]
+    fn corpus_index_parses_include_data() {
+        let p = parse_corpus_index_args(&["--include-data".into(), "repo".into()]).unwrap();
+        assert!(p.include_data && !p.fresh && !p.help);
+        assert_eq!(p.name.as_deref(), Some("repo"));
+
+        let p = parse_corpus_index_args(&[
+            "--fresh".into(),
+            "repo".into(),
+            "--url".into(),
+            "http://127.0.0.1:9200".into(),
+        ])
+        .unwrap();
+        assert!(p.fresh && !p.include_data);
+        assert_eq!(p.url.as_deref(), Some("http://127.0.0.1:9200"));
+
+        assert!(parse_corpus_index_args(&["--nope".into()]).is_err());
+        assert!(parse_corpus_index_args(&["repo".into(), "extra".into()]).is_err());
+        assert!(parse_corpus_index_args(&["--url".into()]).is_err());
+        assert!(parse_corpus_index_args(&["--help".into()]).unwrap().help);
+    }
+
+    #[test]
+    fn corpus_index_says_a_tool_timeout_is_not_a_failed_index() {
+        let note = corpus_index_duration_note();
+        assert!(note.contains("tool timeout"), "{note}");
+        assert!(note.contains("re-run"), "{note}");
+        assert!(note.contains("xerj-done"), "{note}");
+        assert!(
+            CORPUS_USAGE.contains("tool timeout"),
+            "the usage line must point at the same warning"
+        );
+    }
 
     #[test]
     fn corpus_names_are_gated_before_any_path_is_built() {
@@ -2040,6 +3518,12 @@ mod tests {
             assert!(CODE_USAGE.contains(f), "{f} missing from usage");
         }
         assert!(CORPUS_USAGE.contains("--from"));
+        assert!(
+            CODE_USAGE.contains("Default ranking is lexical")
+                && CODE_USAGE.contains("not a neural reading")
+                && CODE_USAGE.contains("--embed-mode neural"),
+            "{CODE_USAGE}"
+        );
     }
 
     /// The `--from` name swap: explicit beats the manifest, the manifest
@@ -2315,7 +3799,7 @@ mod tests {
         url: &str,
     ) -> i32 {
         with_fast_count_retries(|| {
-            corpus_index_flow(node, &auto.runner(), clock, root, url, name, fresh)
+            corpus_index_flow(node, &auto.runner(), clock, root, url, name, fresh, false)
         })
     }
 
@@ -2706,6 +4190,7 @@ mod tests {
                 "http://x",
                 "kv",
                 false,
+                false,
             )
         });
         assert_eq!(rc, 0, "control: a queryable salvage still succeeds");
@@ -2733,6 +4218,7 @@ mod tests {
                 "http://x",
                 "kv",
                 false,
+                false,
             )
         });
         assert_eq!(
@@ -2746,6 +4232,49 @@ mod tests {
         assert_ne!(st.autoindex_exit, Some(serde_json::json!(1)));
         // and the probe ran, over exactly the glob `xerj code` reads
         assert!(node.ops.borrow().iter().any(|o| *o == "search:xc-kv-*"));
+    }
+
+    /// #1183, the last live half of the dishonest-resume item: a run that
+    /// aborted (autoindex exit ∉ {0,3}) and was only KEPT by the #367 salvage
+    /// must not print the clean `searchable: N records` success footer. The
+    /// 2026-10-08 standing rebuild ended `xerj-done ok=false exit=1
+    /// reason=aborted` and still printed `corpus 'xerj-search' searchable:
+    /// 1011181 records`, overstating the kept set by the 348 docs the re-walk
+    /// had just dropped.
+    #[test]
+    fn the_searchable_footer_is_never_printed_after_an_aborted_run() {
+        // clean exits keep the earned "searchable" footer and the next-hint
+        for rc in [0, 3] {
+            let lines = report_footer("kv", rc, "500");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l == "corpus 'kv' searchable: 500 records"),
+                "rc {rc} is clean and earns the searchable footer: {lines:?}"
+            );
+            assert!(lines.iter().any(|l| l.starts_with("next: xerj code kv")));
+        }
+        // a salvaged/aborted run (any other exit) says so and NEVER prints the
+        // word "searchable" — the whole defect in one assertion
+        for rc in [1, 2, 134] {
+            let lines = report_footer("kv", rc, "500");
+            assert!(
+                lines.iter().all(|l| !l.contains("searchable")),
+                "an aborted run (exit {rc}) must not print the searchable footer: {lines:?}"
+            );
+            // it still tells the operator the kept store exists, names the
+            // exit, and points at the clean rebuild — honest, not silent
+            assert!(
+                lines.iter().any(|l| l.contains("indexed with errors")
+                    && l.contains(&format!("autoindex exit {rc}"))
+                    && l.contains("coverage is NOT guaranteed")),
+                "the aborted footer must name the fault: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("--fresh")),
+                "the aborted footer points at the clean rebuild: {lines:?}"
+            );
+        }
     }
 
     /// #1173: the three honest claims a failed legacy run can make. The one
@@ -2905,6 +4434,453 @@ mod tests {
         assert_eq!(st.index_prefix, None, "legacy state records no build");
         assert!(node.live("xc-kv-000"));
         assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
+    }
+
+    /// The journal a `corpus index` kill leaves under `autoindex-state/<name>/<build>`.
+    /// `after_run` is appended after the `run` record (include trailing newlines).
+    /// `torn` appends a partial last line with no newline — the kill's in-flight record.
+    fn write_killed_journal(
+        root: &Path,
+        name: &str,
+        build: &str,
+        url: &str,
+        after_run: &str,
+        torn: bool,
+    ) -> PathBuf {
+        let corpus = root.join("corpora").join(name);
+        let root_str = corpus
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let prefix = format!("xc-{name}-{build}");
+        let dir = root.join("autoindex-state").join(name).join(build);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({
+            "v": 1,
+            "kind": "run",
+            "root": root_str,
+            "url": url,
+            "prefix": prefix,
+            "bulk_timeout_secs": 300,
+            "run_id": format!("run-{build}"),
+            "started": "2026-10-22T00:00:00Z"
+        });
+        let mut text = format!("{run}\n{after_run}");
+        if torn {
+            text.push_str("{\"kind\":\"sync_operation_state\",\"partial\":");
+        }
+        std::fs::write(dir.join("journal.ndjson"), text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resume_verdict_records_a_clean_build_and_explains_the_rest() {
+        use super::ResumeVerdict::*;
+        assert_eq!(resume_verdict(0, Some(10), true), Verified);
+        assert_eq!(resume_verdict(3, Some(10), true), Verified);
+        assert_eq!(resume_verdict(1, Some(10), true), Salvaged);
+        assert_eq!(resume_verdict(0, Some(10), false), Unverified);
+        // A zero or unknown count must not become a ledger with no build.
+        assert_eq!(resume_verdict(0, Some(0), true), KeepJournal);
+        assert_eq!(resume_verdict(0, None, true), KeepJournal);
+        assert_eq!(resume_verdict(1, Some(0), false), KeepJournal);
+        assert_eq!(resume_verdict(1, None, false), KeepJournal);
+    }
+
+    #[test]
+    fn resume_note_claims_no_rehash_only_when_a_generation_is_pending() {
+        let pending = UnfinishedBuild {
+            build: "b1".into(),
+            prefix: "xc-kv-b1".into(),
+            state_dir: PathBuf::from("/tmp/state"),
+            generation_pending: true,
+        };
+        let note = resume_build_note("kv", &pending);
+        assert!(note.contains("journal"), "{note}");
+        assert!(note.contains("not hashed again"), "{note}");
+        assert!(note.contains("uncommitted"), "{note}");
+
+        let sealed = UnfinishedBuild {
+            generation_pending: false,
+            ..pending
+        };
+        let note = resume_build_note("kv", &sealed);
+        assert!(
+            note.contains("re-hashes"),
+            "a journal with no in-progress generation must not claim the hash is skipped: {note}"
+        );
+        assert!(!note.contains("not hashed again"), "{note}");
+    }
+
+    /// #2239: killed mid-index. The ledger was never written (it is written
+    /// only after verification). The journal holds `sync_begin` and the node
+    /// already has this build's indices. The retry must hand that journal
+    /// back to autoindex — which replays uncommitted operations and does not
+    /// re-enter snapshot/hash — and a resume that then completes must record
+    /// the verified build. The old path took legacy mode (`xc-kv`, no state
+    /// dir) and wrote a ledger with no `index_prefix`.
+    #[test]
+    fn a_kill_mid_index_resumes_the_journal_and_records_a_verified_build() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            true,
+        );
+        let node = FakeNode::new();
+        // What the killed run had already published.
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let (_prefix, sd) = &auto.calls.borrow()[0];
+        assert_eq!(
+            sd.as_deref(),
+            Some(state_dir.as_path()),
+            "resume must pass the killed run's state dir, not start a new journal"
+        );
+        assert!(
+            node.ops
+                .borrow()
+                .iter()
+                .all(|op| !op.starts_with("delete:")),
+            "a resume does not retire the indices the killed run already wrote"
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        assert_eq!(st.salvaged, Some(false));
+        assert_eq!(st.autoindex_exit, Some(serde_json::json!(0)));
+        assert!(
+            state::incomplete_coverage(&st).is_none(),
+            "a clean resume is a verified build"
+        );
+        // The torn tail must not have hidden sync_begin: that flag is what
+        // tells the resume it can continue mid-index instead of re-hashing.
+        let scan = read_build_journal(&state_dir.join("journal.ndjson")).unwrap();
+        assert!(
+            scan.generation_pending,
+            "a kill's torn last line is discarded; sync_begin still means the index phase"
+        );
+        assert!(scan.matches(
+            &corpus_journal_root(&root.join("corpora/kv")),
+            "http://x",
+            "xc-kv-b1"
+        ));
+    }
+
+    /// Same kill, but the store answers a count and not a search. The build
+    /// is recorded so status can explain why it is unverified, instead of
+    /// widening to "no verified build recorded".
+    #[test]
+    fn a_resumed_build_the_node_cannot_search_is_recorded_unverified() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        node.seed_search(
+            "xc-kv-b1-*",
+            Err("HTTP 500: store_exception: Segment ea12 not found".into()),
+        );
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1, "a failed verification search is not success");
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.salvaged, Some(true));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        let warning = state::incomplete_coverage(&st).expect("unverified status");
+        assert!(
+            warning.contains("NOT verified complete") && warning.contains("kept unverified"),
+            "{warning}"
+        );
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    /// Autoindex itself failed and the node has nothing new to stand on.
+    /// Do not write the legacy ledger (no build) that the notice complains about.
+    #[test]
+    fn a_failed_resume_keeps_the_journal_and_writes_no_buildless_ledger() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Zero);
+
+        let auto = FakeAuto::with_rc(&node, 1);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        assert!(
+            state::load_state(&root, "kv").is_err(),
+            "a failed resume must not write a ledger that names no build"
+        );
+        assert!(
+            state_dir.join("journal.ndjson").is_file(),
+            "the journal remains the next resume point"
+        );
+    }
+
+    /// Killed during snapshot, before any index existed: still the same state
+    /// dir, not a freshly minted build that abandons the sealed snapshot.
+    #[test]
+    fn a_kill_before_any_index_resumes_the_same_build_directory() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(&root, "kv", "b9", "http://x", "", false);
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b9".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b9"));
+        assert_eq!(st.salvaged, Some(false));
+        let note = resume_build_note(
+            "kv",
+            &UnfinishedBuild {
+                build: "b9".into(),
+                prefix: "xc-kv-b9".into(),
+                state_dir: state_dir.clone(),
+                generation_pending: false,
+            },
+        );
+        assert!(note.contains("re-hashes"), "{note}");
+    }
+
+    #[test]
+    fn a_first_index_with_no_journal_still_mints_a_build() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        assert_eq!(run_flow(&node, &auto, &|| T0, &root, "kv", false), 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert_eq!(st.salvaged, Some(false));
+    }
+
+    #[test]
+    fn fresh_ignores_an_unfinished_journal_and_builds_a_new_one() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert!(!node.live("xc-kv-b1-000"), "fresh retires the killed build");
+    }
+
+    #[test]
+    fn two_pending_journals_are_refused_instead_of_guessing() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices
+            .borrow_mut()
+            .extend(["xc-kv-b1-000".into(), "xc-kv-b2-000".into()]);
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+        assert!(state::load_state(&root, "kv").is_err());
+    }
+
+    #[test]
+    fn a_single_pending_journal_wins_over_another_finished_attempt() {
+        let root = corpus_root("kv");
+        let pending = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n{\"kind\":\"sync_commit\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(pending.as_path()));
+    }
+
+    #[test]
+    fn live_indices_select_the_build_that_was_being_published() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let live = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b2-000".into());
+        node.seed_count("xc-kv-b2-*", Count::Number(40));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(live.as_path()));
+        assert!(node.live("xc-kv-b2-000"));
+    }
+
+    #[test]
+    fn a_journal_for_another_url_is_not_resumed_over_its_live_indices() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://elsewhere",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2, "legacy mode would re-hash and can retire this build");
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    #[test]
+    fn a_corrupt_build_journal_is_refused() {
+        let root = corpus_root("kv");
+        let dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        std::fs::write(
+            dir.join("journal.ndjson"),
+            "{\"kind\":\"run\"}\n{not json}\n",
+        )
+        .unwrap();
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
     }
 
     #[test]
@@ -3296,8 +5272,10 @@ precedence = ["a", "b"]
                 files: None,
                 bytes: None,
                 review: None,
+                paths: Vec::new(),
             }],
             None,
+            false,
         );
         let _h = code_home(home.path());
         let rc = run_corpus_add(&[
@@ -3378,5 +5356,955 @@ precedence = ["a", "b"]
         let rc = run_corpus_add(&["--from".to_string(), junk.display().to_string()]);
         assert_eq!(rc, 2);
         assert!(!home.path().join("corpora/junk").exists());
+    }
+
+    // ── corpus add of a local checkout's .xerjignore (#2199) ───────────────
+
+    fn init_committed_repo(dir: &Path, files: &[(&str, &str)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let (rc, out) = git(Some(dir), &["init", "--quiet", "-b", "main"]).unwrap();
+        assert_eq!(rc, 0, "git init: {out}");
+        for (name, body) in files {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, body).unwrap();
+            let (rc, out) = git(Some(dir), &["add", "--", name]).unwrap();
+            assert_eq!(rc, 0, "git add {name}: {out}");
+        }
+        let (rc, out) = git(
+            Some(dir),
+            &[
+                "-c",
+                "user.email=xerj-test@example.com",
+                "-c",
+                "user.name=xerj-test",
+                "commit",
+                "--quiet",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        assert_eq!(rc, 0, "git commit: {out}");
+    }
+
+    fn head_sha(dir: &Path) -> String {
+        let (rc, sha) = git(Some(dir), &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(rc, 0, "{sha}");
+        assert_eq!(sha.len(), 40, "{sha}");
+        sha
+    }
+
+    #[test]
+    fn local_checkout_root_is_a_directory_or_a_file_url() {
+        assert!(local_checkout_root("https://github.com/xerj-org/xerj").is_none());
+        assert!(local_checkout_root("ssh://git@github.com/xerj-org/xerj.git").is_none());
+        assert!(local_checkout_root("git@github.com:xerj-org/xerj.git").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().display().to_string();
+        assert_eq!(local_checkout_root(&path).as_deref(), Some(dir.path()));
+        assert_eq!(
+            local_checkout_root(&format!("file://{path}")).as_deref(),
+            Some(dir.path())
+        );
+        assert_eq!(
+            local_checkout_root(&format!("file://localhost{path}")).as_deref(),
+            Some(dir.path())
+        );
+        assert!(local_checkout_root("file://localhost/no/such/xerj-path-2199").is_none());
+    }
+
+    /// #2472: a Windows drive or UNC path names its repo by the last
+    /// `\`-separated segment, as a URL or a Unix path does by its last `/` one.
+    #[test]
+    fn repo_name_from_source_splits_windows_paths() {
+        for (source, repo) in [
+            (r"F:\Projects\Roblox\LunarGame", "LunarGame"),
+            (r"F:\Projects\Roblox\LunarGame\", "LunarGame"),
+            (r"F:\src\widget.git", "widget"),
+            (r"\\server\share\widget", "widget"),
+            ("C:/src/widget/", "widget"),
+            ("/home/me/widget", "widget"),
+            ("https://github.com/xerj-org/xerj.git", "xerj"),
+            ("git@github.com:xerj-org/xerj.git", "xerj"),
+        ] {
+            let name = repo_name_from_source(source);
+            assert_eq!(name, repo, "{source}");
+            assert!(
+                xccode::pathgate::valid_repo_name(&name).is_ok(),
+                "{source} -> {name}"
+            );
+        }
+    }
+
+    /// #2339: `--own` is explicit. A local path with no LICENSE is not marked
+    /// own by itself. The marker persists across a re-add, a `--from` file
+    /// cannot set it, and `xerj corpus own` sets and clears it.
+    #[test]
+    fn corpus_add_own_is_explicit_and_corpus_own_sets_an_existing_corpus() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+        let origin = home.path().join("widget");
+        init_committed_repo(&origin, &[("src/lib.rs", "fn mine() {}\n")]);
+
+        assert_eq!(
+            run_corpus_add(&["plain".into(), origin.display().to_string()]),
+            0
+        );
+        let plain =
+            manifest::read_corpus_manifest(&home.path().join("corpora/plain/corpus.json")).unwrap();
+        assert!(!plain.own, "a local path is not own unless --own is passed");
+        assert_eq!(plain.repos[0].licence, "NONE-FOUND");
+
+        assert_eq!(
+            run_corpus_add(&["--own".into(), "mine".into(), origin.display().to_string()]),
+            0
+        );
+        let mine_path = home.path().join("corpora/mine/corpus.json");
+        let mine = manifest::read_corpus_manifest(&mine_path).unwrap();
+        assert!(mine.own);
+        assert_eq!(mine.repos[0].licence, "NONE-FOUND");
+        let text = std::fs::read_to_string(&mine_path).unwrap();
+        assert!(text.contains("\"own\":true"), "{text}");
+
+        assert_eq!(
+            run_corpus_add(&["mine".into(), origin.display().to_string()]),
+            0,
+            "re-add without --own keeps the marker"
+        );
+        assert!(manifest::read_corpus_manifest(&mine_path).unwrap().own);
+
+        let sha = head_sha(&origin);
+        let pin = home.path().join("hostile.json");
+        std::fs::write(
+            &pin,
+            format!(
+                r#"{{"corpus":"from-file","own":true,"repos":[{{"repo":"widget","url":"{}","sha":"{sha}","licence":"UNKNOWN"}}]}}"#,
+                origin.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), pin.display().to_string()]),
+            0
+        );
+        let from_path = home.path().join("corpora/from-file/corpus.json");
+        let from = manifest::read_corpus_manifest(&from_path).unwrap();
+        assert!(
+            !from.own,
+            "a --from manifest must not be able to set own: {}",
+            std::fs::read_to_string(&from_path).unwrap()
+        );
+
+        assert_eq!(run_corpus_own(&["from-file".into()]), 0);
+        assert!(manifest::read_corpus_manifest(&from_path).unwrap().own);
+        assert_eq!(
+            manifest::read_corpus_manifest(&from_path).unwrap().repos[0].licence,
+            "NONE-FOUND"
+        );
+        assert_eq!(run_corpus_own(&["from-file".into(), "--off".into()]), 0);
+        let cleared = std::fs::read_to_string(&from_path).unwrap();
+        assert!(!cleared.contains("own"), "{cleared}");
+        assert!(!manifest::read_corpus_manifest(&from_path).unwrap().own);
+
+        assert_eq!(run_corpus_own(&["missing".into()]), 2);
+        assert_eq!(run_corpus_own(&[]), 2);
+        assert!(CORPUS_USAGE.contains("xerj corpus own"));
+        assert!(CORPUS_USAGE.contains("--own"));
+        assert!(CORPUS_USAGE.contains("file classes") || CORPUS_USAGE.contains("per-file-class"));
+    }
+
+    /// #2199: `git clone` of a local path checks out committed files only.
+    /// An untracked root `.xerjignore` has to be copied or the index sees
+    /// built-in rules alone. Re-adding refreshes it; `file://` is the same
+    /// local checkout; a source with no ignore file does not gain one.
+    #[test]
+    fn corpus_add_copies_an_untracked_root_xerjignore_from_a_local_path() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+        let origin = home.path().join("widget");
+        init_committed_repo(&origin, &[("keep.txt", "tracked\n")]);
+        let ignore = "secret.csv\n";
+        std::fs::write(origin.join(".xerjignore"), ignore).unwrap();
+        let (rc, status) = git(
+            Some(&origin),
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert_eq!(rc, 0, "{status}");
+        assert!(
+            status.contains("?? .xerjignore"),
+            "the fixture must be untracked, not committed: {status}"
+        );
+
+        assert_eq!(
+            run_corpus_add(&["local-ignore".into(), origin.display().to_string()]),
+            0
+        );
+        let corpus = home.path().join("corpora/local-ignore");
+        let clone = corpus.join("widget");
+        assert_eq!(
+            std::fs::read_to_string(clone.join("keep.txt")).unwrap(),
+            "tracked\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).expect("clone .xerjignore"),
+            ignore,
+            "an untracked root .xerjignore must be copied into the clone"
+        );
+        let recorded = manifest::read_corpus_manifest(&corpus.join("corpus.json")).unwrap();
+        assert_eq!(
+            recorded.repos[0].files,
+            Some(2),
+            "the carried ignore file is part of the tree the manifest counts"
+        );
+
+        let updated = "secret.csv\nalso.csv\n";
+        std::fs::write(origin.join(".xerjignore"), updated).unwrap();
+        assert_eq!(
+            run_corpus_add(&["local-ignore".into(), origin.display().to_string()]),
+            0,
+            "re-add of an existing clone refreshes the carried file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).unwrap(),
+            updated
+        );
+
+        let file_url = format!("file://{}", origin.display());
+        assert_eq!(run_corpus_add(&["via-file".into(), file_url]), 0);
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("corpora/via-file/widget/.xerjignore"))
+                .expect("file:// clone .xerjignore"),
+            updated
+        );
+
+        let bare = home.path().join("plainrepo");
+        init_committed_repo(&bare, &[("keep.txt", "tracked\n")]);
+        assert_eq!(
+            run_corpus_add(&["no-ignore".into(), bare.display().to_string()]),
+            0
+        );
+        assert!(
+            !home
+                .path()
+                .join("corpora/no-ignore/plainrepo/.xerjignore")
+                .exists(),
+            "a checkout with no .xerjignore must not gain one"
+        );
+    }
+
+    /// An uncommitted edit of a tracked `.xerjignore` is the same drop:
+    /// `git clone` checks out the committed bytes. A pinned `--from` rebuild
+    /// must not copy the working tree over the recorded sha.
+    #[test]
+    fn corpus_add_copies_uncommitted_xerjignore_edits_but_a_pin_does_not() {
+        let home = tempfile::tempdir().unwrap();
+        let _h = code_home(home.path());
+
+        let origin = home.path().join("edited");
+        init_committed_repo(
+            &origin,
+            &[("keep.txt", "tracked\n"), (".xerjignore", "v1\n")],
+        );
+        std::fs::write(origin.join(".xerjignore"), "v2\n").unwrap();
+        assert_eq!(
+            run_corpus_add(&["edited-ignore".into(), origin.display().to_string()]),
+            0
+        );
+        let clone = home.path().join("corpora/edited-ignore/edited");
+        assert_eq!(
+            std::fs::read_to_string(clone.join(".xerjignore")).unwrap(),
+            "v2\n",
+            "the working-tree edit must overlay the committed ignore file"
+        );
+        let (rc, committed) = git(Some(&clone), &["show", "HEAD:.xerjignore"]).unwrap();
+        assert_eq!(rc, 0, "{committed}");
+        assert_eq!(committed, "v1", "the overlay is not a new commit");
+
+        let pinned_src = home.path().join("pinnedsrc");
+        init_committed_repo(&pinned_src, &[("keep.txt", "tracked\n")]);
+        std::fs::write(pinned_src.join(".xerjignore"), "secret.csv\n").unwrap();
+        let sha = head_sha(&pinned_src);
+        let manifest_path = home.path().join("pin.json");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"{{"corpus":"pinned-exact","repos":[{{"repo":"pinnedsrc","url":"{}","sha":"{sha}"}}]}}"#,
+                pinned_src.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest_path.display().to_string()]),
+            0
+        );
+        let pinned = home.path().join("corpora/pinned-exact/pinnedsrc");
+        assert_eq!(
+            std::fs::read_to_string(pinned.join("keep.txt")).unwrap(),
+            "tracked\n",
+            "the pin must still check out the recorded tree"
+        );
+        assert!(
+            !pinned.join(".xerjignore").exists(),
+            "a pinned rebuild stays at the recorded sha and does not copy the working tree's .xerjignore"
+        );
+    }
+
+    // ── empty ledger vs autoindex prefixes (#2181) ──────────────────────────
+
+    fn catalog_hits(prefixes: &[&str]) -> String {
+        let hits: Vec<Value> = prefixes
+            .iter()
+            .map(|prefix| json!({"_source": {"doc_kind": "run", "prefix": prefix}}))
+            .collect();
+        json!({"hits": {"hits": hits}}).to_string()
+    }
+
+    /// One-shot JSON stand-in for the node. Records each request so a test
+    /// can see that a path with corpora never asked the catalog.
+    struct JsonServer {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl JsonServer {
+        fn start(handler: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::Ordering;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_t = std::sync::Arc::clone(&seen);
+            let stop_t = std::sync::Arc::clone(&stop);
+            let handler = std::sync::Arc::new(handler);
+            let join = std::thread::spawn(move || {
+                while !stop_t.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buf = [0u8; 8192];
+                            let mut req = String::new();
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                        if let Some(end) = req.find("\r\n\r\n") {
+                                            let header_end = end + 4;
+                                            let need = req[..header_end].lines().find_map(|line| {
+                                                let (name, value) = line.split_once(':')?;
+                                                if name.eq_ignore_ascii_case("content-length") {
+                                                    value.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            match need {
+                                                Some(need) if req.len() - header_end >= need => {
+                                                    break
+                                                }
+                                                None => break,
+                                                Some(_) => {}
+                                            }
+                                        }
+                                        if req.len() > 64 * 1024 {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            seen_t.lock().unwrap().push(req.clone());
+                            let (status, body) = handler(&req);
+                            let reason = match status {
+                                200 => "OK",
+                                401 => "Unauthorized",
+                                404 => "Not Found",
+                                _ => "Error",
+                            };
+                            let bytes = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(bytes.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                url,
+                seen,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for JsonServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    fn assert_fast(started: std::time::Instant, what: &str) {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{what} took {elapsed:?}; a dead node must not go through Es::search's six retries"
+        );
+    }
+
+    #[test]
+    fn prefix_hint_names_the_search_and_def_commands_and_corpus_add() {
+        let one = format_autoindex_prefix_hint(&["proj".into()]).unwrap();
+        assert!(one.contains("prefixes: proj\n"), "{one}");
+        assert!(one.contains("`xerj search --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj def --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj corpus add <name> <path>`"), "{one}");
+        assert!(!one.contains("same --prefix"), "{one}");
+        assert_eq!(one.lines().count(), 2, "{one}");
+
+        let many = format_autoindex_prefix_hint(&["refs".into(), "proj".into()]).unwrap();
+        assert!(many.contains("prefixes: proj, refs"), "{many}");
+        assert!(many.contains("`xerj search --prefix proj`"), "{many}");
+        assert!(many.contains("same --prefix for each"), "{many}");
+
+        let mut nine: Vec<String> = (b'a'..=b'i').map(|c| (c as char).to_string()).collect();
+        nine.push("bad name".into());
+        nine.push("has\nnewline".into());
+        let capped = format_autoindex_prefix_hint(&nine).unwrap();
+        assert!(capped.contains("… (1 more)"), "{capped}");
+        assert!(capped.contains("`xerj search --prefix a`"), "{capped}");
+        assert!(!capped.contains("bad name"), "{capped}");
+        assert!(!capped.contains("has\nnewline"), "{capped}");
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+
+        assert!(format_autoindex_prefix_hint(&[]).is_none());
+        assert!(format_autoindex_prefix_hint(&["bad name".into()]).is_none());
+    }
+
+    #[test]
+    fn catalog_hit_prefixes_are_deduped_and_a_non_search_body_is_not_empty() {
+        let v = json!({"hits": {"hits": [
+            {"_source": {"prefix": "b"}},
+            {"_source": {"prefix": ""}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"other": 1}}
+        ]}});
+        assert_eq!(
+            prefixes_from_catalog_hits(&v).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(prefixes_from_catalog_hits(&json!({})).is_none());
+        assert_eq!(
+            prefixes_from_catalog_hits(&json!({"hits": {"hits": []}})).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_unreachable_catalog_is_silence_not_an_error() {
+        let url = closed_port_url();
+        let started = std::time::Instant::now();
+        assert!(fetch_catalog_run_prefixes(&url, None).is_none());
+        assert_fast(started, "closed port");
+
+        let server = JsonServer::start(|_| (500, "{\"error\":\"down\"}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "not-json".into()));
+        assert!(fetch_catalog_run_prefixes(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "{\"hits\":{\"hits\":[]}}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (401, "{}".into()));
+        assert!(catalog_prefix_hint(&server.url, Some("nope")).is_none());
+    }
+
+    fn request_has_api_key(req: &str, key: &str) -> bool {
+        let want = format!("ApiKey {key}");
+        req.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("authorization") && value.trim() == want
+        })
+    }
+
+    #[test]
+    fn the_hint_sends_the_explicit_api_key() {
+        let server = JsonServer::start(|req| {
+            if request_has_api_key(req, "secret-key") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (401, "{}".into())
+            }
+        });
+        let hint = catalog_prefix_hint(&server.url, Some("secret-key")).unwrap();
+        assert!(hint.contains("prefixes: proj"), "{hint}");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|req| request_has_api_key(req, "secret-key")),
+            "{:?}",
+            server.requests()
+        );
+    }
+
+    #[test]
+    fn corpus_list_with_no_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["refs", "proj", "proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 2);
+        assert!(text.stdout.is_empty(), "{}", text.stdout);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj search --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj def --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            text.stderr
+        );
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+    }
+
+    #[test]
+    fn corpus_list_stays_quiet_when_the_node_is_down() {
+        let url = closed_port_url();
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url.clone()]);
+        assert_fast(started, "corpus list, no state dir");
+        assert_eq!(code, 2);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(!text.stderr.contains("cannot reach"), "{}", text.stderr);
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url]);
+        assert_fast(started, "corpus list, empty state dir");
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(text.stderr.is_empty(), "{}", text.stderr);
+    }
+
+    #[test]
+    fn corpus_list_with_a_corpus_does_not_mention_autoindex_prefixes() {
+        let server = JsonServer::start(|req| {
+            if req.contains("/_cat/indices/") {
+                (200, r#"[{"index":"xc-demo-b1-docs"}]"#.into())
+            } else if req.contains("autoindex-catalog") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (404, "{}".into())
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let state = home.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("demo.json"),
+            r#"{"corpus":"demo","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-demo","autoindex_exit":0,"salvaged":false}"#,
+        )
+        .unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(text.stdout.contains("demo"), "{}", text.stdout);
+        assert!(text.stdout.contains("loaded — 1 index"), "{}", text.stdout);
+        assert!(
+            text.stdout.contains("1 of 1 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stdout.contains("autoindex catalog"),
+            "{}",
+            text.stdout
+        );
+        let seen = server.requests();
+        assert!(
+            seen.iter().all(|req| !req.contains("autoindex-catalog")),
+            "a ledger that has a corpus must not read the catalog: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn xerj_code_on_an_empty_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(out.to_stderr);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj search --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj def --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            out.text
+        );
+
+        // A different registered corpus means the ledger is not empty: the
+        // missing name keeps its own refusal and the catalog is not read.
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        std::fs::write(
+            home.path().join("state/other.json"),
+            r#"{"corpus":"other","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-other"}"#,
+        )
+        .unwrap();
+        let before = server.requests().len();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
+        assert_eq!(
+            server.requests().len(),
+            before,
+            "a non-empty ledger must not probe the catalog"
+        );
+        drop(_hold);
+
+        let url = closed_port_url();
+        let empty = tempfile::tempdir().unwrap();
+        let _hold_empty = code_home(empty.path());
+        let started = std::time::Instant::now();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            url,
+        ]);
+        assert_fast(started, "xerj code, dead node");
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
+    }
+
+    fn worktree_files(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == ".git") {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn write_pin(path: &Path, url: &str, sha: &str, paths: Option<&[&str]>) {
+        let mut repo = json!({
+            "repo": "vulndb",
+            "url": url,
+            "licence": "BSD-3-Clause",
+            "sha": sha,
+        });
+        if let Some(paths) = paths {
+            repo["paths"] = json!(paths);
+        }
+        std::fs::write(
+            path,
+            json!({ "corpus": "sparse-demo", "repos": [repo] }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// #1842: `paths` harvests only those directories. A whole-repo pin of
+    /// golang/vulndb indexed ~1.2M docs; the documented corpus is the
+    /// `data/osv` advisory tree. Cone mode would also leave ancestor files
+    /// (LICENSE, go tests) for `corpus index` to ingest, so the checkout is
+    /// the directory itself. Re-adding the same pin narrows a previous full
+    /// checkout, and dropping `paths` restores it.
+    #[test]
+    fn corpus_add_from_paths_harvests_only_those_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let origin = home.path().join("origin");
+        init_committed_repo(
+            &origin,
+            &[
+                ("LICENSE", "bsd\n"),
+                ("data/osv/GO-1.json", "{}\n"),
+                ("data/osv/sub/n.json", "{}\n"),
+                ("data/osv-extra/nope.json", "{}\n"),
+                ("data/reports/R.yaml", "id: 1\n"),
+                ("cmd/main.go", "package main\n"),
+            ],
+        );
+        let sha = head_sha(&origin);
+        let url = origin.display().to_string();
+        let manifest = home.path().join("pin.json");
+        let checkout = home.path().join("corpora/sparse-demo/vulndb");
+
+        write_pin(&manifest, &url, &sha, None);
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "a pin with no paths still harvests the whole repo"
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "LICENSE".to_string(),
+                "cmd/main.go".to_string(),
+                "data/osv-extra/nope.json".to_string(),
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+                "data/reports/R.yaml".to_string(),
+            ]
+        );
+
+        write_pin(&manifest, &url, &sha, Some(&["data/osv"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "re-adding the same sha with paths must narrow the existing checkout"
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+            ]
+        );
+        let recorded =
+            manifest::read_corpus_manifest(&home.path().join("corpora/sparse-demo/corpus.json"))
+                .unwrap();
+        assert_eq!(recorded.repos[0].paths, vec!["data/osv".to_string()]);
+        assert_eq!(
+            recorded.repos[0].files,
+            Some(2),
+            "the manifest counts the harvested files, not the rest of the pin"
+        );
+        let shared =
+            manifest::read_hub_manifest(&home.path().join("corpora/sparse-demo/corpus.json"))
+                .unwrap();
+        assert_eq!(shared.rows[0].paths, vec!["data/osv".to_string()]);
+
+        // Idempotent: a second limited add does not bring the siblings back.
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0
+        );
+        assert_eq!(worktree_files(&checkout).len(), 2);
+
+        write_pin(&manifest, &url, &sha, Some(&["data/osv", "cmd"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0
+        );
+        assert_eq!(
+            worktree_files(&checkout),
+            vec![
+                "cmd/main.go".to_string(),
+                "data/osv/GO-1.json".to_string(),
+                "data/osv/sub/n.json".to_string(),
+            ]
+        );
+
+        write_pin(&manifest, &url, &sha, None);
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            0,
+            "dropping paths restores the whole pin"
+        );
+        assert!(checkout.join("data/reports/R.yaml").is_file());
+        assert!(checkout.join("LICENSE").is_file());
+        assert!(manifest::read_corpus_manifest(
+            &home.path().join("corpora/sparse-demo/corpus.json")
+        )
+        .unwrap()
+        .repos[0]
+            .paths
+            .is_empty());
+    }
+
+    /// A path the pin does not contain, and a path that escapes the repo,
+    /// must not materialize the rest of the tree.
+    #[test]
+    fn corpus_add_from_paths_refuses_a_missing_or_escaping_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let origin = home.path().join("origin");
+        init_committed_repo(
+            &origin,
+            &[("LICENSE", "bsd\n"), ("data/reports/R.yaml", "id: 1\n")],
+        );
+        let sha = head_sha(&origin);
+        let url = origin.display().to_string();
+        let manifest = home.path().join("pin.json");
+        write_pin(&manifest, &url, &sha, Some(&["data/nope"]));
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            1
+        );
+        let checkout = home.path().join("corpora/sparse-demo/vulndb");
+        assert!(
+            !home.path().join("corpora/sparse-demo/corpus.json").exists(),
+            "a failed harvest must not record a corpus"
+        );
+        assert!(
+            !checkout.join("LICENSE").exists(),
+            "a missing paths entry must not fall back to a full checkout"
+        );
+        assert!(!checkout.join("data/reports/R.yaml").exists());
+
+        std::fs::write(
+            &manifest,
+            json!({
+                "corpus": "escape-demo",
+                "repos": [{
+                    "repo": "vulndb",
+                    "url": url,
+                    "sha": sha,
+                    "paths": ["../secret"]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_corpus_add(&["--from".into(), manifest.display().to_string()]),
+            2
+        );
+        assert!(
+            !home.path().join("corpora/escape-demo").exists(),
+            "an escaping paths entry is refused before any directory is created"
+        );
     }
 }

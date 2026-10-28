@@ -18,16 +18,21 @@ members = [
     "crates/xerj-cluster",
     "crates/xerj-console-api",
     "crates/xerj-autoindex",
+    "crates/xerj-hub",
     "crates/xerj-sandbox",
     "crates/xtask",
     "tests/es-compat-yaml",
 ]
 
 [workspace.package]
-version = "1.0.0-rc.95"
+version = "1.0.0-rc.100"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
 authors = ["xerj Contributors"]
+repository = "https://github.com/xerj-org/xerj"
+homepage = "https://xerj.org"
+description = "High-performance hybrid full-text, vector, log, and code search engine with neural embeddings and agent memory."
 
 [workspace.dependencies]
 # Async runtime
@@ -72,7 +77,7 @@ fst = "0.4"
 bitpacking = "0.9"
 # Compression
 lz4_flex = "0.11"
-zstd = "0.13"
+zstd = "0.14.3"
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 rustc-hash = "2"

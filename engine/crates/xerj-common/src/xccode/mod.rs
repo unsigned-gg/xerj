@@ -242,6 +242,18 @@ pub fn run_code_query(
     let pattern = format!("{prefix}*");
     let mapping = http.get_mapping(&format!("/{pattern}/_mapping")).ok();
     let mut fields = fields::resolve_fields(mapping.as_ref());
+    if fields.is_empty() {
+        // resolve_fields returns empty only when every candidate, including
+        // `body`, is numeric on some index. Sending the historical floor
+        // would be the #1284 rejection.
+        return CodeOutcome::refused(
+            format!(
+                "no text field under '{pattern}' can take this query — a mapped \
+                 field is numeric, and a text query against it is rejected"
+            ),
+            2,
+        );
+    }
     // #1254: a corpus may DECLARE the weight of its `text` recall leg. The
     // 0.5 default is the #1238 calibration, measured on the live exploit
     // group where `text` carries sibling-CVE mirror demos that must not
@@ -269,6 +281,9 @@ pub fn run_code_query(
 
     let mut note: Option<String> = None;
     let mut rrf_scores = false;
+    // Any leg that comes back `timed_out` makes the page partial. The flag is
+    // on the JSON body (HTTP 200), so it is invisible unless we read it.
+    let mut deadline_hit = false;
 
     // #1137: fetch deeper than the page so the per-file cap has candidates
     // to draw on; the page is cut back to `params.k` after diversification.
@@ -278,6 +293,7 @@ pub fn run_code_query(
         Mode::Bm25 => match http.search(&pattern, &bm25_body(&query, fetch, &params.lang, &fields))
         {
             Ok(mut r) => {
+                note_deadline(&r, &mut deadline_hit);
                 let mut h = hit_list(&r);
                 if params.fuse_symbols
                     && !params.no_symbol
@@ -286,9 +302,17 @@ pub fn run_code_query(
                     if let Ok(sym_resp) =
                         http.search(&pattern, &symbol_bm25_body(&query, fetch, &params.lang))
                     {
+                        note_deadline(&sym_resp, &mut deadline_hit);
                         let sym_hits = hit_list(&sym_resp);
                         if !sym_hits.is_empty() {
-                            h = fuse_file_and_symbol_hits(http, &pattern, h, sym_hits, fetch);
+                            h = fuse_file_and_symbol_hits(
+                                http,
+                                &pattern,
+                                h,
+                                sym_hits,
+                                fetch,
+                                &mut deadline_hit,
+                            );
                             if let Some(hits_arr) =
                                 r.pointer_mut("/hits/hits").and_then(Value::as_array_mut)
                             {
@@ -315,27 +339,47 @@ pub fn run_code_query(
                     )
                 }
             };
-            let (capable, total) = fields::semantic_capable(Some(&mapping));
-            if capable.is_empty() {
+            // Group by the field each index actually embeds. One request
+            // cannot name two semantic fields, and naming `body` at an index
+            // whose embedded field is `code` or `text` 400s every index in
+            // the comma-join.
+            let (groups, total) = fields::semantic_groups(Some(&mapping));
+            if groups.is_empty() {
                 // No semantic arm is possible: do NOT post the query. An
                 // empty comma-join is an empty index segment, which the
                 // server reads as `/_search` — every index on the node,
                 // corpus or not. The empty answer with its note is the
                 // honest result.
                 note = Some(format!(
-                    "no index under '{pattern}' maps `body` as semantic_text"
+                    "no index under '{pattern}' maps a field as semantic_text"
                 ));
                 (Value::Null, Vec::new())
             } else {
+                let indexed: usize = groups.iter().map(|(_, names)| names.len()).sum();
+                let described = groups
+                    .iter()
+                    .map(|(field, names)| format!("{field} ({})", names.len()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 note = Some(format!(
-                    "vector only over {} of {total} index(es)",
-                    capable.len()
+                    "vector only over {indexed} of {total} index(es): {described}"
                 ));
-                let body = semantic_body(&query, fetch, &params.lang);
-                match http.search(&capable.join(","), &body) {
-                    Ok(r) => (r.clone(), hit_list(&r)),
-                    Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                let mut merged: Option<Value> = None;
+                for (field, names) in &groups {
+                    let body = semantic_on_field(field, &query, fetch, &params.lang);
+                    match http.search(&names.join(","), &body) {
+                        Ok(response) => {
+                            note_deadline(&response, &mut deadline_hit);
+                            merged = Some(match merged {
+                                Some(prev) => merge_by_score(prev, &response, fetch),
+                                None => response,
+                            });
+                        }
+                        Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
+                    }
                 }
+                let response = merged.unwrap_or(Value::Null);
+                (response.clone(), hit_list(&response))
             }
         }
         Mode::Hybrid => {
@@ -347,7 +391,10 @@ pub fn run_code_query(
                      discovered under '{pattern}'"
                 ));
                 match http.search(&pattern, &bm25_body(&query, fetch, &params.lang, &fields)) {
-                    Ok(r) => (r.clone(), hit_list(&r)),
+                    Ok(r) => {
+                        note_deadline(&r, &mut deadline_hit);
+                        (r.clone(), hit_list(&r))
+                    }
                     Err(e) => return CodeOutcome::refused(format!("search failed: {e}"), 2),
                 }
             } else {
@@ -355,7 +402,12 @@ pub fn run_code_query(
                 // neighbours for ANY input, so a BM25 miss is the corpus's
                 // only honest "no" — vector hits must not launder it.
                 match http.search(&pattern, &bm25_body(&query, 1, &params.lang, &fields)) {
-                    Ok(pre) if hit_list(&pre).is_empty() => {
+                    Ok(pre)
+                        if {
+                            note_deadline(&pre, &mut deadline_hit);
+                            hit_list(&pre).is_empty()
+                        } =>
+                    {
                         note = Some(
                             "no lexical match in this corpus — vector nearest-neighbours \
                              are not evidence of a match, so this is reported as a miss"
@@ -363,7 +415,8 @@ pub fn run_code_query(
                         );
                         (Value::Null, Vec::new())
                     }
-                    Ok(_) => {
+                    Ok(pre) => {
+                        note_deadline(&pre, &mut deadline_hit);
                         // The engine's native top-level `hybrid` (RRF k=60) —
                         // no client-side fusion. Aimed at the comma-joined
                         // CAPABLE set when only some indices map `body` as
@@ -377,6 +430,7 @@ pub fn run_code_query(
                         let body = hybrid_body(&query, fetch, &params.lang, &fields);
                         match http.search(&target, &body) {
                             Ok(r) => {
+                                note_deadline(&r, &mut deadline_hit);
                                 rrf_scores = true;
                                 let mut n = format!(
                                     "hybrid RRF(k={RRF_K}) — BM25 over {total} index(es), \
@@ -413,6 +467,7 @@ pub fn run_code_query(
                                         hybrid_bm25_leg_body(&query, fetch, &params.lang, &fields);
                                     match http.search(&lexical_only.join(","), &lex_body) {
                                         Ok(lex) => {
+                                            note_deadline(&lex, &mut deadline_hit);
                                             n.push_str(&format!(
                                                 "; lexical-only (BM25 leg only, merged by \
                                                  score): {}",
@@ -444,7 +499,10 @@ pub fn run_code_query(
                                     &pattern,
                                     &bm25_body(&query, fetch, &params.lang, &fields),
                                 ) {
-                                    Ok(r) => (r.clone(), hit_list(&r)),
+                                    Ok(r) => {
+                                        note_deadline(&r, &mut deadline_hit);
+                                        (r.clone(), hit_list(&r))
+                                    }
                                     Err(e) => {
                                         return CodeOutcome::refused(
                                             format!("search failed: {e}"),
@@ -461,11 +519,32 @@ pub fn run_code_query(
         }
     };
 
+    // #1504: a vector leg ran. The note already says how many indices it
+    // covered; it did not say which embedder produced the vectors. The
+    // default is lexical feature-hashing, and a caller who read "vector
+    // over N of M" has guessed neural before. The line states the default
+    // and the flag that changes it. It does not claim the running node is
+    // or is not on that default — the client cannot see `--embed-mode`.
+    if let Some(n) = note.as_mut() {
+        if n.contains("vector over") || n.contains("vector only") {
+            n.push_str(
+                "; vector leg uses the node's embedder (default is lexical \
+                 feature-hashing, not neural — start the node with --embed-mode neural \
+                 for the built-in BERT)",
+            );
+        }
+    }
+
     // 5. #1137: cut the overfetched window back to the page, capping records
     //    per source file (#1137) and per source index (#1238), and patch the
     //    diversified page into the response so `--json` consumers see the
     //    SAME list the prose renderer does (the G7 grader is one). A page
     //    that shrank says so in the note, naming only the caps that fired.
+    // #1504: translation catalogs and minified bundles repeat every UI phrase
+    // and win natural-language queries. They stay searchable, behind source.
+    let mut hits = hits;
+    render::demote_sparse_definition_hits(&mut hits, &query);
+    let hits = demote_catalog_noise(hits);
     let (hits, file_dropped, index_dropped) = diversify(hits, params.k);
     if file_dropped > 0 || index_dropped > 0 {
         let mut caps = Vec::new();
@@ -484,6 +563,21 @@ pub fn run_code_query(
             Some(n) => format!("{n}; {cap}"),
             None => cap,
         });
+    }
+    // A missed deadline is HTTP 200 with a prefix of the ranking. Say so on
+    // every surface: stderr warnings, the prose the CLI prints, and the JSON
+    // body (`timed_out`, the same field the node set). Exit stays 0 when
+    // there are hits — the page is partial, not a transport failure.
+    if deadline_hit {
+        warnings.push(DEADLINE_WARNING.to_string());
+        match resp.as_object_mut() {
+            Some(obj) => {
+                obj.insert("timed_out".into(), Value::Bool(true));
+            }
+            None => {
+                resp = serde_json::json!({"timed_out": true, "hits": {"hits": []}});
+            }
+        }
     }
     if params.as_json {
         if let Some(hits_arr) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) {
@@ -515,6 +609,10 @@ pub fn run_code_query(
     // 6. Licence map: ALWAYS from the corpus's own corpus.json — never
     //    re-derived at query time, never from prose.
     let licences = manifest::licence_map(root, &corpus);
+    let checkout = root.join("corpora").join(&corpus);
+    // #2339: first-party marker lives on corpus.json, beside the licence
+    // record. It does not change the licence string the header prints.
+    let own = manifest::corpus_is_own(root, &corpus);
 
     let text = render::render(
         &hits,
@@ -528,6 +626,10 @@ pub fn run_code_query(
             rrf_scores,
             age_days,
             strict_licence: params.strict_licence,
+            lexical_lines: params.mode == Mode::Bm25
+                || note.as_deref().is_some_and(|n| n.starts_with("BM25 only")),
+            checkout: Some(&checkout),
+            own,
         },
         note.as_deref(),
     );
@@ -541,6 +643,25 @@ pub fn run_code_query(
         to_stderr: false,
     }
 }
+
+/// The engine answers a missed search deadline with HTTP 200, the hits it
+/// gathered, and `timed_out: true`. A caller that only reads `hits` reports
+/// that prefix as the whole ranking.
+pub(crate) fn response_timed_out(resp: &Value) -> bool {
+    resp.get("timed_out") == Some(&Value::Bool(true))
+}
+
+fn note_deadline(resp: &Value, deadline_hit: &mut bool) {
+    if response_timed_out(resp) {
+        *deadline_hit = true;
+    }
+}
+
+/// What `xerj code` says when the node stopped early. Kept in one place so
+/// the prose warning and the regression test cannot drift.
+pub(crate) const DEADLINE_WARNING: &str = "\
+search deadline hit: the node returned HTTP 200 with timed_out true and a partial \
+hit list. These are the hits gathered before the deadline, not a complete ranking.";
 
 /// Hits of a search response, missing containers tolerated as empty.
 pub(crate) fn hit_list(resp: &Value) -> Vec<Value> {
@@ -585,6 +706,87 @@ pub(crate) fn diversity_fetch(k: usize) -> usize {
 /// they are: a corpus whose whole fan-out is a handful of shard indices
 /// (the blogposts pack is 4) has fewer indices than slots, the per-index
 /// cap would only shrink the page, and so it never engages.
+/// Stable partition: hits whose path is a translation catalog or a minified
+/// bundle move behind every other hit, keeping their relative order. A page
+/// that is only catalogs is unchanged. Hits with no path stay where they are.
+pub fn demote_catalog_noise(hits: Vec<Value>) -> Vec<Value> {
+    let mut primary = Vec::with_capacity(hits.len());
+    let mut catalogs = Vec::new();
+    for hit in hits {
+        if hit_path(&hit).is_some_and(is_catalog_noise) {
+            catalogs.push(hit);
+        } else {
+            primary.push(hit);
+        }
+    }
+    primary.extend(catalogs);
+    primary
+}
+
+/// Translation catalogs and minified bundles (#1504). The patterns are the
+/// ones a multilingual repo uses for key→string tables, not a general
+/// "prose file" filter: `lang/*.php`, `values*/strings.xml`, `*.lproj/*.strings`,
+/// `*.po` / `*.pot`, and `*.min.js` / `*.min.mjs` / `*.min.css`.
+///
+/// This is the index-time predicate. Autoindex does not put the phrase text
+/// of these files into `body` — a post-fetch reorder cannot help when the
+/// catalogs fill the whole fetch window, and a one-line bundle that is not
+/// named `*.min.js` is caught separately by content. `.pyi` stubs are NOT
+/// in this set: they stay indexed so `xerj def` can still resolve a name
+/// that exists only as a stub, and [`is_catalog_noise`] ranks them behind
+/// the implementation at query time.
+pub fn is_translation_or_bundle(path: &str) -> bool {
+    let name = file_name(path);
+    if name.ends_with(".min.js") || name.ends_with(".min.mjs") || name.ends_with(".min.css") {
+        return true;
+    }
+    if name.ends_with(".po") || name.ends_with(".pot") {
+        return true;
+    }
+    let Some(parent) = parent_segment(path) else {
+        return false;
+    };
+    if parent == "lang" && name.ends_with(".php") {
+        return true;
+    }
+    if name == "strings.xml" && (parent == "values" || parent.starts_with("values-")) {
+        return true;
+    }
+    parent.ends_with(".lproj") && name.ends_with(".strings")
+}
+
+/// Translation catalogs, minified bundles, and type stubs (#1504, #1651).
+pub fn is_catalog_noise(path: &str) -> bool {
+    // Type stubs repeat the public signature and outrank the implementation
+    // on a natural-language query (candle field report 2026-10-17: `.pyi`
+    // files were the top hits). They stay searchable, behind source.
+    file_name(path).ends_with(".pyi") || is_translation_or_bundle(path)
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn parent_segment(path: &str) -> Option<&str> {
+    let cut = path.rfind(['/', '\\'])?;
+    let head = &path[..cut];
+    let start = head.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    let parent = &head[start..];
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn hit_path(hit: &Value) -> Option<&str> {
+    hit.pointer("/_source/ax_path")
+        .and_then(Value::as_str)
+        .or_else(|| hit.pointer("/_source/ax_file").and_then(Value::as_str))
+        .or_else(|| hit.pointer("/_source/path").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn diversify(hits: Vec<Value>, want: usize) -> (Vec<Value>, usize, usize) {
     // Keys are owned: a borrowed &str would pin every hit it came from and
     // forbid the move into `out` below.
@@ -653,7 +855,16 @@ pub(crate) fn bm25_body(query: &str, k: usize, lang: &Option<String>, fields: &[
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({ "size": k, "query": { "bool": { "must": must } } })
+    let mut body = serde_json::json!({
+        "size": k,
+        "query": { "bool": { "must": must } },
+        // Response-only. `_passage.ordinal` is the 0-based line of a lexical
+        // window (#174). It is not a highlight block, which changes ranking
+        // (#177). The scored fast path does not serve text `multi_match`.
+        "fields": ["_passage"]
+    });
+    attach_coverage_clauses(&mut body, query, fields);
+    body
 }
 
 /// #1237: second BM25 leg over symbol-record `impl` fields. Excludes `impl`
@@ -667,11 +878,29 @@ pub(crate) fn symbol_bm25_body(query: &str, k: usize, lang: &Option<String>) -> 
     if let Some(lg) = lang {
         must.push(serde_json::json!({ "match": { "language": lg } }));
     }
-    serde_json::json!({
+    let fields = vec!["impl".to_string()];
+    let mut body = serde_json::json!({
         "size": k,
         "_source": { "excludes": ["impl", "body"] },
         "query": { "bool": { "must": must } }
-    })
+    });
+    attach_coverage_clauses(&mut body, query, &fields);
+    body
+}
+
+/// `should` coverage clauses for a multi-term question (#2327). A one-token
+/// lookup leaves the body untouched, so the measured BM25 shape stays.
+fn attach_coverage_clauses(body: &mut Value, query: &str, fields: &[String]) {
+    let clauses = crate::code_query::coverage_match_clauses(query, fields);
+    if clauses.is_empty() {
+        return;
+    }
+    if let Some(obj) = body
+        .pointer_mut("/query/bool")
+        .and_then(Value::as_object_mut)
+    {
+        obj.insert("should".into(), Value::Array(clauses));
+    }
 }
 
 fn hit_file_key(hit: &Value) -> Option<String> {
@@ -694,6 +923,7 @@ pub(crate) fn fuse_file_and_symbol_hits(
     file_hits: Vec<Value>,
     sym_hits: Vec<Value>,
     limit: usize,
+    deadline_hit: &mut bool,
 ) -> Vec<Value> {
     struct FileEntry {
         file_rank: Option<usize>,
@@ -828,6 +1058,7 @@ pub(crate) fn fuse_file_and_symbol_hits(
                 .and_then(Value::as_str)
                 .unwrap_or(pattern);
             if let Ok(resp) = http.search(target, &lookup) {
+                note_deadline(&resp, deadline_hit);
                 if let Some(fetched) = hit_list(&resp)
                     .into_iter()
                     .find(|h| hit_file_key(h).as_deref() == Some(key.as_str()))
@@ -884,13 +1115,20 @@ pub(crate) fn fuse_file_and_symbol_hits(
     out
 }
 
-/// The vector-only body. Aimed ONLY at indices whose `body` is semantic_text
-/// (a semantic query against plain text 400s the whole wildcard).
+/// The vector-only body aimed at `field`. A semantic query against a plain
+/// `text` field 400s the whole request, so callers pass only indices that
+/// embed this field. Hybrid still hardcodes `body`; semantic mode passes
+/// the field [`fields::semantic_groups`] elected.
 ///
 /// The clause carries `k` = the fetch window: without it the parser cuts the
 /// vector pool to 10 whatever `size` says (#1145).
-pub(crate) fn semantic_body(query: &str, k: usize, lang: &Option<String>) -> Value {
-    let q = serde_json::json!({ "semantic": { "field": "body", "query": query, "k": k } });
+pub(crate) fn semantic_on_field(
+    field: &str,
+    query: &str,
+    k: usize,
+    lang: &Option<String>,
+) -> Value {
+    let q = serde_json::json!({ "semantic": { "field": field, "query": query, "k": k } });
     // `--lang` rides in `filter`: the engine sends a bool to the vector path
     // only when the semantic clause is its sole must/should clause (#1148).
     let query = match lang {
@@ -1053,6 +1291,9 @@ mod tests {
         fail_search: bool,
         // Per-target answers (#1146); a target not listed gets `hits`.
         hits_by_target: HashMap<String, Vec<Value>>,
+        /// The node stopped at its deadline: HTTP 200, `timed_out: true`,
+        /// and only the hits gathered so far.
+        timed_out: bool,
     }
 
     impl FakeHttp {
@@ -1076,6 +1317,7 @@ mod tests {
                 live: vec!["xc-kv-b1-000".to_string()],
                 fail_search: false,
                 hits_by_target: HashMap::new(),
+                timed_out: false,
             }
         }
     }
@@ -1104,7 +1346,11 @@ mod tests {
                 return Err("transport: connection refused".to_string());
             }
             let hits = self.hits_by_target.get(index).unwrap_or(&self.hits);
-            Ok(serde_json::json!({ "hits": { "hits": hits } }))
+            let mut response = serde_json::json!({ "hits": { "hits": hits } });
+            if self.timed_out {
+                response["timed_out"] = serde_json::json!(true);
+            }
+            Ok(response)
         }
     }
 
@@ -1152,7 +1398,8 @@ mod tests {
                 "query": { "bool": { "must": [
                     { "multi_match": { "query": "addReplyNull",
                         "fields": ["body", "defs", "title"] } }
-                ]}}
+                ]}},
+                "fields": ["_passage"]
             }),
             "mapping-resolved fields (defs_expanded dropped); no highlight, no _source \
              projection; size is the #1137 diversity fetch (10x k=5), cut back to k after"
@@ -1166,6 +1413,49 @@ mod tests {
         // No field-report nudge marker was ever part of this port (dropped
         // 2026-09-18): the prose must not ask the agent to report back.
         assert!(!out.text.to_lowercase().contains("report back"));
+        assert!(
+            out.warnings.iter().all(|w| !w.contains("timed_out")),
+            "a complete response must not be marked partial: {:?}",
+            out.warnings
+        );
+    }
+
+    /// The engine's 30s search deadline answers HTTP 200 with `timed_out:
+    /// true` and a prefix of the hits. `xerj code` used to print that prefix
+    /// as a finished ranking.
+    #[test]
+    fn a_search_deadline_marks_the_result_partial() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        http.timed_out = true;
+        let out = run_code_query(
+            &root,
+            &http,
+            "u",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0, "partial hits are still a successful page");
+        assert!(
+            out.warnings.iter().any(|w| w.contains("timed_out")),
+            "the deadline must be a warning, not a silent 200: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.text.contains("valkey/src/networking.c"),
+            "the hits gathered before the deadline are still shown: {}",
+            out.text
+        );
+
+        let mut params = CodeParams::new("kv", "addReplyNull");
+        params.as_json = true;
+        let out = run_code_query(&root, &http, "u", &params, "`--stale-ok`");
+        assert_eq!(
+            out.json.as_ref().and_then(|v| v.get("timed_out")),
+            Some(&serde_json::json!(true)),
+            "json output keeps the ES timed_out flag: {:?}",
+            out.json
+        );
     }
 
     #[test]
@@ -1187,6 +1477,77 @@ mod tests {
         assert!(out
             .text
             .contains("!! AGPL: adapt the APPROACH, do not copy the code"));
+    }
+
+    /// #2339: the CLI pipeline (`xerj code` calls this) and the MCP tool share
+    /// this function. An own corpus keeps the unidentified licence in the
+    /// header and drops the banner. The same corpus without the marker, and
+    /// a named restricted licence, still warn.
+    #[test]
+    fn own_corpus_query_omits_the_unidentified_banner_and_keeps_the_licence() {
+        let root = root_with_state();
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(out.text.contains(", UNKNOWN)"), "{text}", text = out.text);
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+        assert!(!out.text.contains("do not copy"), "{}", out.text);
+
+        let mut strict = CodeParams::new("kv", "q");
+        strict.strict_licence = true;
+        let out = run_code_query(&root, &FakeHttp::new(), "u", &strict, "`--stale-ok`");
+        assert!(out.text.contains("void addReplyNull"), "{}", out.text);
+        assert!(!out.text.contains("!!"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"UNKNOWN\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! UNKNOWN: adapt the APPROACH, do not copy the code"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains(", UNKNOWN)"), "{}", out.text);
+
+        std::fs::write(
+            root.join("corpora/kv/corpus.json"),
+            "{\"corpus\":\"kv\",\"own\":true,\"repos\":[{\"repo\":\"valkey\",\"url\":\"u\",\"licence\":\"AGPL\"}]}",
+        )
+        .unwrap();
+        let out = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "q"),
+            "`--stale-ok`",
+        );
+        assert!(
+            out.text
+                .contains("!! AGPL: adapt the APPROACH, do not copy the code"),
+            "own does not silence a detected AGPL: {}",
+            out.text
+        );
     }
 
     #[test]
@@ -1323,11 +1684,173 @@ mod tests {
             "{}",
             out.text
         );
+        // #1504: the mode line names the default embedder. It must not claim
+        // the running node is neural — only what the default is and the flag
+        // that changes it.
+        assert!(
+            out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "vector mode line must name the default embedder: {}",
+            out.text
+        );
         assert!(
             out.text.contains("rrf 4.20"),
             "hybrid scores render as rrf: {}",
             out.text
         );
+    }
+
+    /// #1504: standalone semantic prints the same embedder default. BM25 does
+    /// not — there is no vector leg to misread.
+    #[test]
+    fn semantic_mode_names_the_default_embedder_and_bm25_does_not() {
+        let root = root_with_state();
+        let mut http = FakeHttp::new();
+        http.mapping = serde_json::json!({
+            "xc-kv-b1-000": { "mappings": { "properties": { "body": { "type": "semantic_text" } } } },
+            "xc-kv-b1-001": { "mappings": { "properties": { "body": { "type": "text" } } } }
+        });
+        http.live = vec!["xc-kv-b1-000".into(), "xc-kv-b1-001".into()];
+        let mut p = CodeParams::new("kv", "addReplyNull");
+        p.mode = Mode::Semantic;
+        let out = run_code_query(&root, &http, "u", &p, "`--stale-ok`");
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(
+            out.text.contains("vector only over 1 of 2")
+                && out.text.contains("lexical feature-hashing")
+                && out.text.contains("--embed-mode neural"),
+            "{}",
+            out.text
+        );
+
+        let bm25 = run_code_query(
+            &root,
+            &FakeHttp::new(),
+            "u",
+            &CodeParams::new("kv", "addReplyNull"),
+            "`--stale-ok`",
+        );
+        assert_eq!(bm25.exit, 0, "{}", bm25.text);
+        assert!(
+            !bm25.text.contains("--embed-mode neural"),
+            "bm25 has no vector leg: {}",
+            bm25.text
+        );
+    }
+
+    /// Candle field report 2026-10-17: natural-language search put `.pyi`
+    /// stubs above the implementation. Stubs stay in the page, after source.
+    /// A page that is only stubs keeps its order.
+    #[test]
+    fn pyi_stubs_rank_behind_the_implementation() {
+        let hit = |path: &str, score: f64| {
+            serde_json::json!({
+                "_score": score,
+                "_source": { "ax_path": path }
+            })
+        };
+        let demoted = demote_catalog_noise(vec![
+            hit("candle/pyo3/quantized.pyi", 9.0),
+            hit("candle/quantized.py", 2.0),
+            hit("candle/pyo3/tensor.pyi", 8.0),
+        ]);
+        let paths: Vec<&str> = demoted
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "candle/quantized.py",
+                "candle/pyo3/quantized.pyi",
+                "candle/pyo3/tensor.pyi",
+            ]
+        );
+        let only = demote_catalog_noise(vec![hit("a.pyi", 3.0), hit("b.pyi", 1.0)]);
+        assert_eq!(only[0]["_source"]["ax_path"], "a.pyi");
+        assert_eq!(only[1]["_source"]["ax_path"], "b.pyi");
+    }
+
+    /// #1504: lang catalogs, Android strings, Apple .strings, gettext, and
+    /// minified bundles sort behind an implementing source file. A page that
+    /// is only catalogs keeps its order. A PHP service file is not a catalog
+    /// just because the repo also has `lang/`.
+    #[test]
+    fn catalog_and_minified_hits_rank_behind_source() {
+        let hit = |path: &str, score: f64| {
+            serde_json::json!({
+                "_index": "xc-aipbx-000",
+                "_score": score,
+                "_source": { "ax_path": path, "ax_file": path, "body": "phrase" }
+            })
+        };
+        let hits = vec![
+            hit("web/lang/en.php", 9.0),
+            hit("assets/jssip.min.js", 8.0),
+            hit("res/values-da/strings.xml", 7.0),
+            hit("ios/en.lproj/Localizable.strings", 6.0),
+            hit("locale/app.po", 5.5),
+            hit("locale/app.pot", 5.4),
+            hit("android/service/PbxForegroundService.kt", 4.0),
+            hit("web/src/services/phones/NecTemplate.php", 3.0),
+            hit("docs/phones.md", 2.0),
+        ];
+        let demoted = demote_catalog_noise(hits);
+        let paths: Vec<&str> = demoted
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            &paths[..3],
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+        assert!(paths[3..].iter().all(|p| is_catalog_noise(p)), "{paths:?}");
+
+        let (page, _, _) = diversify(demoted, 3);
+        let page_paths: Vec<&str> = page
+            .iter()
+            .map(|h| h["_source"]["ax_path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            page_paths,
+            [
+                "android/service/PbxForegroundService.kt",
+                "web/src/services/phones/NecTemplate.php",
+                "docs/phones.md",
+            ]
+        );
+
+        let only = demote_catalog_noise(vec![
+            hit("web/lang/hr.php", 9.0),
+            hit("web/lang/en.php", 8.0),
+        ]);
+        assert_eq!(only[0]["_source"]["ax_path"], "web/lang/hr.php");
+        assert_eq!(only[1]["_source"]["ax_path"], "web/lang/en.php");
+
+        assert!(is_catalog_noise("candle/quantized.pyi"));
+        assert!(!is_catalog_noise("candle/quantized.py"));
+        assert!(!is_catalog_noise("src/main.rs"));
+        assert!(!is_catalog_noise("res/layout/activity.xml"));
+        assert!(is_catalog_noise("web/lang/en.php"));
+        assert!(is_catalog_noise("res/values/strings.xml"));
+        assert!(is_catalog_noise("assets/app.min.css"));
+        // `.pyi` is query-time noise only. Stripping it at index time would
+        // hide a name that exists only as a stub from `xerj def`.
+        assert!(!is_translation_or_bundle("candle/quantized.pyi"));
+        assert!(is_translation_or_bundle("web/lang/en.php"));
+        assert!(is_translation_or_bundle("assets/jssip.min.js"));
+        // A huge one-line bundle that is not named `*.min.js` (the report's
+        // `quill.js`) is not a path match. Index-time content detection
+        // catches it; this predicate must not pretend the name is enough.
+        assert!(!is_translation_or_bundle("assets/quill.js"));
+        assert!(!is_catalog_noise("assets/quill.js"));
+        assert!(!is_translation_or_bundle(
+            "web/src/services/phones/NecTemplate.php"
+        ));
     }
 
     /// #1146: with a mixed mapping the fused request may only go to the
@@ -1463,7 +1986,16 @@ mod tests {
     /// vector@10 (the #1137 overfetch widened the BM25 leg alone).
     #[test]
     fn the_vector_leg_carries_the_fetch_window_as_k() {
-        let sem = semantic_body("q", 50, &None);
+        let sem = semantic_on_field("body", "q", 50, &None);
+        assert_eq!(
+            sem.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("body"))
+        );
+        let on_code = semantic_on_field("code", "q", 50, &None);
+        assert_eq!(
+            on_code.pointer("/query/semantic/field"),
+            Some(&serde_json::json!("code"))
+        );
         assert_eq!(sem.pointer("/size"), Some(&serde_json::json!(50)));
         assert_eq!(
             sem.pointer("/query/semantic/k"),
@@ -1489,7 +2021,7 @@ mod tests {
         let lang = Some("rust".to_string());
         let want_filter = serde_json::json!([{ "match": { "language": "rust" } }]);
 
-        let sem = semantic_body("q", 50, &lang);
+        let sem = semantic_on_field("body", "q", 50, &lang);
         let must = sem.pointer("/query/bool/must").and_then(Value::as_array);
         assert_eq!(must.map(Vec::len), Some(1), "{sem}");
         assert!(must.unwrap()[0].get("semantic").is_some(), "{sem}");
@@ -1825,7 +2357,8 @@ mod tests {
                 }
             }),
         ];
-        let fused = fuse_file_and_symbol_hits(&NoopHttp, "xc-test*", file_hits, sym_hits, 5);
+        let fused =
+            fuse_file_and_symbol_hits(&NoopHttp, "xc-test*", file_hits, sym_hits, 5, &mut false);
         assert_eq!(fused.len(), 2);
         assert_eq!(
             fused[0].pointer("/_source/ax_path").and_then(Value::as_str),

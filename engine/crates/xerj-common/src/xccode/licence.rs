@@ -10,6 +10,12 @@
 //! * CLONE time — the same tuple gates the one-line warning `xerj corpus add`
 //!   prints per repo.
 //!
+//! A corpus the operator marked own ([`copy_warning_applies`]) is their own
+//! first-party code. An unidentified licence stays recorded and is still
+//! named in the hit header, but the do-not-copy banner is omitted for that
+//! unidentified licence only. A licence the detector actually named is
+//! unchanged, and a hub pack's licence class is not this tuple.
+//!
 //! The original scripts let these drift (the clone-time check was missing the
 //! MPL arm, so `sonic` warned only at query time despite a comment saying the
 //! two "MUST stay in step"). The port unifies on the FULLER tuple: strictly
@@ -63,6 +69,69 @@ pub fn is_restricted(lic: &str) -> bool {
     RESTRICTED.iter().any(|p| lic.contains(p))
 }
 
+/// The licence a human REVIEW recorded for a repo at its pin (the `review`
+/// block a vetted hub manifest carries: `spdx`, `use`, `by`, `at`, `note`).
+/// Only a completed review counts: `by` must name the reviewer and `use` must
+/// not be `UNREVIEWED` (draft rows carry an `spdx` hint with an empty `by`).
+/// The SPDX string must look like one — letters, digits and `.+-/ ()`, at
+/// most 64 chars — so an untrusted manifest cannot put arbitrary text into
+/// the terminal through it.
+pub fn reviewed_spdx(review: Option<&serde_json::Value>) -> Option<String> {
+    let r = review?.as_object()?;
+    let field = |k: &str| {
+        r.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+    };
+    let spdx = field("spdx");
+    let by = field("by");
+    let used = field("use");
+    let looks_spdx = !spdx.is_empty()
+        && spdx.len() <= 64
+        && spdx
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".+-/ ()".contains(c));
+    if !looks_spdx || by.is_empty() || used.is_empty() || used.eq_ignore_ascii_case("UNREVIEWED") {
+        return None;
+    }
+    Some(spdx.to_string())
+}
+
+/// True when the detector could not name a licence at all (as opposed to
+/// naming a restricted one).
+pub fn is_unidentified(lic: &str) -> bool {
+    matches!(lic.trim(), "" | "UNKNOWN" | "NONE-FOUND")
+}
+
+/// Whether a passage or a clone line should carry the do-not-copy banner.
+///
+/// `own` is the corpus-level first-party marker (`xerj corpus add --own` /
+/// `xerj corpus own`). It suppresses the banner only when the recorded
+/// licence is unidentified — the owner's own tree often has no LICENSE file,
+/// and "do not copy" is the wrong instruction for that code. The licence
+/// string itself is not rewritten. A named restricted licence (GPL, AGPL,
+/// MPL, …) still warns: marking a corpus own does not relicense a checkout
+/// the detector could read.
+pub fn copy_warning_applies(lic: &str, own: bool) -> bool {
+    !lic.is_empty() && is_restricted(lic) && !(own && is_unidentified(lic))
+}
+
+/// The licence to label a repo's passages with: the recorded detector string,
+/// unless the detector could not identify one and a completed human review
+/// names it (issue #1893: the detector read UNKNOWN on a CC0-1.0 repo whose
+/// review verified CC0-1.0, and every passage said "do not copy"). A review
+/// never overrides a licence the detector DID identify — a restricted
+/// detection still warns.
+pub fn effective_licence(recorded: &str, review: Option<&serde_json::Value>) -> String {
+    if is_unidentified(recorded) {
+        if let Some(spdx) = reviewed_spdx(review) {
+            return spdx;
+        }
+    }
+    recorded.to_string()
+}
+
 /// Find the licence without guessing: read the file(s) the project actually
 /// ships. Dual-licensed crates (very common in Rust) ship LICENSE-MIT +
 /// LICENSE-APACHE and no plain LICENSE, so every candidate is collected
@@ -79,8 +148,12 @@ pub fn detect_licence(repo_dir: &std::path::Path) -> String {
         .flatten()
         .filter(|e| e.path().is_file())
         .map(|e| e.file_name().to_string_lossy().to_string())
+        // Case-insensitive: plenty of projects ship `license.txt`,
+        // `License.md` or `copying` (jfreechart, ta4j; issue #2201), and a
+        // missed file records NONE-FOUND, which is treated as restricted.
         .filter(|n| {
-            n.starts_with("LICENSE") || n.starts_with("LICENCE") || n.starts_with("COPYING")
+            let u = n.to_uppercase();
+            u.starts_with("LICENSE") || u.starts_with("LICENCE") || u.starts_with("COPYING")
         })
         .collect();
     names.sort();
@@ -119,12 +192,22 @@ fn classify_one(text: &str) -> &'static str {
         .take(2)
         .collect::<Vec<_>>()
         .join(" ");
-    let out = classify_text(&title);
-    if out == "UNKNOWN" {
-        classify_text(text.chars().take(4000).collect::<String>().as_str())
-    } else {
-        out
+    let from_title = classify_text(&title);
+    // A generic "BSD" hit is the redistribution sentence, which 2-clause,
+    // 3-clause and 0BSD files all share. Keep reading the body so the
+    // clause title or the endorsement sentence can name the variant.
+    // Anything more specific (Apache, MIT, MPL, GPL, BSD-3-Clause, …)
+    // wins from the title and the body is not consulted.
+    if from_title != "UNKNOWN" && from_title != "BSD" {
+        return from_title;
     }
+    let from_body = classify_text(text.chars().take(4000).collect::<String>().as_str());
+    // A generic `BSD` title stays `BSD` when the body names nothing more
+    // specific; otherwise (and for an UNKNOWN title) the body decides.
+    if from_title == "BSD" && from_body == "UNKNOWN" {
+        return "BSD";
+    }
+    from_body
 }
 
 /// Classify licence text. Order matters: check the most RESTRICTIVE phrases
@@ -164,11 +247,60 @@ fn classify_text(text: &str) -> &'static str {
         || body.contains("permission is hereby granted, free of charge")
     {
         "MIT"
+    } else if body.contains("bsd 3-clause")
+        || body.contains("bsd-3-clause")
+        || body.contains("3-clause bsd")
+        || body.contains("may be used to endorse or promote products derived from this software")
+    {
+        "BSD-3-Clause"
+    } else if body.contains("bsd 2-clause")
+        || body.contains("bsd-2-clause")
+        || body.contains("simplified bsd")
+    {
+        "BSD-2-Clause"
+    } else if body.contains("0bsd")
+        || body.contains("zero-clause bsd")
+        || body.contains("zero clause bsd")
+    {
+        "0BSD"
     } else if body.contains("redistribution and use in source and binary forms") {
         "BSD"
     } else {
         "UNKNOWN"
     }
+}
+
+/// Whether a manifest's declared licence and a checkout's detected licence
+/// are the same reading. A coarse `BSD` agrees with `BSD-2-Clause`,
+/// `BSD-3-Clause` and `0BSD` — the detector's generic redistribution hit is
+/// not a disagreement with a clause the manifest already named. Two
+/// different clauses (`BSD-2-Clause` vs `BSD-3-Clause`) do not agree.
+/// Slash-joined dual licences are compared token by token after sorting.
+pub fn licence_readings_agree(declared: &str, detected: &str) -> bool {
+    fn tokens(s: &str) -> Vec<&str> {
+        s.split('/')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+    fn one(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let bsd_family = |s: &str| s == "BSD" || s.starts_with("BSD-") || s == "0BSD";
+        (a == "BSD" && bsd_family(b)) || (b == "BSD" && bsd_family(a))
+    }
+    let mut declared_tokens = tokens(declared);
+    let mut detected_tokens = tokens(detected);
+    if declared_tokens.len() != detected_tokens.len() {
+        return false;
+    }
+    declared_tokens.sort_unstable();
+    detected_tokens.sort_unstable();
+    declared_tokens
+        .iter()
+        .zip(detected_tokens.iter())
+        .all(|(a, b)| one(a, b))
 }
 
 #[cfg(test)]
@@ -231,6 +363,57 @@ mod tests {
         assert!(clone_warning_line("Apache-2.0/MIT").is_none());
     }
 
+    /// #2339: own code keeps an unidentified licence on the record, and does
+    /// not get the do-not-copy banner for that unidentified licence. A named
+    /// restricted licence still warns.
+    #[test]
+    fn own_suppresses_only_an_unidentified_copy_warning() {
+        assert!(!copy_warning_applies("UNKNOWN", true));
+        assert!(!copy_warning_applies("NONE-FOUND", true));
+        assert!(!copy_warning_applies("", true));
+        assert!(copy_warning_applies("UNKNOWN", false));
+        assert!(copy_warning_applies("NONE-FOUND", false));
+        assert!(
+            copy_warning_applies("AGPL", true),
+            "own does not relicense AGPL"
+        );
+        assert!(copy_warning_applies("GPL-3.0", true));
+        assert!(copy_warning_applies("MPL-2.0", true));
+        assert!(!copy_warning_applies("Apache-2.0", true));
+        assert!(!copy_warning_applies("Apache-2.0", false));
+        assert!(
+            copy_warning_applies("UNKNOWN/MIT", true),
+            "a mixed string that names a constituent is not unidentified"
+        );
+    }
+
+    // ── a completed human review names an unidentified licence (#1893) ──
+
+    #[test]
+    fn a_completed_review_names_an_unknown_licence() {
+        let review = serde_json::json!({
+            "spdx": "CC0-1.0", "use": "adapt-with-attribution", "by": "xerj-org",
+            "at": "2026-10-13", "note": "LICENSE.md verified. Detector reported UNKNOWN."
+        });
+        assert_eq!(effective_licence("UNKNOWN", Some(&review)), "CC0-1.0");
+        assert_eq!(effective_licence("NONE-FOUND", Some(&review)), "CC0-1.0");
+        assert!(clone_warning_line(&effective_licence("UNKNOWN", Some(&review))).is_none());
+        // A licence the detector DID identify is never overridden.
+        assert_eq!(effective_licence("GPL-3.0", Some(&review)), "GPL-3.0");
+        assert_eq!(effective_licence("UNKNOWN", None), "UNKNOWN");
+    }
+
+    #[test]
+    fn a_draft_or_odd_review_does_not_count() {
+        let draft = serde_json::json!({ "spdx": "MIT", "use": "UNREVIEWED", "by": "", "at": "" });
+        assert_eq!(effective_licence("UNKNOWN", Some(&draft)), "UNKNOWN");
+        let no_by = serde_json::json!({ "spdx": "MIT", "use": "adapt-with-attribution", "by": "" });
+        assert_eq!(reviewed_spdx(Some(&no_by)), None);
+        let hostile = serde_json::json!({ "spdx": "MIT\u{1b}[2J", "use": "x", "by": "y" });
+        assert_eq!(reviewed_spdx(Some(&hostile)), None);
+        assert_eq!(reviewed_spdx(Some(&serde_json::json!("MIT"))), None);
+    }
+
     // ── the detector's two ordering traps ──────────────────────────────────
 
     #[test]
@@ -283,6 +466,41 @@ mod tests {
             "BSD"
         );
         assert_eq!(
+            classify_one(
+                "BSD 3-Clause License\n\n\
+                 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:\n\n\
+                 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission."
+            ),
+            "BSD-3-Clause"
+        );
+        // No title, just the redistribution sentence plus the endorsement
+        // clause. The first lines classify as coarse BSD; the body names it.
+        assert_eq!(
+            classify_one(
+                "Redistribution and use in source and binary forms,\n\
+                 with or without modification.\n\n\
+                 Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission."
+            ),
+            "BSD-3-Clause"
+        );
+        assert_eq!(
+            classify_one(
+                "BSD 2-Clause License\n\nRedistribution and use in source and binary forms."
+            ),
+            "BSD-2-Clause"
+        );
+        assert_eq!(
+            classify_one("Zero-Clause BSD\n\nPermission to use, copy, modify."),
+            "0BSD"
+        );
+        assert!(licence_readings_agree("BSD-3-Clause", "BSD"));
+        assert!(licence_readings_agree("BSD", "BSD-3-Clause"));
+        assert!(licence_readings_agree("BSD-3-Clause", "BSD-3-Clause"));
+        assert!(licence_readings_agree("MIT/Apache-2.0", "Apache-2.0/MIT"));
+        assert!(!licence_readings_agree("MIT", "BSD"));
+        assert!(licence_readings_agree("BSD-2-Clause", "BSD"));
+        assert!(!licence_readings_agree("BSD-2-Clause", "BSD-3-Clause"));
+        assert_eq!(
             classify_one("Random README text with no licence phrases"),
             "UNKNOWN"
         );
@@ -319,6 +537,30 @@ mod tests {
         let empty = holder.path().join("nolicense");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(detect_licence(&empty), "NONE-FOUND");
+    }
+
+    #[test]
+    fn detect_licence_file_name_is_case_insensitive() {
+        // Issue #2201: jfreechart ships `license.txt` (LGPL-2.1) and was
+        // recorded NONE-FOUND.
+        let holder = tempfile::tempdir().unwrap();
+        let repo = holder.path().join("jfreechart");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join("license.txt"),
+            "GNU LESSER GENERAL PUBLIC LICENSE\nVersion 2.1, February 1999",
+        )
+        .unwrap();
+        assert_eq!(detect_licence(&repo), "LGPL");
+
+        let mixed = holder.path().join("mixed");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::write(
+            mixed.join("License.md"),
+            "MIT License\n\nPermission is hereby granted, free of charge",
+        )
+        .unwrap();
+        assert_eq!(detect_licence(&mixed), "MIT");
     }
 
     #[test]

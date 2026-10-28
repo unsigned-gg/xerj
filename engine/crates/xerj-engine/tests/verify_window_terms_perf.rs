@@ -30,16 +30,6 @@ use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
 
-fn kw_schema(fields: &[&str]) -> Schema {
-    let mut schema = Schema::empty();
-    for &f in fields {
-        schema
-            .add_field(FieldConfig::new(f, FieldType::Keyword))
-            .unwrap();
-    }
-    schema
-}
-
 /// The client's window size (`SyncExecutor::VERIFY_WINDOW`).
 const WINDOW: usize = 1024;
 /// Groups (distinct digests); at `DOCS_PER_GROUP` records each the index
@@ -55,6 +45,25 @@ fn make_engine(dir: &TempDir) -> Engine {
     let mut config = Config::default();
     config.server.data_dir = dir.path().to_str().unwrap().to_string();
     Engine::new(config).expect("engine::new")
+}
+
+/// Declare the exact-match fields this verify-shape reads as `keyword`, the
+/// way the real crawl's data index and the autoindex catalog declare theirs
+/// (`ax_file` is a content digest, `ax_dataset` a dataset name, `cve_id` an
+/// identifier — all keyword, never analysed text). These tests used
+/// `Schema::empty()`, so since #1329 those fields became `text` parents with
+/// NO doc-values column; the columnar count-lane (terms on `ax_file`) and the
+/// `KwExists` arm both read that column, so the window fell to the brute path
+/// and the "served columnar" assertions failed. `text` is declared keyword
+/// too so the `exists` arm has a column to read — a declared keyword carries
+/// no `ignore_above` by default, so the ~1 KB record body is still stored
+/// whole (presence is all `exists` reads).
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut s = Schema::empty();
+    for f in fields {
+        s.fields.push(FieldConfig::new(*f, FieldType::Keyword));
+    }
+    s
 }
 
 async fn run(idx: &std::sync::Arc<Index>, body: serde_json::Value) -> serde_json::Value {

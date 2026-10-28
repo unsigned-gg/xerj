@@ -33,6 +33,16 @@ pub enum BoolOperator {
     Or,
     /// All tokens must match.
     And,
+    /// The request did not name an operator. Execution treats this as [`Or`]
+    /// unless the index sets `index.query.default_match_operator` to `and`
+    /// (#1504, log datasets). Not a wire value: the parser produces it only
+    /// when the `operator` key is absent, and [`crate::apply_default_match_operator`]
+    /// resolves it before a log index runs the query. An explicit `"or"` stays
+    /// [`Or`], so a caller can still ask for the ES default on a log index.
+    ///
+    /// Serde's missing-field default stays [`Or`]. A deserialized AST that
+    /// never went through the parser must not grow this variant.
+    Omitted,
 }
 
 /// Determines how scores are combined for `MultiMatch` queries.
@@ -490,6 +500,12 @@ pub enum QueryNode {
         /// match_bool_prefix) that keep BM25 scoring.
         #[serde(default, skip_serializing_if = "is_false")]
         constant_score: bool,
+        /// #1812: fold case on both sides when matching a KEYWORD field.
+        /// `false` (default) = ES-correct case-sensitive keyword prefix.
+        /// `true` is set for `prefix{case_insensitive:true}`.
+        /// Ignored for `text` fields.
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
     },
 
     /// Wildcard pattern match (`?` = any char, `*` = zero-or-more chars).
@@ -714,7 +730,15 @@ pub enum QueryNode {
     },
 
     /// Regular expression match against a field value.
-    Regexp { field: String, pattern: String },
+    Regexp {
+        field: String,
+        pattern: String,
+        /// #1812: fold case on both sides when matching a KEYWORD field.
+        /// `false` (default) = ES-correct case-sensitive keyword regexp.
+        /// Ignored for `text` fields.
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
+    },
 
     /// Position-aware text match (ES `intervals` query). The `rule` is the
     /// raw rule JSON (one of match/all_of/any_of/prefix/wildcard/fuzzy,
@@ -1412,6 +1436,17 @@ pub struct HighlightRequest {
     /// `false` keeps every matching text/keyword field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_field_match: Option<bool>,
+
+    /// Highlighter implementation (`unified`, `plain`, `fvh`, `semantic`).
+    /// Absent means the field type's default: `semantic` for `semantic_text`
+    /// on a semantic query, the lexical term highlighter otherwise.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub highlighter_type: Option<String>,
+
+    /// `score` (semantic default here) or `none` (document order). A field
+    /// that sets its own `order` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 /// Per-field highlight options (can override the top-level defaults).
@@ -1425,6 +1460,12 @@ pub struct HighlightFieldOptions {
     pub fragment_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number_of_fragments: Option<usize>,
+    /// Overrides [`HighlightRequest::highlighter_type`] for this field.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub highlighter_type: Option<String>,
+    /// Overrides [`HighlightRequest::order`] for this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

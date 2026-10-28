@@ -67,7 +67,7 @@ if [ -n "$INDEX" ]; then
 else
   command -v curl >/dev/null 2>&1 || { echo "curl is required to fetch $SOURCES_URL" >&2; exit 2; }
   TMPIDX=$(mktemp "${TMPDIR:-/tmp}/xerj-sources-XXXXXX.gz")
-  trap 'rm -f "$TMPIDX" "$JOIN" "$JOIN.pkgs" "$JOIN.crates" 2>/dev/null' EXIT
+  trap 'rm -f "$TMPIDX" 2>/dev/null' EXIT   # JOIN is not set yet; its trap comes below
   echo "fetching $SOURCES_URL" >&2
   curl -sSf -m 300 -o "$TMPIDX" "$SOURCES_URL"
   DEB_PACKAGES=$(gzip -dc "$TMPIDX" | sed -n 's/^Package: //p' | sort -u)
@@ -93,7 +93,7 @@ RESULT=$(awk '
     if (pkgs["rust-" name]) print "P\t" $0; else print "M\t" $0
   }
 ' "$JOIN.pkgs" "$JOIN.crates")
-PRESENT=$(printf '%s\n' "$RESULT" | grep -c '^P' | tr -d ' ')
+PRESENT=$(printf '%s\n' "$RESULT" | awk '/^P/ { count++ } END { print count + 0 }')
 MISSING=$(printf '%s\n' "$RESULT" | sed -n 's/^M\t//p')
 
 MISSING_COUNT=$((TOTAL - PRESENT))

@@ -18,6 +18,7 @@ Primary sources:
 | Engine-side visibility funnel | `engine/crates/xerj-engine/src/index_guard.rs` |
 | Privileges, roles, `role_descriptors` parsing | `engine/crates/xerj-engine/src/rbac.rs` |
 | Console client identity and rate limiting | `engine/crates/xerj-console-api/src/client_ip.rs`, `.../auth/rate_limit.rs` |
+| Console passkey session vs API token | `engine/crates/xerj-console-api/src/auth/sessions.rs` (`PasskeySession`) |
 | Share links: records, claim route, claim limiter | `engine/crates/xerj-api/src/share.rs` |
 | Share-link guest route allow-list | `engine/crates/xerj-api/src/authz.rs` (`guest_route_allowed`, `guest_body_denied`) |
 | Cluster control-frame authentication | `engine/crates/xerj-cluster/src/auth.rs` |
@@ -29,37 +30,37 @@ reasons.
 
 ### Layer 1: the authz middleware
 
-`authz_middleware` (`xerj-api/src/authz.rs:1224`) runs on both HTTP routers. It
+`authz_middleware` (`xerj-api/src/authz.rs:1300`) runs on both HTTP routers. It
 is added to the router before `auth_middleware`, so it runs after it
 (`xerj-api/src/router.rs:786-789`): authentication has already resolved the
 caller to a `Principal`, and this layer decides what that principal may reach.
 
 It does four things:
 
-1. Classifies the path (`classify`, `authz.rs:444`) into a brain, a memory
+1. Classifies the path (`classify`, `authz.rs:497`) into a brain, a memory
    namespace, one or more index expressions, a cluster endpoint, or exempt.
-   Path segments are percent-decoded first (`percent_decode`, `authz.rs:421`),
+   Path segments are percent-decoded first (`percent_decode`, `authz.rs:474`),
    so `%2Exerj-memory-alice` cannot slip past a check that
    `.xerj-memory-alice` would fail.
 2. Works out the privilege the request needs (`required_privilege`,
-   `authz.rs:505`). `GET`/`HEAD` need read. A `POST` whose operation segment is
+   `authz.rs:561`). `GET`/`HEAD` need read. A `POST` whose operation segment is
    in `POST_READ_OPS` (`_search`, `_count`, `_msearch`, `_mget`, `_sql` and
-   others, `authz.rs:349`) needs read. Operations in `ADMIN_OPS` (`_settings`,
-   `_mapping`, `_close`, `_alias`, `_forcemerge` and others, `authz.rs:388`)
+   others, `authz.rs:402`) needs read. Operations in `ADMIN_OPS` (`_settings`,
+   `_mapping`, `_close`, `_alias`, `_forcemerge` and others, `authz.rs:441`)
    need manage, as does a request with no operation segment at all, because that
    creates or destroys the index. Everything else is treated as a write.
-3. Extracts the indices the request body names (`body_targets`, `authz.rs:730`)
+3. Extracts the indices the request body names (`body_targets`, `authz.rs:786`)
    and authorizes each one. The shapes it parses are enumerated in `BodyShape`
-   (`authz.rs:578`): `_bulk` action lines, `_msearch` header lines, `_mget`
+   (`authz.rs:634`): `_bulk` action lines, `_msearch` header lines, `_mget`
    `docs[]._index`, `_aliases` actions, `_reindex` `source`/`dest`, snapshot
    `indices`, `PUT /{index}` `aliases`, index-template `index_patterns`, ML job
    and datafeed configs, the native `POST /v1/indices` body, and a `terms`
    lookup or `lookup` runtime field at any depth inside a search body. Aliases
    are resolved to their backing indices before the decision
-   (`authorize_expression`, `authz.rs:1168`).
+   (`authorize_expression`, `authz.rs:1224`).
 4. Installs the principal as the engine's visibility rule for the rest of the
    request and prunes reserved index names out of metadata responses
-   (`prune_response`, `authz.rs:1431`).
+   (`prune_response`, `authz.rs:1715`).
 
 A superuser short-circuits on the first line of the middleware
 (`authz.rs:1237`): no body buffering, no visibility guard, no response pruning.
@@ -68,12 +69,12 @@ index in it, bounded by `limits.max_body_bytes`; a body over that limit is
 refused with `413` rather than being authorized unread (`authz.rs:1251-1262`).
 
 A denial at this layer is an ES-shaped `403` with `type: security_exception`
-(`forbidden`, `authz.rs:242`; body shape in `xerj-api/src/error.rs:52`). It is
+(`forbidden`, `authz.rs:282`; body shape in `xerj-api/src/error.rs:52`). It is
 returned before any existence check, so `403` versus `404` cannot be used to
 enumerate what exists.
 
 A body that should have named its targets but cannot be parsed is refused, not
-ignored (`unresolvable`, `authz.rs:709`).
+ignored (`unresolvable`, `authz.rs:765`).
 
 ### Layer 2: the index_guard visibility funnel
 
@@ -548,6 +549,71 @@ startup rather than silently widening or narrowing trust
 Note that `ClientIp` is also used for audit fields on endpoints that are not
 rate limited, for example passkey enrolment (`auth/passkey.rs:168`). Only the
 three endpoints listed above charge a bucket.
+
+## Console credentials: a passkey session is not an API token
+
+CVE-2026-97406, [CERT VU#645818](https://kb.cert.org/vuls/id/645818)
+(published 2026-10-20). Cookie sessions and `Authorization: Bearer <api token>`
+both become an `AuthSession` (`auth/sessions.rs`). That is intentional for
+ordinary console calls. It is not a passkey session. Handlers that mint a
+credential or change identity extract `PasskeySession` instead
+(`sessions.rs:298`, extractor at `sessions.rs:304`). The extractor authenticates
+first, then calls `require_passkey_session` (`sessions.rs:169`). A missing
+credential is 401. A valid API token, and a browser session whose `idp` is not
+`"passkey"`, are 403. The body text is `PASSKEY_SESSION_REQUIRED`
+(`sessions.rs:140`).
+
+A passkey session is a `xerj_session` cookie whose `.xerj_sessions` row has
+`idp: "passkey"` (`sessions.rs:250`). Login and enrollment mint that row with
+`idp: "passkey"`. A bearer token is `SessionOrigin::ApiToken`
+(`sessions.rs:393`); its `session_id` is the token hash, not a session id.
+When both a cookie and a bearer header are present, the bearer wins
+(`sessions.rs:194`): the request is not upgraded onto the cookie, so a token
+cannot ride a passkey cookie through this gate.
+
+Routes that require `PasskeySession`:
+
+| Route | Handler | What a bearer token must not do |
+|---|---|---|
+| `POST /_xerj-console/api/v1/auth/api-tokens` | `auth/tokens.rs:73` | Mint a successor token |
+| `DELETE /_xerj-console/api/v1/auth/api-tokens/:id` | `auth/tokens.rs:160` | Revoke a token |
+| `POST /_xerj-console/api/v1/auth/magic/issue` | `auth/magic.rs:79` | Issue an invitation |
+| `DELETE /_xerj-console/api/v1/auth/passkeys/:id` | `auth/me.rs:58` | Delete a passkey |
+| `POST /_xerj-console/api/v1/auth/logout` | `auth/login.rs:218` | Revoke the browser session |
+
+The refusal happens in the extractor, before the handler, so it writes nothing.
+`put_api_token` (`auth/store.rs:285`) is how a new token row is stored, and the
+only caller that inserts a new secret is `tokens::create`. There is no
+`parent_id`. A bearer token cannot mint a descendant, so revoking a token
+cannot leave one behind. `revoke_api_tokens_for_user` (`auth/store.rs:312`) is
+not part of that path and is not called from passkey deletion.
+
+These stay on `AuthSession`, so a bearer token still works: `GET /me`,
+`GET /auth/passkeys`, `GET /auth/api-tokens` (metadata, no secret), prefs,
+dashboards, saved views, data-source reads, `GET /knowledge`, and the
+`/graph/*` reads.
+
+Three credential-shaped routes do not take `AuthSession` at all, and a bearer
+token does not unlock them:
+
+- `POST /auth/magic/redeem` (`auth/magic.rs:200`) trusts the magic link. The
+  invitee has no session yet. Requiring a passkey session here would break
+  bootstrap. The stolen-token path into redeem was `magic/issue`, which is
+  gated.
+- `POST /auth/passkey/begin` and `/finish` trust the in-memory enrollment
+  session that redeem creates. There is no handler that enrolls a passkey for
+  the bearer token's user.
+- `POST /auth/login/begin` and `/finish` are the WebAuthn ceremony.
+
+No `/users` handler and no "revoke some other session" handler exist. Logout
+revokes only the current passkey session.
+
+Deleting the last passkey is refused with 409 (`auth/me.rs:73`). That is what
+stops an account from holding API tokens and no passkey. It is not a cascade
+that stamps `revoked_at` on the token rows.
+
+The regression test is `tests/api_tokens_flow.rs`
+(`bearer_token_cannot_mint_or_change_credentials`).
 
 ## Reach: what a fresh node exposes (issue #228)
 

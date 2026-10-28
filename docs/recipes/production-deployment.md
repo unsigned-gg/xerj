@@ -59,18 +59,14 @@ Boot it:
 xerj --config /etc/xerj/xerj.toml
 ```
 
-On first start the admin key is printed **once** (illustrative — yours is a
-random 64-hex-character value):
+On first start the admin key is written **once** to `<data_dir>/admin.key`
+(mode 0600). The banner names that path and does not print the key:
 
 ```
-╔══════════════════════════════════════════════════╗
-║  First-run: admin API key auto-generated         ║
-║                                                  ║
-║  <64 random hex chars>                           ║
-║                                                  ║
-║  Keep this secret. Written to:                   ║
-║  /var/lib/xerj/admin.key                         ║
-╚══════════════════════════════════════════════════╝
+First-run: admin API key auto-generated.
+The key is not printed here. Read it from (owner-only, mode 0600):
+/var/lib/xerj/admin.key
+Keep that file secret. Clients send it as `Authorization: ApiKey $(cat /var/lib/xerj/admin.key)`.
 ```
 
 …followed by the deployment-posture banner (verbatim from a real TLS+auth boot;
@@ -104,10 +100,10 @@ this build — provide them at the layers described in
 ### How auth behaves
 
 * **On by default.** `[auth] enabled` defaults to `true`. Leave `admin_api_key`
-  empty and XERJ generates a 64-hex-character key on first run, writes it to
-  `<data_dir>/admin.key` with `0600` permissions, and prints it once. Or set
-  `admin_api_key` yourself (then no file is written — protect the config file
-  with `chmod 600`).
+  empty and XERJ generates a 64-hex-character key on first run and writes it to
+  `<data_dir>/admin.key` with `0600` permissions. The startup notice prints the
+  path, not the key. Or set `admin_api_key` yourself (then no file is written —
+  protect the config file with `chmod 600`).
 * **One key, full access.** Every request must carry the key; there is **no
   RBAC** — any authenticated caller can read and write every index. Both header
   schemes work:
@@ -471,9 +467,14 @@ in-process BERT sentence encoder (default `all-MiniLM-L6-v2`, 384-dim, ~90 MB),
 no Python, no external service. Select it per node with `[embedding] mode =
 "neural"` (or `--embed-mode neural`, or `XERJ_EMBED_MODE=neural`).
 
-On a connected host the model downloads itself **once, on first use**, from the
-HuggingFace Hub and is cached for every later start. On an **air-gapped** host
-there is no Hub to reach, so stage the model files yourself.
+On a connected host the model is downloaded from the HuggingFace Hub and loaded
+**at startup**, then cached for every later start. If that load fails the
+process **refuses to start** with one error that names the cause, the command
+`xerj --embed-mode lexical`, `embedding.local_model_dir`, and `HF_ENDPOINT`
+(a Hub mirror). It does not stay up and fail every ingest, and it does not
+substitute lexical vectors — those are not comparable with neural vectors.
+Explicit `proxy` already fails closed the same way. On an **air-gapped** host
+there is no Hub to reach, so stage the model files yourself before starting.
 
 ### Step 1 — download the three files on a connected machine
 
@@ -509,26 +510,21 @@ local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"   # holds the 3 files abov
 ```
 
 When `local_model_dir` is set it takes precedence over the Hub — XERJ makes
-**no outbound network call** for the model. Selecting the neural backend logs a
-line when the semantic index is built:
+**no outbound network call** for the model. The weights load at startup, before
+the data directory is opened. A correct staging just works and makes no network
+call. A **missing or wrong file refuses startup** with the offending path:
 
 ```
-INFO  embedding backend: built-in neural BERT (loads on first use)
+embedding.mode=neural failed to load model sentence-transformers/all-MiniLM-L6-v2: local model dir /opt/xerj/models/... is missing tokenizer.json
+… has no model.safetensors (candle requires safetensors, not pytorch_model.bin).
+Refusing to start. …
+To index without a model, restart with: xerj --embed-mode lexical
 ```
 
-The weights themselves load lazily, from your staged directory, on the first
-`semantic_text` ingest (not at boot). A correct staging just works — the local
-path is silent on success and makes no network call. A **missing or wrong file
-fails loud** with the offending path, which is your signal to fix the staging:
-
-```
-local model dir /opt/xerj/models/... is missing tokenizer.json
-… has no model.safetensors (candle requires safetensors, not pytorch_model.bin)
-```
-
-(The `neural embedder: model ready` log line you may have seen elsewhere is the
-*Hub-download* path's completion message; the offline `local_model_dir` path
-does not print it.)
+(The `neural embedder: model ready` log line is the *Hub-download* path's
+completion message; the offline `local_model_dir` path does not print it.
+After a successful load, opening a semantic index logs
+`embedding backend: built-in neural BERT (loaded)`.)
 
 > **Slim builds.** A `--no-default-features` build omits the neural backend;
 > `mode = "neural"` on such a binary logs a warning and falls back to the

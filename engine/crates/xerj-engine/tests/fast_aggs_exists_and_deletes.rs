@@ -25,16 +25,6 @@ use xerj_engine::aggs::fast_path_aggs_served;
 use xerj_engine::{Engine, Index};
 use xerj_query::parse_request;
 
-fn kw_schema(fields: &[&str]) -> Schema {
-    let mut schema = Schema::empty();
-    for &f in fields {
-        schema
-            .add_field(FieldConfig::new(f, FieldType::Keyword))
-            .unwrap();
-    }
-    schema
-}
-
 /// The served/bailed assertions read the PROCESS-GLOBAL
 /// `fast_path_aggs_served()` counter as a before/after delta, so two of
 /// these tests running concurrently count each other's serves (CI caught
@@ -49,6 +39,29 @@ fn make_engine(dir: &TempDir) -> Engine {
     let mut config = Config::default();
     config.server.data_dir = dir.path().to_str().unwrap().to_string();
     Engine::new(config).expect("engine::new")
+}
+
+/// A schema that DECLARES the given string fields as `keyword`, mirroring the
+/// real autoindex catalog mapping (`catalog.rs::catalog_mapping` declares
+/// `format`/`path`/`status`/`file_key` as keyword).
+///
+/// These tests stand in for that catalog but used `Schema::empty()`, letting
+/// their string fields (`extension`, `text`, `group`) be dynamically mapped.
+/// Since #1329 a dynamically mapped string is a `text` parent with NO
+/// doc-values (only its `.keyword` sub-field carries them, matching ES), and a
+/// `text` field never gets a doc-values column regardless of the flag
+/// (`FieldConfig::stored_doc_values` excludes `Text`). The columnar fast path
+/// — the terms executor and the `KwExists` arm alike — reads that doc-values
+/// column, so an inferred stand-in makes every "must serve columnarly"
+/// assertion bail to brute. Declaring the stand-ins keyword restores the
+/// column the catalog's real keyword fields have. Numeric fields (`v`, `i`)
+/// are unaffected and stay inferred.
+fn kw_schema(fields: &[&str]) -> Schema {
+    let mut s = Schema::empty();
+    for f in fields {
+        s.fields.push(FieldConfig::new(*f, FieldType::Keyword));
+    }
+    s
 }
 
 async fn run(idx: &std::sync::Arc<Index>, body: serde_json::Value) -> serde_json::Value {
@@ -321,6 +334,19 @@ async fn merged_delete_history_re_qualifies_for_fast_path() {
     let q = json!({
         "query": {
             "bool": {
+                // A one-element `terms` SET, not a singular `term`: on a
+                // declared keyword field a singular `term` is deliberately
+                // kept in the FTS scoring tree (index.rs
+                // `query_node_to_fts_projected`, so a mixed bool can add its
+                // BM25 score), which makes `query_needs_fts` true and routes a
+                // size:0 agg to the brute path — never the columnar fast path
+                // this test asserts. The real finalize-verify window
+                // (`sync_executor::windowed_value_counts`) filters with a
+                // `terms` set over a digest window, so `terms` is also the
+                // production-faithful shape. A one-element set matches exactly
+                // the same docs as `term`. (Before #1329 `extension` was an
+                // inferred `text` field, classified differently, so the
+                // singular `term` happened to take the fast path.)
                 "filter": [
                     { "terms": { "extension": ["css"] } },
                     { "exists": { "field": "i" } }

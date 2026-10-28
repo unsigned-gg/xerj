@@ -162,7 +162,7 @@ fn run_build_inner(args: &[String], home: &Path) -> Result<i32> {
         let files = walk(&fetched.root, &src.glob)?;
         let mut keys = HashSet::new();
         for (rel, path) in files {
-            for value in parse_file(&path)? {
+            for value in parse_file(&path, src.records_field.as_deref())? {
                 let mut env = normalize::normalize(src.format, &value);
                 env.insert(SRC.into(), Value::String(src.slug.clone()));
                 env.insert(
@@ -192,7 +192,7 @@ fn run_build_inner(args: &[String], home: &Path) -> Result<i32> {
 
     // ── identity + merge over the FULL store (not just this run's files) ──
     let slugs: HashSet<String> = recipe.sources.iter().map(|s| s.slug.clone()).collect();
-    let envelopes = store::read_all(&store_dir, &slugs);
+    let envelopes = store::read_all(&store_dir, &slugs)?;
     let clusters = identity::cluster(&envelopes, &recipe.identity);
     let merge_order = if recipe.merge.precedence.is_empty() {
         recipe.identity.canonical_source_order.clone()
@@ -278,6 +278,7 @@ fn kind_name(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Dir => "dir",
         SourceKind::HttpZip => "http-zip",
+        SourceKind::HttpJson => "http-json",
         SourceKind::Git => "git",
     }
 }
@@ -288,16 +289,55 @@ fn kind_name(kind: SourceKind) -> &'static str {
 /// (posix-relative-path, absolute-path), sorted — directory iteration order
 /// must never reach the output.
 fn walk(root: &Path, glob: &str) -> Result<Vec<(String, PathBuf)>> {
+    // A source root that cannot be read is a HARD error, never an empty
+    // walk. A `dir` source whose path is typo'd, points at the wrong cwd, or
+    // names a tree that was renamed upstream would otherwise walk to zero
+    // files; `prune` then deletes every envelope the slug ever stored and
+    // the build exits 0 with a smaller, all-checksums-valid pack — silent
+    // data loss (#1110 negative-path audit, gap 1). An existing but empty
+    // directory is still allowed: a legitimately empty upstream prunes to
+    // zero on purpose, a missing one does not.
+    let meta = std::fs::metadata(root).with_context(|| {
+        format!(
+            "source root {} cannot be read — a typo'd path or a moved upstream \
+             tree must fail the build, not silently empty the pack",
+            root.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!("source root {} is not a directory", root.display());
+    }
     let re = glob_regex(glob);
     let mut out = Vec::new();
-    fn recurse(dir: &Path, root: &Path, re: &regex::Regex, out: &mut Vec<(String, PathBuf)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
+    // A listing error must not become "no files". The autoindex walker
+    // skips an unreadable entry (`walk.rs:327`, the `Err` arm of `it.next()`)
+    // because a skipped file is only absent from that pass. Here `prune`
+    // treats "not seen" as "deleted upstream", so swallowing `read_dir` —
+    // on the root or on any nested directory — deletes every envelope under
+    // it and the build still exits 0 (#1110 gap 1). `metadata` above already
+    // refuses a missing root; this is the root that exists but cannot be
+    // listed, and the same failure one directory down.
+    fn recurse(
+        dir: &Path,
+        root: &Path,
+        re: &regex::Regex,
+        out: &mut Vec<(String, PathBuf)>,
+    ) -> Result<()> {
+        let entries = std::fs::read_dir(dir).with_context(|| {
+            format!(
+                "source directory {} cannot be listed — an unreadable tree must \
+                 fail the build, not silently empty the pack",
+                dir.display()
+            )
+        })?;
+        for e in entries {
+            let e = e.with_context(|| format!("cannot read entry in {}", dir.display()))?;
             let p = e.path();
+            // `Path::is_dir` follows symlinks, which is the walk this
+            // replaced. A stat failure reports "not a directory" (same as
+            // before); the failure this function refuses is `read_dir`.
             if p.is_dir() {
-                recurse(&p, root, re, out);
+                recurse(&p, root, re, out)?;
             } else {
                 let rel = p.strip_prefix(root).unwrap_or(&p);
                 let rel = rel.to_string_lossy().replace('\\', "/");
@@ -306,8 +346,9 @@ fn walk(root: &Path, glob: &str) -> Result<Vec<(String, PathBuf)>> {
                 }
             }
         }
+        Ok(())
     }
-    recurse(root, root, &re, &mut out);
+    recurse(root, root, &re, &mut out)?;
     out.sort();
     Ok(out)
 }
@@ -349,7 +390,7 @@ fn glob_regex(glob: &str) -> regex::Regex {
 /// source is visible junk, not a silent parse error. Other extensions are
 /// skipped by the glob, not here — reaching this with an unlisted type is a
 /// hard error, not a silent drop.
-fn parse_file(path: &Path) -> Result<Vec<Value>> {
+fn parse_file(path: &Path, records_field: Option<&str>) -> Result<Vec<Value>> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let name = path
@@ -357,10 +398,19 @@ fn parse_file(path: &Path) -> Result<Vec<Value>> {
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_lowercase();
-    if name.ends_with(".md") || name.ends_with(".markdown") {
+    let markdown = name.ends_with(".md") || name.ends_with(".markdown");
+    let jsonl = name.ends_with(".jsonl") || name.ends_with(".ndjson");
+    // `records_field` only means something for a wrapped `.json` catalog; on
+    // any other file type it would be silently ignored, so refuse instead.
+    if let (Some(field), true) = (records_field, markdown || jsonl) {
+        bail!(
+            "{}: records_field '{field}' applies only to .json files, not .md/.jsonl",
+            path.display()
+        );
+    }
+    if markdown {
         return Ok(vec![Value::String(raw)]);
     }
-    let jsonl = name.ends_with(".jsonl") || name.ends_with(".ndjson");
     if jsonl {
         let mut out = Vec::new();
         for (n, line) in raw.lines().enumerate() {
@@ -376,6 +426,21 @@ fn parse_file(path: &Path) -> Result<Vec<Value>> {
     } else {
         let v: Value = serde_json::from_str(&raw)
             .with_context(|| format!("{}: not valid JSON", path.display()))?;
+        if let Some(field) = records_field {
+            let Value::Object(mut m) = v else {
+                bail!(
+                    "{}: records_field '{field}' requires a top-level JSON object",
+                    path.display()
+                );
+            };
+            let Some(Value::Array(a)) = m.remove(field) else {
+                bail!(
+                    "{}: records_field '{field}' missing or not a JSON array",
+                    path.display()
+                );
+            };
+            return Ok(a);
+        }
         Ok(match v {
             Value::Array(a) => a,
             other => vec![other],
@@ -421,22 +486,148 @@ mod tests {
     }
 
     #[test]
+    fn walk_refuses_a_missing_root_instead_of_pruning_everything() {
+        // #1110 gap 1: a missing source root must fail the build, not walk to
+        // zero files and let `prune` wipe the slug with a green exit.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = walk(&missing, "**/*.json").unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+
+        // an existing but empty directory is still fine — a legitimately
+        // empty upstream prunes to zero on purpose.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(walk(&empty, "**/*.json").unwrap().is_empty());
+
+        // a file where a directory is expected is also refused.
+        let afile = tmp.path().join("a.json");
+        std::fs::write(&afile, "{}").unwrap();
+        let err = walk(&afile, "**/*.json").unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    /// `chmod` a path for the duration of the test, then put the previous
+    /// mode back — including on panic — so the tempdir can be removed.
+    #[cfg(unix)]
+    struct RestoreMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    #[cfg(unix)]
+    impl RestoreMode {
+        fn lock(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let prev = std::fs::metadata(path).unwrap().permissions().mode();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(path, perms).unwrap();
+            RestoreMode {
+                path: path.to_path_buf(),
+                mode: prev,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&self.path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(self.mode);
+                std::fs::set_permissions(&self.path, perms).ok();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_refuses_an_unreadable_root() {
+        // #1110 gap 1, the read_dir half: metadata succeeding is not enough.
+        // A directory that exists but cannot be listed (mode 000) used to
+        // fall through `recurse`'s swallowed `read_dir` and come back as an
+        // empty file list — the same silent prune as a typo'd path.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("src");
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/a.json"), "{}").unwrap();
+        let _restore = RestoreMode::lock(&root, 0o000);
+        let err = walk(&root, "**/*.json").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be listed"),
+            "unreadable root must fail the walk, not return no files: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_refuses_an_unreadable_subdirectory() {
+        // A nested directory that cannot be listed must fail the walk too.
+        // Skipping it would omit its files from the live key set and `prune`
+        // would delete their envelopes as if upstream had removed them.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("src");
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join("keep/a.json"), "{}").unwrap();
+        std::fs::write(root.join("secret/b.json"), "{}").unwrap();
+        let _restore = RestoreMode::lock(&root.join("secret"), 0o000);
+        let err = walk(&root, "**/*.json").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be listed"),
+            "unreadable subdirectory must fail the walk: {err}"
+        );
+        assert!(
+            err.contains("secret"),
+            "the error must name the directory that could not be listed: {err}"
+        );
+    }
+
+    #[test]
     fn parse_file_understands_json_and_jsonl() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.json");
         std::fs::write(&a, r#"[{"id":"x"},{"id":"y"}]"#).unwrap();
-        assert_eq!(parse_file(&a).unwrap().len(), 2);
+        assert_eq!(parse_file(&a, None).unwrap().len(), 2);
         let b = tmp.path().join("b.jsonl");
         std::fs::write(&b, "{\"id\":\"z\"}\n\n{\"id\":\"w\"}\n").unwrap();
-        assert_eq!(parse_file(&b).unwrap().len(), 2, "blank lines skipped");
+        assert_eq!(
+            parse_file(&b, None).unwrap().len(),
+            2,
+            "blank lines skipped"
+        );
         let c = tmp.path().join("c.json");
         std::fs::write(&c, r#"{"id":"one"}"#).unwrap();
-        assert_eq!(parse_file(&c).unwrap().len(), 1);
+        assert_eq!(parse_file(&c, None).unwrap().len(), 1);
         let d = tmp.path().join("d.md");
         std::fs::write(&d, "```toml\n[advisory]\nid = \"R\"\n```\n\n# T\n").unwrap();
-        let parsed = parse_file(&d).unwrap();
+        let parsed = parse_file(&d, None).unwrap();
         assert_eq!(parsed.len(), 1, "one raw string value, not json-parsed");
         assert!(parsed[0].as_str().unwrap().starts_with("```toml"));
+        let wrapped = tmp.path().join("wrapped.json");
+        std::fs::write(
+            &wrapped,
+            r#"{"title":"KEV","vulnerabilities":[{"cveID":"CVE-1"},{"cveID":"CVE-2"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_file(&wrapped, Some("vulnerabilities")).unwrap().len(),
+            2
+        );
+        let err = parse_file(&wrapped, Some("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing or not a JSON array"), "{err}");
+        let err = parse_file(&b, Some("vulnerabilities"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("applies only to .json files"), "{err}");
+        let err = parse_file(&d, Some("vulnerabilities"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("applies only to .json files"), "{err}");
     }
 
     // ── end to end: recipe → harvest → identity → pack, twice ─────────────
@@ -725,6 +916,270 @@ shards = 4
             "dead envelope pruned"
         );
         assert_eq!(read_records(&pack).len(), 1);
+
+        // ── fourth run with --fresh: wipes build dir, resets generation ────
+        let fresh_args: Vec<String> = vec!["e2e".to_string(), "--fresh".to_string()];
+        assert_eq!(run_build_inner(&fresh_args, home.path()).unwrap(), 0);
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(pack.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["generation"],
+            json!(1),
+            "--fresh wipes previous build dir and resets generation to 1"
+        );
+        for s in manifest["sources"].as_array().unwrap() {
+            assert_eq!(s["skipped"], json!(0), "--fresh re-harvests from scratch");
+            assert_eq!(s["new"], s["records"]);
+        }
+    }
+
+    fn store_files(home: &Path, build: &str, prefix: &str) -> Vec<String> {
+        let store = home.join("builds").join(build).join("store");
+        let mut names: Vec<String> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn pack_generation(home: &Path, build: &str) -> u64 {
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.join("builds")
+                    .join(build)
+                    .join("pack")
+                    .join(build)
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        manifest["generation"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn missing_source_root_fails_the_build_and_does_not_prune() {
+        // #1110 gap 1 at the pipeline: a typo'd `dir` path must exit as an
+        // error AND leave the previously stored envelopes on disk. `walk`
+        // failing is not enough if `prune` already ran.
+        let home = tempfile::tempdir().unwrap();
+        e2e_env(home.path());
+        let args: Vec<String> = vec!["e2e".to_string()];
+        assert_eq!(run_build_inner(&args, home.path()).unwrap(), 0);
+        let before = store_files(home.path(), "e2e", "rustsec.");
+        assert_eq!(before.len(), 2, "two rustsec envelopes stored");
+        let gen = pack_generation(home.path(), "e2e");
+
+        std::fs::rename(
+            home.path().join("recipes/data/rustsec"),
+            home.path().join("recipes/data/rustsec-moved"),
+        )
+        .unwrap();
+        let err = run_build_inner(&args, home.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be read"),
+            "missing source root must fail the build: {err}"
+        );
+        assert_eq!(
+            store_files(home.path(), "e2e", "rustsec."),
+            before,
+            "a failed walk must not prune the slug's envelopes"
+        );
+        assert_eq!(
+            pack_generation(home.path(), "e2e"),
+            gen,
+            "a failed walk must not publish a new generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_source_root_fails_the_build_and_does_not_prune() {
+        // Same contract as the missing-root test, for a directory that
+        // exists but whose `read_dir` fails. That is the path `recurse`
+        // used to swallow.
+        let home = tempfile::tempdir().unwrap();
+        e2e_env(home.path());
+        let args: Vec<String> = vec!["e2e".to_string()];
+        assert_eq!(run_build_inner(&args, home.path()).unwrap(), 0);
+        let before = store_files(home.path(), "e2e", "rustsec.");
+        assert_eq!(before.len(), 2);
+        let gen = pack_generation(home.path(), "e2e");
+
+        let root = home.path().join("recipes/data/rustsec");
+        let _restore = RestoreMode::lock(&root, 0o000);
+        let err = run_build_inner(&args, home.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be listed"),
+            "unreadable source root must fail the build: {err}"
+        );
+        assert_eq!(
+            store_files(home.path(), "e2e", "rustsec."),
+            before,
+            "an unreadable root must not prune the slug's envelopes"
+        );
+        assert_eq!(pack_generation(home.path(), "e2e"), gen);
+    }
+
+    fn idless_recipe(name: &str, glob: &str) -> String {
+        format!(
+            r#"[recipe]
+format = 1
+name = "{name}"
+
+[[sources]]
+slug = "notes"
+kind = "dir"
+path = "notes"
+glob = "{glob}"
+format = "flat"
+licence = "CC0-1.0"
+
+[identity]
+edges = [{{ field = "id" }}]
+"#
+        )
+    }
+
+    #[test]
+    fn markdown_blobs_without_ids_are_refused() {
+        // #1110 gap 2, the normalize path: `.md` files flattened by `flat`
+        // become `{"value": …}` with no id. N of them must not ship in one
+        // shard under id "".
+        let home = tempfile::tempdir().unwrap();
+        let notes = home.path().join("recipes/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            home.path().join("recipes/idless.toml"),
+            idless_recipe("idless", "**/*.md"),
+        )
+        .unwrap();
+        for (i, body) in ["alpha", "bravo", "charlie", "delta"].iter().enumerate() {
+            std::fs::write(notes.join(format!("n{i}.md")), format!("# {body}\n")).unwrap();
+        }
+        let err = run_build_inner(&["idless".into()], home.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty id"), "{err}");
+        assert_eq!(
+            store_files(home.path(), "idless", "notes.").len(),
+            4,
+            "all four blobs were harvested; the refusal is at emit, not a silent drop"
+        );
+        let pack = home.path().join("builds/idless/pack/idless");
+        assert!(pack.is_dir(), "emit creates the pack dir before refusing");
+        let shards: Vec<_> = std::fs::read_dir(&pack)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("records-"))
+            .collect();
+        assert!(
+            shards.is_empty(),
+            "refused records must not be written into the pack: {shards:?}"
+        );
+    }
+
+    #[test]
+    fn non_string_and_empty_ids_are_refused() {
+        // #1110 gap 2: a non-string `id` (number, null, missing) is not a
+        // stable identity. N such records must be refused, not collapsed.
+        let home = tempfile::tempdir().unwrap();
+        let notes = home.path().join("recipes/notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            home.path().join("recipes/idless.toml"),
+            idless_recipe("idless", "**/*.json"),
+        )
+        .unwrap();
+        let bodies = [
+            r#"{"id":""}"#,
+            r#"{"id":7}"#,
+            r#"{"id":null,"name":"n"}"#,
+            r#"{"note":"no id field"}"#,
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            std::fs::write(notes.join(format!("n{i}.json")), body).unwrap();
+        }
+        let err = run_build_inner(&["idless".into()], home.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty id"), "{err}");
+        assert_eq!(store_files(home.path(), "idless", "notes.").len(), 4);
+        let pack = home.path().join("builds/idless/pack/idless");
+        if pack.is_dir() {
+            for entry in std::fs::read_dir(&pack).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.starts_with("records-"),
+                    "refused records must not be written: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_store_envelope_fails_the_rebuild_without_shrinking_the_pack() {
+        // #1110 gap 4 at the pipeline: a truncated `<slug>.<key>.json` must
+        // fail the rebuild. The previous pack stays, and the corrupt file is
+        // not pruned (its key is still live) and then quietly omitted.
+        let home = tempfile::tempdir().unwrap();
+        e2e_env(home.path());
+        let args: Vec<String> = vec!["e2e".to_string()];
+        assert_eq!(run_build_inner(&args, home.path()).unwrap(), 0);
+        let before = store_files(home.path(), "e2e", "");
+        let gen = pack_generation(home.path(), "e2e");
+        let records_before = read_records(&home.path().join("builds/e2e/pack/e2e")).len();
+
+        let victim = home
+            .path()
+            .join("builds/e2e/store")
+            .join(before.iter().find(|n| n.starts_with("rustsec.")).unwrap());
+        std::fs::write(&victim, "{truncated").unwrap();
+
+        let err = run_build_inner(&args, home.path()).unwrap_err().to_string();
+        assert!(err.contains("corrupt store envelope"), "{err}");
+        assert!(
+            victim.is_file(),
+            "the corrupt envelope must still be on disk, not pruned"
+        );
+        assert_eq!(pack_generation(home.path(), "e2e"), gen);
+        assert_eq!(
+            read_records(&home.path().join("builds/e2e/pack/e2e")).len(),
+            records_before,
+            "the published pack must not shrink"
+        );
+    }
+
+    #[test]
+    fn fresh_rebuilds_after_a_corrupt_manifest() {
+        // #1110 gap 5: a corrupt manifest.json fails a normal rebuild (it
+        // must not reset generation to 0), and `--fresh` is the recovery —
+        // it discards the build dir and harvests again.
+        let home = tempfile::tempdir().unwrap();
+        e2e_env(home.path());
+        let args: Vec<String> = vec!["e2e".to_string()];
+        assert_eq!(run_build_inner(&args, home.path()).unwrap(), 0);
+        let manifest_path = home.path().join("builds/e2e/pack/e2e/manifest.json");
+        std::fs::write(&manifest_path, "{truncated").unwrap();
+
+        let err = run_build_inner(&args, home.path()).unwrap_err().to_string();
+        assert!(err.contains("corrupt previous manifest"), "{err}");
+        // the failed rebuild must not have replaced the torn manifest with
+        // a generation-1 success
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), b"{truncated");
+
+        let fresh: Vec<String> = vec!["e2e".into(), "--fresh".into()];
+        assert_eq!(run_build_inner(&fresh, home.path()).unwrap(), 0);
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["generation"], json!(1));
+        assert_eq!(manifest["counts"]["records"], json!(2));
+        assert_eq!(read_records(manifest_path.parent().unwrap()).len(), 2);
     }
 
     // ── end to end: a git source, watermark-skipped on the second run ─────

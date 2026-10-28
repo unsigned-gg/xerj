@@ -34,6 +34,12 @@ const MARKERS: &[&str] = &[
     "reqwest::blocking::Client",
     "reqwest::get(",
     "reqwest::blocking::get(",
+    // #2379: the local-node clients are built in `node_http_builder` /
+    // `node_blocking_builder`. Callers (`xerj mcp`, `xerj batch-search`,
+    // `xerj code`) no longer spell `reqwest::Client` themselves, and they
+    // still open that connection.
+    "node_http_builder(",
+    "node_blocking_builder(",
     "hf_hub::",
     "ureq::",
     "TcpStream::connect",
@@ -80,9 +86,36 @@ const KNOWN: &[(&str, Role)] = &[
         Role::Node("**Cluster transport**"),
     ),
     ("xerj-mcp/src/lib.rs", Role::Client("`xerj mcp`")),
+    // Batch retrieval uses the same operator-selected node URL and auth as
+    // `xerj mcp` (localhost:9200 by default). It sends queries to /_msearch
+    // and optionally reads mappings; it adds no node-side egress path.
+    (
+        "xerj-mcp/src/batch_cli.rs",
+        Role::Client("`xerj batch-search`"),
+    ),
     (
         "xerj-autoindex/src/esclient.rs",
         Role::Client("`xerj autoindex`"),
+    ),
+    // #2181: when `xerj code` / `xerj corpus list` find an empty ledger they
+    // POST one catalog search to the node URL those commands already use
+    // (`--url`, `XERJ_URL`, else localhost:9200). The body is a fixed
+    // `doc_kind: run` prefix query; the API key goes only when one is
+    // configured. No document text and no user query leave, and the peer is
+    // the operator's own node, so DATA_EGRESS and the air-gapped rows do
+    // not change.
+    ("xerj-autoindex/src/xc.rs", Role::Client("`xerj code`")),
+    // #2345: after a successful `xerj search` or MCP `xerj_search`,
+    // staleness.rs POSTs one catalog search to the node URL that search
+    // already used (`--url`, `XERJ_URL`, else localhost:9200). The body is a
+    // `doc_kind: run` prefix query, and a `doc_kind: file` query only when a
+    // directory mtime says something was removed. The API key goes only when
+    // one is configured. No document text and no user query leave, and the
+    // peer is the operator's own node, so DATA_EGRESS and the air-gapped
+    // rows do not change.
+    (
+        "xerj-autoindex/src/staleness.rs",
+        Role::Client("`xerj search`"),
     ),
     (
         "xerj-autoindex/src/feedback.rs",
@@ -139,10 +172,48 @@ const KNOWN: &[(&str, Role)] = &[
     // accept loop on drop, label_http_tests.rs is a #[cfg(test)] module.
     ("xerj-autoindex/src/label.rs", Role::TestOnly),
     ("xerj-autoindex/src/label_http_tests.rs", Role::TestOnly),
+    // #2222's finalize-verify deletion test: production verify talks to the
+    // node through the shared Es client (esclient.rs, already classified as
+    // `xerj autoindex`). The only `TcpStream::connect` is inside `#[cfg(test)]`,
+    // a connect to that test's own `127.0.0.1` listener so a parked `accept`
+    // wakes after the index is "deleted". Nothing in this file is a node or
+    // client path, so the published list, DATA_EGRESS and the air-gapped
+    // recipe stay as they are.
+    ("xerj-autoindex/src/sync_executor.rs", Role::TestOnly),
     // #1055's xerj_map module: the tool itself reuses the proxy's shared
     // client (xerj-mcp/src/lib.rs, already classified); only its unit tests
     // construct one, to point at an unroutable address.
     ("xerj-mcp/src/map.rs", Role::TestOnly),
+    // Corpus Hub v2 (discussion #1374): `xerj hub …` and `xerj code --def` are
+    // command-line clients in the same binary; both run and exit before the
+    // server starts (xerj-server/src/main.rs), so a default node opens none of
+    // these. catalogue.rs and cli.rs's `fetch_to` are `xerj hub pull`'s two
+    // read-only fetches (signed catalogue + sig, then the one pack + sig) from
+    // XERJ_HUB_URL, default https://hub.xerj.org: records travel IN, and no
+    // document text, query text or credential goes up, so — as with `xerj
+    // corpus build` — DATA_EGRESS and the air-gapped rows do not change.
+    // node.rs's HubNode is the node-URL client (`--url`, XERJ_URL, else
+    // localhost:9200) behind `build-pack`, `pull` and `code --def`.
+    // NOT covered here: the hosted-answer client of plan §5-§6
+    // (docs/CORPUS_HUB_V2_IMPLEMENTATION.md). It sends the user's question to
+    // the hub, so it needs its own published row, DATA_EGRESS sentence and
+    // air-gapped row — even if it reuses HubNode, which this file-level scan
+    // cannot tell apart from a call to a local node.
+    ("xerj-hub/src/catalogue.rs", Role::Client("`xerj hub pull`")),
+    ("xerj-hub/src/cli.rs", Role::Client("`xerj hub pull`")),
+    ("xerj-hub/src/node.rs", Role::Client("`xerj hub`")),
+    // Agent corpus reviews (#1886): feedback.rs POSTs one structured review
+    // to XERJ_CORPUS_FEEDBACK_URL, default https://hub.xerj.org/api/corpus-feedback,
+    // automatically after `xerj hub pull` and the MCP hub tools, and on demand
+    // from `xerj hub feedback` / `xerj_corpus_feedback`. Unlike `xerj hub pull`
+    // this sends data UP (scores, corpus slug, agent family, a query shape with
+    // every non-template word replaced, a random install id; never query text
+    // or document text), so it has its own published row and air-gapped row.
+    // It is a client path, not the node's, so DATA_EGRESS does not change.
+    (
+        "xerj-hub/src/feedback.rs",
+        Role::Client("`xerj hub feedback`"),
+    ),
 ];
 
 /// Phrasings that were false and must not come back on a published surface.

@@ -23,7 +23,7 @@ Every statement below points at the code that makes it true:
 |---|---|
 | Pipeline orchestration, `corpus build` CLI | `engine/crates/xerj-autoindex/src/harvest/mod.rs` |
 | Recipe parsing + strict validation | `engine/crates/xerj-autoindex/src/harvest/recipe.rs` |
-| Source adapters (`dir`, `http-zip`, `git`) | `engine/crates/xerj-autoindex/src/harvest/source.rs` |
+| Source adapters (`dir`, `http-zip`, `http-json`, `git`) | `engine/crates/xerj-autoindex/src/harvest/source.rs` |
 | Input-format normalisation (`osv`, `rustsec-md`, `flat`) | `engine/crates/xerj-autoindex/src/harvest/normalize.rs` |
 | Content-addressed store (presence = dedup) | `engine/crates/xerj-autoindex/src/harvest/store.rs` |
 | Union-find identity resolution | `engine/crates/xerj-autoindex/src/harvest/identity.rs` |
@@ -32,7 +32,7 @@ Every statement below points at the code that makes it true:
 | ed25519 keygen / sign / verify | `engine/crates/xerj-autoindex/src/harvest/sign.rs` |
 | `corpus add --from <pack>` + `--verify-sig` | `engine/crates/xerj-autoindex/src/xc.rs` |
 | Claims pinned to a measured build | `engine/crates/xerj-autoindex/tests/pack_claims.rs` |
-| Showcase recipe + stats | `tools/packs/rust-vulns/` |
+| Showcase recipes + stats | `tools/packs/rust-vulns/`, `tools/packs/cisa-kev/` |
 | Scheduled build/sign/publish | `.github/workflows/pack-publish.yml` |
 
 ## Quick start
@@ -54,10 +54,11 @@ xerj corpus add rust-vulns --from ~/.xerj-code/builds/rust-vulns/pack/rust-vulns
 A recipe is a commented TOML file — licence reasoning belongs in comments, and
 the recipe ships verbatim inside the pack as provenance. Sections:
 
-- `[[sources]]` — `slug`, `kind` (`dir` | `http-zip` | `git`), `url`/`path`,
-  `format` (the normalisation adapter), `licence`, optional `glob` and
-  watermark. Sources are advisory-listed upstream trees, HTTP zip exports, or
-  git repos fetched shallow at a pinned ref.
+- `[[sources]]` — `slug`, `kind` (`dir` | `http-zip` | `http-json` | `git`),
+  `url`/`path`, `format` (the normalisation adapter), `licence`, optional
+  `glob`, `records_field` (to unwrap a top-level JSON object's array field), and
+  watermark. Sources are advisory-listed upstream trees, HTTP zip exports,
+  single-URL JSON feeds, or git repos fetched shallow at a pinned ref.
 - `[envelope]` — which normalised fields become the universal envelope:
   `id_from`, `title_from`, `body_join`, `defs_from`. `defs` (space-joined
   symbol paths) is what feeds `xerj code`'s definition search.
@@ -85,7 +86,14 @@ There is no `--sync` mode to get wrong. Every normalised record is stored at
 sees the file, and skips. Only genuinely new or changed records are written,
 and the pack is re-emitted deterministically (fixed shard count, records
 ordered by id, a uniform key set on every record) from whatever the store
-holds. `--fresh` discards the build state for a full re-harvest.
+holds. `--fresh` discards the build state for a full re-harvest. A `dir`
+source whose path is missing, is not a directory, or cannot be listed fails
+the build and does not prune envelopes already stored for that slug; an
+existing empty directory is still a real empty upstream and does prune.
+A previous `manifest.json` that is not valid JSON, or that has no integer
+`generation`, fails the same way — `--fresh` is the recovery. Records whose
+`id` is empty or not a string are refused rather than shipped under one
+collapsed id.
 
 Build state lives under `~/.xerj-code/builds/<name>/` (override the root with
 `XERJ_CODE_HOME`) — persistent across reboots, never under `/tmp`.
@@ -167,6 +175,45 @@ exactly as it does to a user's reference corpora.
 Publishing your own pack needs none of this — a pack directory is
 self-contained, and `corpus add --from <dir|zip>` is the whole install. The
 release machinery exists because *our* pack promises freshness.
+
+## Fresh-machine portability (2026-10-23)
+
+Checked on one Linux x86_64 host with the published `xerj v1.0.0-rc.98`
+tarball (`xerj-1.0.0-rc.98-x86_64-unknown-linux-gnu.tar.gz`, `sha256sum -c`
+against the release `.sha256` exited 0) and the public pack release
+`pack-rust-vulns-2026-10-22`. This was not a build of the tree that produced
+the pack.
+
+- Loose `rust-vulns-SHA256SUMS` was byte-identical to `SHA256SUMS` inside
+  `rust-vulns-pack.zip`. `sha256sum -c` on that file exited 0 (every named
+  file printed `OK`).
+- The public key fetched from
+  `https://raw.githubusercontent.com/xerj-org/xerj/main/tools/packs/keys/rust-vulns.pub`
+  matched `tools/packs/keys/rust-vulns.pub` in this checkout.
+- `xerj corpus add rust-vulns --from rust-vulns-pack.zip --verify-sig rust-vulns.pub`
+  printed `signature verified` and exited 0. It reported 1297 `rustsec`
+  records and 748 `osv` records, 2045 in total, pack generation 1. The same
+  2045 is the count in that release's `rust-vulns-freshness.json` (`2045
+  advisories, built 2026-10-22, gen 1`).
+- A public key with one flipped nibble: `corpus add` exited 2 with
+  `signature does not verify`, and the corpus directory stayed empty.
+  Running `corpus index` after that refusal (exit status discarded) exited 2
+  with `no corpus` and still wrote nothing.
+- A zip whose `records-00000.jsonl` had one byte flipped, checksums not
+  rewritten: `corpus add --verify-sig` exited 2 with `checksum mismatch` and
+  wrote nothing.
+- Against `xerj --insecure --port 19200`, `xerj corpus index rust-vulns`
+  exited 0. The `xerj-done` line was `ok=true exit=0 reason=completed
+  wall=6.9s files=2 records=2045 generation=1`.
+- `xerj code rust-vulns "smallvec insert_many buffer overflow" --url
+  http://127.0.0.1:19200` exited 0. The top passage was the RustSec record
+  titled "Buffer overflow in SmallVec::insert_many" (score 27.50). The hit
+  was labelled `line unknown`.
+
+`cisa-kev` was not part of this run. `gh release list -R xerj-org/xerj -L 200`
+on 2026-10-23 returned no tag containing `cisa` or `kev`, and
+`tools/packs/cisa-kev/README.md` says that pack is not published or signed.
+There is no public URL to download, checksum, or query.
 
 ## Honest limits
 

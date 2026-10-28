@@ -110,6 +110,11 @@ landing/resources/xerj-sales-kit.zip
 # Re-include root OSS scaffolding so the default *.md / no-extension
 # ignore above does not swallow the standard public-repo files.
 !README.md
+!/README.zh-CN.md
+!/README.ja-JP.md
+!/README.ar.md
+!/README.es.md
+!/README.ko.md
 !CLA.md
 !LICENSE
 !LICENSE.md
@@ -131,6 +136,11 @@ landing/resources/xerj-sales-kit.zip
 # documented everywhere and shipped nowhere).
 !tools/**/*.md
 
+# Re-include the DeepSeek Harness bundle readme. The blanket *.md rule
+# above would drop dsh/README.md on `git add`, and the catalog lists the
+# committed file.
+!dsh/**/*.md
+
 # Re-include the public .github community files. The blanket *.md rule above
 # silently swallowed these: no pull-request template has ever existed in this
 # repo's history because `git add` refused it without anyone noticing, while
@@ -141,8 +151,6 @@ landing/resources/xerj-sales-kit.zip
 
 # Transient demo-capture artifacts (local paths + ephemeral tokens)
 demo/screenshots/manifest.json
-demo/.flow-data/
-demo/.flow-chrome/
 
 # Local ES 8.13.4 reference node for fair benchmarking (never committed)
 .es-local/
@@ -191,3 +199,6 @@ __pycache__/
 # in site generation or in any CI gate, and its only output was
 # .dogfood/seo/evidence/, so it follows the captures out of the tree.
 scripts/seo/evidence/
+
+# MCP Registry bundle build output (deploy/mcp-registry/build-mcpb.py)
+/dist/

@@ -55,6 +55,9 @@ pub struct ShardRouter {
     routing_table: HashMap<(String, u32), String>,
     /// `(index_name, shard_id)` → list of replica node IDs (excluding primary)
     replica_table: HashMap<(String, u32), Vec<String>>,
+    /// Replicas a read or a later copy may use. Absent means every placed
+    /// replica is in sync. Present, including empty, replaces that list.
+    in_sync: HashMap<(String, u32), Vec<String>>,
 }
 
 impl ShardRouter {
@@ -65,12 +68,28 @@ impl ShardRouter {
             num_shards,
             routing_table: HashMap::new(),
             replica_table: HashMap::new(),
+            in_sync: HashMap::new(),
         }
     }
 
     /// The configured number of virtual shards.
     pub fn num_shards(&self) -> u32 {
         self.num_shards
+    }
+
+    /// Widen or set the hash width. `route_doc` uses this for every index,
+    /// so a plan that assigns shard `n` must set the width to at least `n + 1`
+    /// or that shard is unreachable.
+    pub fn set_num_shards(&mut self, num_shards: u32) {
+        assert!(num_shards > 0, "num_shards must be > 0");
+        self.num_shards = num_shards;
+    }
+
+    /// Drop every primary and replica row for `index`.
+    pub fn clear_index(&mut self, index: &str) {
+        self.routing_table.retain(|(idx, _), _| idx != index);
+        self.replica_table.retain(|(idx, _), _| idx != index);
+        self.in_sync.retain(|(idx, _), _| idx != index);
     }
 
     /// Route a document to its shard and owning node.
@@ -111,6 +130,8 @@ impl ShardRouter {
     /// index assignments.
     pub fn update_from_metadata(&mut self, metadata: &ClusterMetadata) {
         self.routing_table.clear();
+        self.replica_table.clear();
+        self.in_sync.clear();
         let mut max_shards: u32 = 0;
         for ((index, shard), node_id) in &metadata.shard_assignments {
             self.routing_table
@@ -135,19 +156,63 @@ impl ShardRouter {
     /// The replica list is separate from the primary routing table — a node can
     /// be added here without changing which node is the primary owner.
     pub fn add_replica(&mut self, index: &str, shard: u32, node_id: &str) {
-        self.replica_table
+        let replicas = self
+            .replica_table
             .entry((index.to_string(), shard))
-            .or_default()
-            .push(node_id.to_string());
+            .or_default();
+        if !replicas.iter().any(|id| id == node_id) {
+            replicas.push(node_id.to_string());
+        }
     }
 
-    /// Return all replica node IDs for a shard, **excluding the primary owner**.
+    /// Primary shard ids of `index` owned by `node_id`, sorted.
+    pub fn shards_owned_by(&self, index: &str, node_id: &str) -> Vec<u32> {
+        let mut shards: Vec<u32> = self
+            .routing_table
+            .iter()
+            .filter(|((idx, _), owner)| idx == index && owner.as_str() == node_id)
+            .map(|((_, shard), _)| *shard)
+            .collect();
+        shards.sort_unstable();
+        shards
+    }
+
+    /// Shard ids of `index` for which `node_id` is a replica, sorted.
+    pub fn replica_shards_for(&self, index: &str, node_id: &str) -> Vec<u32> {
+        let mut shards: Vec<u32> = self
+            .replica_table
+            .iter()
+            .filter(|((idx, _), replicas)| idx == index && replicas.iter().any(|id| id == node_id))
+            .map(|((_, shard), _)| *shard)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+    }
+
+    /// Primary node id for one shard, when the plan names one.
+    pub fn primary_node(&self, index: &str, shard: u32) -> Option<String> {
+        self.routing_table.get(&(index.to_string(), shard)).cloned()
+    }
+
+    /// Replica node ids a read or a copy uses, excluding the primary.
     ///
-    /// Used by [`WalReplicator`] to determine which nodes need to receive a
-    /// copy of each WAL entry.
-    ///
-    /// [`WalReplicator`]: crate::replication::WalReplicator
+    /// This is the in-sync set when one has been published, and otherwise
+    /// every replica placed at create.
     pub fn get_replicas(&self, index: &str, shard: u32) -> Vec<String> {
+        let key = (index.to_string(), shard);
+        if let Some(nodes) = self.in_sync.get(&key) {
+            return nodes.clone();
+        }
+        self.placed_replicas(index, shard)
+    }
+
+    /// Replicas named when the index was created, excluding the primary.
+    ///
+    /// The quorum is computed from this count. A later in-sync shrink does
+    /// not change it: losing replicas does not lower the bar to the primary
+    /// alone.
+    pub fn placed_replicas(&self, index: &str, shard: u32) -> Vec<String> {
         let key = (index.to_string(), shard);
         let primary = self.routing_table.get(&key);
 
@@ -161,6 +226,26 @@ impl ShardRouter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Publish the replicas that confirmed the last acknowledged write.
+    ///
+    /// Ids that are not placed replicas of this shard are dropped. A shard
+    /// with no placed replicas is left unchanged, so a command that arrives
+    /// before the plan does not install an empty overlay.
+    pub fn set_in_sync(&mut self, index: &str, shard: u32, nodes: &[String]) {
+        let placed = self.placed_replicas(index, shard);
+        if placed.is_empty() {
+            return;
+        }
+        let mut kept: Vec<String> = nodes
+            .iter()
+            .filter(|id| placed.iter().any(|placed_id| placed_id == *id))
+            .cloned()
+            .collect();
+        kept.sort();
+        kept.dedup();
+        self.in_sync.insert((index.to_string(), shard), kept);
     }
 }
 
@@ -355,5 +440,27 @@ mod tests {
             saw_node_a && saw_node_b,
             "both shards should be reachable after refresh (a={saw_node_a}, b={saw_node_b})"
         );
+    }
+
+    #[test]
+    fn in_sync_replaces_the_read_list_and_leaves_placement_alone() {
+        let mut router = ShardRouter::new(1);
+        router.assign("orders", 0, "n1");
+        router.add_replica("orders", 0, "n2");
+        router.add_replica("orders", 0, "n3");
+        assert_eq!(
+            router.get_replicas("orders", 0),
+            vec!["n2".to_string(), "n3".to_string()]
+        );
+
+        router.set_in_sync("orders", 0, &["n3".into(), "n1".into(), "n3".into()]);
+        assert_eq!(router.get_replicas("orders", 0), vec!["n3".to_string()]);
+        assert_eq!(
+            router.placed_replicas("orders", 0),
+            vec!["n2".to_string(), "n3".to_string()]
+        );
+
+        router.set_in_sync("missing", 0, &["n2".into()]);
+        assert!(router.get_replicas("missing", 0).is_empty());
     }
 }

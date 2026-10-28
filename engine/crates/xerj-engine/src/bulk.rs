@@ -402,6 +402,50 @@ pub struct BulkOpts {
     pub default_pipeline: Option<String>,
 }
 
+/// The action named by the first key of a bulk action line, without parsing
+/// the line. Anything unrecognised reads as `index`, the renderer's default.
+fn action_line_kind(line: &str) -> &'static str {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let Some(rest) = rest.strip_prefix('{') else {
+        return "index";
+    };
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let Some(rest) = rest.strip_prefix('"') else {
+        return "index";
+    };
+    match rest.split('"').next() {
+        Some("create") => "create",
+        Some("update") => "update",
+        Some("delete") => "delete",
+        _ => "index",
+    }
+}
+
+/// One refusal item per paired action, in body order (#2427). Used when the
+/// whole request is refused before its parse: a single summary item would
+/// not match the body's action count, and the autoindex client (like any
+/// client re-offering 429 items by position) could not map it back.
+fn refuse_every_action(
+    pairs: &[(usize, &str, Option<&str>, usize)],
+    default_index: Option<&str>,
+    error: &EngineError,
+) -> Vec<BulkItemResult> {
+    let status = engine_error_http_status(error);
+    let reason = error.to_string();
+    pairs
+        .iter()
+        .map(|(_, action_line, _, _)| BulkItemResult {
+            action: action_line_kind(action_line).to_string(),
+            index: default_index.unwrap_or("").to_string(),
+            id: String::new(),
+            status,
+            result: None,
+            error: Some(reason.clone()),
+            get_source: None,
+        })
+        .collect()
+}
+
 pub async fn process_bulk_with_opts(
     engine: &Engine,
     default_index: Option<&str>,
@@ -548,6 +592,31 @@ pub async fn process_bulk_with_opts(
         pairs.push((i, action_line, doc_line, item_index));
         i += advance;
     }
+
+    // #2427: memory admission for the whole request BEFORE the parse.
+    // The write paths below check the breaker only after the parse has built
+    // a document copy (and, for update/create, a parsed `Value`) per action,
+    // so a bulk admitted on a stale sample, or while a latch was engaged,
+    // allocated all of that first. `lines` and `pairs` borrow the body and
+    // cost a few words per action. Refuse here with one 429 per action (the
+    // client re-offers 429 items by position, so the count must match the
+    // body), or count the body against live RSS until the parse ends.
+    let parse_reservation = match crate::governor::global() {
+        Some(g) => match g.admit_bulk_parse(body.len() as u64) {
+            Ok(reservation) => Some(reservation),
+            Err(e) => {
+                // The refusal frees nothing by itself; ask for the drain on
+                // this 429 like `Index::governor_write_gate` (#2321).
+                crate::engine::request_memory_pressure_drain();
+                return BulkResult {
+                    took_ms: started.elapsed().as_millis() as u64,
+                    errors: true,
+                    items: refuse_every_action(&pairs, default_index, &EngineError::Common(e)),
+                };
+            }
+        },
+        None => None,
+    };
 
     // Step 2: parallel parse.  Each tuple yields either a
     // `ParsedAction` or an `ErrItem`.  The order of the output
@@ -906,6 +975,31 @@ pub async fn process_bulk_with_opts(
                             );
                         }
                     };
+                    // One document over the fixed ceiling is refused before
+                    // `IgnoredAny`, `Value`, or tokenization. `Token` owns a
+                    // `String` per word, and `panic = "abort"` dies on that
+                    // allocation before the RSS governor samples (#1122).
+                    // 413, not 429:
+                    // the item is settled. Neighbours in the same bulk still
+                    // index. A lone 413 is not the whole-request action-count
+                    // refusal (`is_whole_request_too_large` requires more than
+                    // one sent action).
+                    if xerj_common::document_limit::indexed_document_too_large(dl.len()) {
+                        return ParseOutcome::Err(
+                            BulkItemResult {
+                                action: action_type.to_string(),
+                                index: target_index,
+                                id: doc_id.unwrap_or_default(),
+                                status: 413,
+                                result: None,
+                                error: Some(xerj_common::document_limit::indexed_document_refusal(
+                                    dl.len(),
+                                )),
+                                get_source: None,
+                            },
+                            *item_index,
+                        );
+                    }
                     // M5.11 — SKIP the doc-body JSON parse for `index`
                     // actions.  The turbo-raw ingest path accepts the raw
                     // NDJSON bytes and defers the parse to drain-for-flush
@@ -1094,6 +1188,9 @@ pub async fn process_bulk_with_opts(
     });
 
     let parse_ms = t_parse.elapsed().as_millis() as u64;
+    // The parse buffers now exist and are visible to the RSS sampler; each
+    // write path takes its own analyze reservation for the token spike.
+    drop(parse_reservation);
     let t_group = std::time::Instant::now();
     let mut parsed: Vec<ParsedAction> = Vec::with_capacity(parse_results.len());
     for outcome in parse_results {
@@ -1177,10 +1274,10 @@ pub async fn process_bulk_with_opts(
     // the write index via `is_write_index:true` in the alias metadata.
     let url_require_alias = opts.require_alias.unwrap_or(false);
     let default_source_req = opts.default_source_req.clone();
-    parsed.retain(|action| {
+    parsed.retain_mut(|action| {
         let eff_require_alias = action.require_alias.unwrap_or(url_require_alias);
-        let target = &action.target_index;
-        let is_alias = engine.aliases.contains_key(target);
+        let target = action.target_index.clone();
+        let is_alias = engine.aliases.contains_key(&target);
         if eff_require_alias && !is_alias {
             items[action.item_index] = Some(BulkItemResult {
                 action: action.action_type.clone(),
@@ -1191,43 +1288,32 @@ pub async fn process_bulk_with_opts(
                 error: Some(format!(
                     "no such index [{target}] and [require_alias] request flag is [true] and [{target}] is not an alias"
                 )),
-                            get_source: None,
+                get_source: None,
             });
             errors = true;
             return false;
         }
         if is_alias {
-            if let Some(backings) = engine.aliases.get(target) {
-                if backings.len() > 1 {
-                    // Look up per-backing is_write_index in alias metadata.
-                    // The metadata map is keyed by backing index name and
-                    // stores `{alias: {is_write_index: true, ...}, ...}`.
-                    let has_write_target = backings.iter().any(|backing| {
-                        engine
-                            .index_alias_metadata
-                            .get(backing)
-                            .and_then(|v| {
-                                v.get(target).and_then(|meta| {
-                                    meta.get("is_write_index").and_then(Value::as_bool)
-                                })
-                            })
-                            .unwrap_or(false)
+            // One write-target definition for every write path: a single
+            // backing index or exactly one `is_write_index:true`. The old code
+            // only checked that SOME write index existed and then left the
+            // target as the alias, so `get_or_create_index` wrote to the FIRST
+            // backing index and ignored the designation.
+            match engine.write_target(&target) {
+                Ok(Some(concrete)) => action.target_index = concrete,
+                Ok(None) => {}
+                Err(reason) => {
+                    items[action.item_index] = Some(BulkItemResult {
+                        action: action.action_type.clone(),
+                        index: target.clone(),
+                        id: action.doc_id.clone().unwrap_or_default(),
+                        status: 400,
+                        result: None,
+                        error: Some(reason),
+                        get_source: None,
                     });
-                    if !has_write_target {
-                        items[action.item_index] = Some(BulkItemResult {
-                            action: action.action_type.clone(),
-                            index: target.clone(),
-                            id: action.doc_id.clone().unwrap_or_default(),
-                            status: 400,
-                            result: None,
-                            error: Some(format!(
-                                "no write index is defined for alias [{target}]. The write index may be explicitly disabled using is_write_index=false or the alias points to multiple indices without one being designated as a write index"
-                            )),
-                                                    get_source: None,
-                        });
-                        errors = true;
-                        return false;
-                    }
+                    errors = true;
+                    return false;
                 }
             }
         }
@@ -1350,7 +1436,12 @@ pub async fn process_bulk_with_opts(
                 });
                 mapping_has_semantic_text(&props.unwrap_or(Value::Null))
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // The index does not exist yet. A matching template's
+            // `semantic_text` is applied by the auto-create this batch is
+            // about to do; classifying from the absent mapping sent the
+            // first write down the turbo path, which never embeds (#2281).
+            || engine.absent_index_template_has_semantic_text(target);
         cache.insert(target.to_string(), has);
         has
     };
@@ -3738,5 +3829,45 @@ mod lone_surrogate_tests {
         let index = engine.get_index(name).unwrap();
         index.refresh().await.unwrap();
         assert_eq!(index.live_doc_count(), (TOTAL - bad_positions.len()) as u64);
+    }
+}
+
+#[cfg(test)]
+mod parse_admission_tests {
+    use super::*;
+
+    #[test]
+    fn action_line_kind_reads_the_first_key_without_parsing() {
+        assert_eq!(action_line_kind(r#"{"index":{"_index":"a"}}"#), "index");
+        assert_eq!(action_line_kind(r#" { "create":{}}"#), "create");
+        assert_eq!(action_line_kind(r#"{"update":{"_id":"1"}}"#), "update");
+        assert_eq!(action_line_kind(r#"{"delete":{"_id":"1"}}"#), "delete");
+        assert_eq!(action_line_kind("not json"), "index");
+    }
+
+    /// #2427: a request refused before its parse answers one 429 per action,
+    /// in body order, so a client re-offering 429 items by position can map
+    /// every item back onto the body it sent.
+    #[test]
+    fn a_refused_bulk_answers_one_429_per_action() {
+        let pairs: Vec<(usize, &str, Option<&str>, usize)> = vec![
+            (0, r#"{"index":{}}"#, Some(r#"{"a":1}"#), 0),
+            (2, r#"{"delete":{"_id":"x"}}"#, None, 1),
+            (3, r#"{"update":{"_id":"y"}}"#, Some(r#"{"doc":{}}"#), 2),
+        ];
+        let error = EngineError::Common(xerj_common::XerjError::circuit_breaking(
+            "[parent] real memory circuit breaker tripped",
+        ));
+        let items = refuse_every_action(&pairs, Some("logs"), &error);
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items.iter().map(|i| i.action.as_str()).collect::<Vec<_>>(),
+            ["index", "delete", "update"]
+        );
+        for item in &items {
+            assert_eq!(item.status, 429);
+            assert_eq!(item.index, "logs");
+            assert!(item.error.as_deref().unwrap().contains("circuit breaker"));
+        }
     }
 }

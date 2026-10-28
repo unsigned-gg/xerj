@@ -14,6 +14,39 @@ repository root is always the invocation.
 
 ---
 
+The dependency-free playground state regressions run the committed browser
+bundle with controlled browser state: `node --test scripts/landing/test_*.cjs`
+(Node 22, also run by the SEO job). To regenerate the playground bundle, run
+`esbuild playground/src/app.js --bundle --outfile=playground/app.bundle.js`
+from `landing/`. Custom dashboards inherit their template's data and render
+functions while keeping their own layout overrides. Clones can themselves be
+cloned; missing or cyclic template references produce the blank fallback.
+
+The shared marketing-page copy controls in `landing/interact.js` display
+`COPIED` only after the clipboard API or legacy copy command succeeds. A denied
+copy displays `COPY FAILED`; visitors can retry or select the command manually.
+The temporary feedback restores the original button label. Run the interaction
+regressions with `node --test scripts/landing/test_interact.cjs` (Node 18+; no
+packages are required).
+
+Dependency-free landing interaction tests run with
+`node --test scripts/landing/test_*.cjs` (Node 22) in the SEO job. Playground
+PNG export snapshots computed SVG paint styles before rasterization, since a
+detached SVG image cannot inherit the page stylesheet or its custom properties.
+For the real-browser pixel check, serve the repository root with
+`python3 -m http.server 8857 --bind 127.0.0.1`, open
+`http://127.0.0.1:8857/scripts/landing/png_export_fixture.html`, and click the
+export button. The live query stroke and exported PNG must retain the yellow
+crosshair (nonzero yellow pixels and a crosshair pixel distinct from the white
+background). The click downloads one PNG for inspection. This is a static
+fixture; it does not run XERJ or contact external services.
+Regenerate its committed bundle from `landing/` using
+`esbuild playground/src/app.js --bundle --outfile=playground/app.bundle.js`.
+
+Playground saved views restore the saved time range, cluster and filters;
+custom views also save their FROM/TO endpoints. Legacy saved views without
+endpoints retain the current custom endpoints.
+
 ## 1. Architecture
 
 ```
@@ -23,8 +56,9 @@ content/compare/<slug>.md   ─┤                      ├─> landing/answers/
 scripts/seo/pagedata.py     ─┤                      ├─> landing/answers/index.json    (hub search index)
 scripts/seo/urlmap.py       ─┘                      └─> a spliced block in landing/llms.txt
 
-landing/**/*.html  ── fix_heads.py ──> the <!-- seo:begin --> … <!-- seo:end --> block in every <head>
+landing/**/*.html  ── fix_heads.py ──> the <!-- seo:begin --> … <!-- seo:end --> block in every <head>, and the GA4 snippet at the top of <head>
 landing/**/*.html  ── fix_links.py ──> every internal <a href>, plus the site-map footer block
+landing/**/*.html  ── set_nav.py ───> the primary nav in every page
 landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 (brand tokens)     ── mk_og_card.py ──> landing/og/xerj-card.png
 ```
@@ -43,6 +77,8 @@ landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 | every internal `<a href>` in `landing/` | `fix_links.py` | write the href you mean; the pass rewrites it to the served form |
 | `landing/sitemap.xml` | `gen_sitemap.py` | it is derived from the filesystem and from git |
 | `landing/og/xerj-card.png` | `mk_og_card.py` | edit the rasteriser; the brand tokens come from `landing/style.css` |
+| the primary nav (`<nav class="nav">`) in every page, and in the `build_articles.py` templates | `set_nav.py` | edit `LEFT` / `RIGHT` in `set_nav.py`, then run it; `--check` verifies |
+| the `<a class="nav-stars">` GitHub stars badge in every primary nav (its fallback count) | `stars_badge.py` | run it to refresh the count from the GitHub API; `--check` verifies; `landing/theme.js` refreshes the number in the browser |
 
 Generated article pages and twins carry a first-line marker:
 
@@ -200,6 +236,14 @@ two spaces) or an inline `[a, b]`; nested map keys under a list item are
 | `noindex` | bool | `true` adds `robots: noindex` **and** removes the page from `sitemap.xml` (`urlmap.is_noindex` reads it) |
 | `agent_prompt` | string | one logical line, must contain `https://xerj.org/llms.txt`, must not contain a Markdown fence |
 | `commands` | list of `{cmd, note}` | `cmd` must shell-parse, and must start with `xerj` + a real subcommand (`autoindex mcp serve verify help version`) or a flag, or with an allowed shell primitive (`bash cd command curl env export git sh until wget`). No `<placeholders>` |
+| `answer` | string | **GEO.** 40–60 words, answer-first, restating the question; rendered in a "Short answer" card under the H1 and in the `.md` twin |
+| `key_fact` / `key_fact_source` / `key_fact_date` | strings, all three or none | **GEO.** One sentence with a number; source is an `https://` URL, a site path, a repo path that exists (rendered as a GitHub link), or the literal `capture` (the run this page documents); ISO date it was measured or checked |
+| `intent_group` | string | **GEO.** The agent-intent cluster (task column of the query research CSV); groups `llms.txt` and drives "same intent" related links |
+| `queries` | list of string | **GEO.** Literal queries from the research CSV the page targets (published in `index.json`); omit when none fits |
+| `structured_data` | list | opt-in JSON-LD: `faq` → `FAQPage`, `howto` → `HowTo` from `commands:` (≥ 2; command cards get `id="step-N"`), `software`. See trap 6 and lint rules 46/46b. No page sets it in this port |
+| `og_image` / `og_image_alt` | string | both or neither; must be `og/<category>-<slug>.png` and exist under `landing/` |
+| `last_checked` | string | ISO date every third-party fact was re-read (best-of pages) |
+| `items` | list of `{name, url, license, install}` | best-of pages: emitted as `ItemList` of `SoftwareApplication`; `url` must be `https://` |
 
 ### 3.2 `links_out` resolution
 
@@ -460,7 +504,13 @@ The file is a **derivation**, not a document:
   minus any article whose frontmatter sets `noindex: true`;
 * `<loc>` = `urlmap.deployed_url(file)` — absolute, https, extensionless,
   byte-identical to that page's canonical and `og:url`;
-* `<lastmod>` = `git log -1 --format=%cs -- <file>`;
+* `<lastmod>` = the page's content date (`DateSource.page_lastmod`): article
+  `updated:` front matter, else JSON-LD `dateModified`, else a `pagedata.py`
+  `updated`, else — on a full clone — the last commit that changed more than
+  shared chrome (`<head>`, the primary nav, the generated footer). A shallow
+  checkout keeps the `<lastmod>` already committed for that URL, and only a
+  URL missing from the file falls back to mtime. `git log -1` of the HTML
+  file is not the date: a sitewide head commit would stamp every URL today;
 * **no `<priority>`, no `<changefreq>`.** Google ignores both; Bing stated in
   July 2025 that both are ignored and influence nothing. Emitting them is noise;
 * **no non-HTML assets.** A `.txt` or `.json` URL produces no search result.
@@ -473,16 +523,40 @@ The file is a **derivation**, not a document:
 2. `<lastmod>` is the reason. Google uses `lastmod` only "if it's consistently
    and verifiably accurate", and the judgement is **sitewide**: one page whose
    `lastmod` drifts from reality teaches the crawler to ignore the field for
-   every page. Deriving it from `git log` makes it verifiable by construction.
-   The predecessor of this file was hand-maintained — 24 entries for an 80-page
-   site, 18 of which were URLs that 308-redirected rather than pages, four of
-   which were non-HTML assets, and all 24 carrying a `lastmod` that disagreed
-   with git. That is the failure this script exists to prevent.
+   every page. The date is the content date above, which is checkable from the
+   source front matter, the page's own `dateModified`, or `git log` of a
+   content change. The predecessor of this file was hand-maintained — 24
+   entries for an 80-page site, 18 of which were URLs that 308-redirected
+   rather than pages, four of which were non-HTML assets, and all 24 carrying
+   a `lastmod` that disagreed with git. That is the failure this script exists
+   to prevent.
 
-When git cannot answer (uncommitted file, shallow clone, no git), the tool falls
-back to the filesystem mtime and prints `WARNING: <lastmod> fell back to
-filesystem mtime` on stderr. In CI that warning means the checkout is wrong —
-see trap 3.
+When none of the content dates apply and git cannot answer (uncommitted file,
+shallow clone, no git), the tool keeps the `<lastmod>` already committed for
+that URL. Only a URL that is not in the file yet falls back to the filesystem
+mtime, and that prints `WARNING: <lastmod> fell back to filesystem mtime` on
+stderr. A shallow checkout no longer restamps the whole sitemap to today.
+
+### 5.1 Tell IndexNow after a production deploy
+
+IndexNow lets Bing, Yandex, Seznam, Naver and the other participating engines
+recrawl a changed URL at once instead of on their next sitemap read. It is a
+manual step, run from a checkout after the production deploy is live. No
+workflow runs it.
+
+```bash
+python3 scripts/seo/indexnow_ping.py                        # dry run: lists what it would send
+python3 scripts/seo/indexnow_ping.py --send                 # every <loc> in landing/sitemap.xml
+python3 scripts/seo/indexnow_ping.py --send https://xerj.org/product
+python3 scripts/seo/indexnow_ping.py --host hub.xerj.org --send   # reads the live hub sitemap
+```
+
+The key is public by design: the engine fetches `https://<host>/<key>.txt` and
+compares it with the key in the request. The file is
+`landing/e94e889e7bee019e40a7617324e7a20a.txt`, and the hub generator writes
+the same file into `tools/corpus-hub-site/out/`. Do not rename or delete it;
+a new key needs a new file live on the host first. Send only URLs that
+changed, and do not resend an unchanged sitemap on a schedule.
 
 ---
 
@@ -504,6 +578,7 @@ see trap 3.
 | `ste_check.py` | ASD-STE100 (Simplified Technical English) house-style reader, plus the article structure checks (H1, TL;DR, FAQ). **Advisory, not a gate** — see §7 | `--fail-on ERROR\|WARN\|INFO`, `--self-test`, `--show`, `--stats`, `--only`, `--skip` | Treat every tier as advice. Never reword a user-phrased H1 or FAQ question to satisfy it |
 | `claims_rules.py` | the fact-check rule corpus: each rule carries its evidence citation and a compliant rewrite | data | n/a |
 | `audit.py` | the full 12-family technical-SEO audit (thinness, duplication, click depth, page weight, image CLS, …). Also supplies the HTML parser that `seo_lint.py` uses, so the auditor and the gate cannot disagree | `--fail-on`, `--max-findings`, `--json`, `--report` | in CI it is **report-only** (`if: always()`), never blocking |
+| `indexnow_ping.py` | **manual, never CI**: sends changed URLs to IndexNow (Bing, Yandex, Seznam, Naver and others). The key file is `landing/<key>.txt`; the hub generator writes the same key into its `out/` | dry run by default; `--send`, `--host xerj.org\|hub.xerj.org`, `[URL ...]` | HTTP 403: the key file is not live on that host yet. 422: a URL is not on the host |
 | `verify_live.py` | **post-deploy, never CI**: fetches every `<loc>` in the *committed* sitemap from a live origin and checks a literal 200, a body that is not the homepage, and a canonical equal to the requested URL — plus one probe that a never-existing path answers 404 | `[base]`, `--jobs`, `--limit`, `--timeout`, `--json`, `--skip-not-found-probe` | the deploy does not match the tree. On a PR everything fails, which is why it is not a gate — see §7 |
 
 `scripts/seo/testdata/factcheck/*.md` is the fact-check regression suite: 21
@@ -539,6 +614,32 @@ touch `claims_rules.py` or `scripts/seo/testdata/`.
 
 ### The check that must NOT be a gate
 
+`verify_agent_discovery.py` checks the agent-discovery contract after deployment:
+
+```sh
+python3 scripts/seo/verify_agent_discovery.py
+python3 scripts/seo/verify_agent_discovery.py https://staging.example.com --json
+# Opt in only on a deployment expected to publish the public xerj skill:
+python3 scripts/seo/verify_agent_discovery.py --skills --json
+```
+
+The default checks five requests: homepage GET and HEAD, then the three fixed
+documentation targets from its discovery headers. It requires the relations
+on the final response, not just in 103 Early Hints; a target must return 200
+with the expected media type, and OpenAPI JSON must have a version and paths.
+`--skills` additionally checks the v0.2.0 index, the public `xerj` entry, CORS,
+and the exact-byte SHA-256 of its single-file artifact. It checks consistency,
+not authenticity, and does not validate other skills or activate instructions.
+
+Only fixed paths on the chosen origin are fetched. Redirects are reported,
+never followed; responses are capped at 1 MiB. Requests are direct HTTP(S),
+without proxy configuration, credentials or cookies. `--timeout` limits each
+socket operation (not total run time). Exit 0 means pass, 1 means a delivery
+or contract failure, and 2 means invalid CLI arguments. Wait for deployment
+propagation before treating a failure as a code defect. The tool reads no
+XERJ node or user corpus and changes no remote state. CI runs only its
+loopback fixtures: `python3 scripts/seo/test_verify_agent_discovery.py`.
+
 `verify_live.py` needs a deployment, so on a pull request every URL it asks for
 404s. Wiring it into `seo.yml` would make the merge gate fail on correct work,
 which is how gates get ignored. Run it **after** a deploy:
@@ -571,7 +672,7 @@ releases back, and three machine-readable schema files nothing linked to. It
 checks four things:
 
 1. **ES-YAML conformance figures** agree with the canonical `CONFORMANCE`
-   constant in the script (today `1366/1369`).
+   constant in the script (today `1444/1454`).
 2. **Version stamps** in the `XERJ.AI ·` footer brand line, and the
    `Current release:` line in `llms*.txt`, match the newest `v1.0.0-rc.*` git
    tag. It needs `fetch-depth: 0` for the tags.
@@ -615,37 +716,34 @@ to it.
 ### 2. `dateModified` comes from git, so the first commit is never the last one
 
 Since #974 an article's `dateModified` comes from its **required `updated:`
-frontmatter field** — author-controlled data, immune to the loop below. What
-still comes from `git log -1 --format=%cs -- <file>` (`urlmap.DateSource`) is
-the sitemap's `<lastmod>`, which dates the *generated* HTML file itself. That
-is deliberate: it is the condition Google states for trusting the field. It
-also means:
+frontmatter field** — author-controlled data, immune to the loop below. The
+sitemap's `<lastmod>` uses that same field for a generated article (then the
+page's JSON-LD `dateModified`, then a pinned `pagedata.py` date). It does
+**not** use `git log -1` of the generated HTML: a sitewide head commit, and a
+shallow checkout whose files all share today's mtime, stamped every URL with
+one day. `git log` is only the fallback for a hand-written page that publishes
+no date, and only for a commit that changed more than shared chrome. That
+also means a hand-written page with no pinned date still moves `<lastmod>`
+when you commit a body edit, because that commit is now the content change.
+Re-run `gen_sitemap.py --write` after the commit (and amend, or add a
+follow-up commit) so `--check` sees the same day. A generated article does
+not: its date is `updated:`, and regenerating the HTML does not change it.
 
-```
-edit source  ->  build (date = today's mtime fallback)  ->  commit
-             ->  the source's git date is now the commit date
-             ->  build again: the generated output changes
-             ->  commit again  ->  now it converges
-```
-
-**It converges in exactly one extra round.** The loop is: commit your work, then
-immediately re-run `build_articles.py --write` and `gen_sitemap.py --write`, and
-`--amend` (or add) the resulting diff. After that, re-running the generators
-produces a zero diff, because the second commit does not change the *source*
-file's date — only the generated file's, and the generated file's own date is
-not an input.
-
-The stderr warning `WARNING: <lastmod> fell back to filesystem mtime` is the
-signal that a file is not committed yet. It is expected locally on new work and
-is a bug in CI.
+The stderr warning `WARNING: <lastmod> fell back to filesystem mtime` means a
+URL had no in-file date, no usable git history, and no committed sitemap
+entry. It is expected for a brand-new untracked page and is a bug in CI if it
+fires for a page that is already in `sitemap.xml`.
 
 ### 3. CI needs `fetch-depth: 0`
 
-`actions/checkout` defaults to a shallow clone with no tags. On a shallow clone
-`git log -1 -- <file>` returns nothing for most files, every date degrades to the
-filesystem mtime, generated output no longer matches the committed output, and
-`fix_heads.py --check` fails — with an error that looks like a content problem
-and is not. `landing-constants-guard.sh` fails differently on the same cause: it
+`actions/checkout` defaults to a shallow clone with no tags. Sitemap
+`<lastmod>` does not require that full history for a page that carries
+`updated:` or `dateModified`: those dates are in the checkout. A page with
+neither keeps the `<lastmod>` already committed, so a shallow
+`gen_sitemap.py --check` does not restamp the file to today.
+`fix_heads.py` can still move a date that is computed from `git log` when the
+page has no pinned date and no JSON-LD date to keep, and
+`landing-constants-guard.sh` fails differently on the same cause: it
 resolves "newest released tag" through `git tag --list`, which a shallow checkout
 does not fetch. Both `seo.yml` and the `landing-constants-guard` job in `ci.yml`
 already set `fetch-depth: 0`. Any new workflow that touches this toolchain must
@@ -685,7 +783,21 @@ were removed outright. `aggregateRating`/`Review` would be invented — there is
 review corpus — which is a manual-action risk under Google's structured-data spam
 policies. The emitted set is: `Organization` + `WebSite` sitewide, one page-body
 type (`SoftwareApplication` / `CollectionPage` / `TechArticle` / `Article` /
-`WebPage`), and `BreadcrumbList` below the root. That is all.
+`WebPage`), and `BreadcrumbList` below the root. That is the default.
+
+**One opt-in exception (2026-10-19).** An article source may list
+`structured_data: [faq, howto, software]`. `seo_head.extra_structured_data` then
+adds `FAQPage` (from `faq:`), `HowTo` (from `commands:`, at least two) and a
+`SoftwareApplication` for the product. Since 2026-10-23 every article in
+`content/answers` and `content/compare` sets `structured_data: [faq]`, so
+those pages emit `FAQPage`. HowTo stays off. A best-of page
+can still emit an `ItemList` of the tools in its visible summary table, from
+`items:`, without that opt-in. Google shows no rich result for FAQ or HowTo,
+but answer engines and agents read the blocks as plain structured data when a
+page does opt in. `seo_lint` rule 46 lets the two types through only on a page
+that opted in, and rule 46b (`jsonld.faq_not_visible`) fails the page if a
+`FAQPage` question or answer is not visible in the page text. No
+`aggregateRating` / `Review`, ever.
 
 ### 7. JSON-LD needs no CSP change
 
@@ -696,6 +808,16 @@ data to a page can never require touching `landing/_headers`, and `seo_lint.py`
 rule 55 fails the build if anyone widens `script-src` on account of it. (The
 `'unsafe-inline'` already in the policy predates this work; it is something to
 remove later, not to build on.)
+
+The GA4 tag is the exception that is a script. `seo_head.ga4_snippet()` emits
+Google's standard async `gtag.js` snippet once, immediately after `<head>`, on
+every page (`fix_heads.py` for pages already on disk, `build_articles.py` for
+generated articles). Rule 55's allowlist includes `https://*.googletagmanager.com`
+for that tag and still fails any other `script-src` host. `landing/_headers`
+also allows `https://*.google-analytics.com` and `https://*.analytics.google.com`
+on `connect-src`, and the Analytics and Tag Manager hosts on `img-src`, so the
+tag's collect calls are not blocked. That set is Google's GA4 policy without
+Google Signals. It does not allow `google.com`, DoubleClick, or ads hosts.
 
 ### 8. When `factcheck.py` fires, fix the claim — never the wording
 

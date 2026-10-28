@@ -4,7 +4,9 @@
 //! codes as Latin-1. `pdf_oxide` resolves the object graph and font mappings
 //! before returning Unicode text. Each document runs in a fresh worker process
 //! so parser state or failure cannot contaminate the server. On Unix the worker
-//! also gets a process group and an address-space limit. This is crash/resource
+//! also gets a process group and, where the kernel accepts `RLIMIT_AS`, a
+//! 1536 MiB address-space cap. A kernel that rejects that cap (`EINVAL` /
+//! `EPERM`, as on macOS 27) still runs the worker. This is crash/resource
 //! isolation, not a security sandbox: the worker retains the user's authority.
 
 use super::{split_sections, ExtractStats, FieldOrigin, RawRecord, Sink};
@@ -455,7 +457,7 @@ impl ExtractionSpoolBudget {
         let _admission = self.admission.lock().unwrap();
         let previous_spools = self
             .spools
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
                 (spools < self.max_spools).then_some(spools + 1)
             })
             .map_err(|_| {
@@ -950,39 +952,64 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     set_worker_memory_limit(&mut command);
     let mut child = command.spawn().with_context(|| {
         format!(
-            "could not start the isolated PDF parser for {}; check process/resource limits",
+            "{} for {}; check process/resource limits",
+            crate::state::PDF_WORKER_START_FAILURE,
             path.display()
         )
     })?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    // Event-driven pipe EOF wakeup adapted from facebookexperimental/reverie
-    // (reverie-rpc-transport/src/mapped/workers.rs:66-103, BSD-2-Clause):
-    // wake the parent supervisor immediately on pipe closure instead of
-    // paying a blind 20ms sleep penalty on every fast PDF worker exit.
-    let eof_signal = Arc::new((Mutex::new(0usize), Condvar::new()));
-    let out_signal = Arc::clone(&eof_signal);
-    let err_signal = Arc::clone(&eof_signal);
-    let out_reader = std::thread::spawn(move || {
-        let res = read_capped(stdout, MAX_WORKER_OUTPUT);
-        if let Ok(mut done) = out_signal.0.lock() {
-            *done += 1;
-            out_signal.1.notify_all();
-        }
-        res
-    });
-    let err_reader = std::thread::spawn(move || {
-        let res = read_capped(stderr, MAX_WORKER_STDERR as usize);
-        if let Ok(mut done) = err_signal.0.lock() {
-            *done += 1;
-            err_signal.1.notify_all();
-        }
-        res
-    });
+    // Each drain thread reports when its pipe reaches EOF, so the supervisor
+    // below wakes as the worker exits instead of sleeping out a fixed poll
+    // interval (#1394).
+    let pipes = Arc::new(PipeEof::default());
+    let out_closed = PipeEofMark(Arc::clone(&pipes));
+    let err_closed = PipeEofMark(Arc::clone(&pipes));
+    // #1122: `std::thread::spawn` panics when a thread cannot be created
+    // (thread limit, memory exhaustion) and release builds are panic=abort,
+    // so one failed spawn here used to abort the whole run. A failed spawn
+    // now stops the worker and fails this one file, like any other worker
+    // start-up failure.
+    let out_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stdout", move || {
+            let _closed = out_closed;
+            read_capped(stdout, MAX_WORKER_OUTPUT)
+        }) {
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's output reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+    let err_reader =
+        match xerj_common::thread_spawn::try_spawn_returning("xerj-pdf-stderr", move || {
+            let _closed = err_closed;
+            read_capped(stderr, MAX_WORKER_STDERR as usize)
+        }) {
+            Ok(reader) => reader,
+            Err(failure) => {
+                drop(failure.job);
+                terminate_worker_tree(&mut child);
+                let _ = out_reader.join();
+                return Err(failure.error).with_context(|| {
+                    format!(
+                        "could not start the PDF parser's error reader for {}",
+                        path.display()
+                    )
+                });
+            }
+        };
 
     let started = Instant::now();
     let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));
-    let mut seen_eof = 0usize;
+    let mut closed = 0;
+    let mut after_eof = Duration::from_millis(1);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -996,8 +1023,7 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
                 });
             }
         }
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
+        if started.elapsed() >= timeout {
             terminate_worker_tree(&mut child);
             let _ = out_reader.join();
             let _ = err_reader.join();
@@ -1007,19 +1033,19 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
                 path.display()
             ));
         }
-        let wait_slice = timeout
-            .saturating_sub(elapsed)
-            .min(Duration::from_millis(20));
-        if let Ok(done) = eof_signal.0.lock() {
-            if *done == seen_eof {
-                if let Ok((done, _)) = eof_signal.1.wait_timeout(done, wait_slice) {
-                    seen_eof = *done;
-                }
-            } else {
-                seen_eof = *done;
-            }
+        let slice = timeout
+            .saturating_sub(started.elapsed())
+            .min(WORKER_POLL_INTERVAL);
+        if closed < 2 {
+            // Wakes early when the next pipe closes; a worker that exits
+            // closes both, so the common case is reaped within microseconds.
+            closed = pipes.wait_for_change(closed, slice);
         } else {
-            std::thread::sleep(wait_slice);
+            // Both pipes are closed but the child is not reaped yet: it is
+            // normally mid-exit, so poll briefly and back off to the regular
+            // interval in case it closed them deliberately and kept running.
+            std::thread::sleep(after_eof.min(slice));
+            after_eof = (after_eof * 2).min(WORKER_POLL_INTERVAL);
         }
     };
     terminate_worker_descendants(child.id());
@@ -1093,6 +1119,44 @@ struct CappedRead {
     overflow: bool,
 }
 
+/// Upper bound on one supervisor wait in `spawn_worker`; it is also the
+/// cadence of the timeout check when the worker's pipes stay open.
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Number of PDF-worker output pipes whose drain thread has finished. Event
+/// driven pipe-EOF wakeup, based on work by @todie in #1394.
+#[derive(Default)]
+struct PipeEof {
+    closed: Mutex<u8>,
+    changed: Condvar,
+}
+
+impl PipeEof {
+    /// Waits at most `slice` for the closed count to move past `seen` and
+    /// returns the count observed. Poison is ignored: the count is a plain
+    /// integer and stays meaningful if a drain thread panicked.
+    fn wait_for_change(&self, seen: u8, slice: Duration) -> u8 {
+        let guard = self.closed.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .changed
+            .wait_timeout_while(guard, slice, |closed| *closed == seen)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+}
+
+/// Marks one pipe closed when dropped, so a drain thread that errors or
+/// panics still wakes the supervisor.
+struct PipeEofMark(Arc<PipeEof>);
+
+impl Drop for PipeEofMark {
+    fn drop(&mut self) {
+        let mut closed = self.0.closed.lock().unwrap_or_else(|e| e.into_inner());
+        *closed = closed.saturating_add(1);
+        self.0.changed.notify_all();
+    }
+}
+
 fn read_capped(mut input: impl Read, cap: usize) -> Result<CappedRead> {
     let mut prefix = Vec::with_capacity(cap.min(64 << 10));
     let mut overflow = false;
@@ -1117,19 +1181,25 @@ fn read_capped(mut input: impl Read, cap: usize) -> Result<CappedRead> {
 #[cfg(unix)]
 fn set_worker_memory_limit(command: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // Probe in the parent so a refusal can be logged once on the progress
+    // stream. The child still decides: `pre_exec` skips EINVAL/EPERM and
+    // fails the spawn only for some other errno. `setrlimit` and the errno
+    // read are async-signal-safe; `from_raw_os_error` runs only on that
+    // fatal path, which is the same allocation the old code made for every
+    // failure.
+    let _ = super::rlimit::address_space_cap_supported();
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let limit = libc::rlimit {
-                rlim_cur: WORKER_ADDRESS_SPACE,
-                rlim_max: WORKER_ADDRESS_SPACE,
-            };
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                return Err(std::io::Error::last_os_error());
+            match super::rlimit::apply_address_space_cap(WORKER_ADDRESS_SPACE) {
+                super::rlimit::AddressSpaceCap::Applied
+                | super::rlimit::AddressSpaceCap::Skipped => Ok(()),
+                super::rlimit::AddressSpaceCap::Failed(errno) => {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                }
             }
-            Ok(())
         });
     }
 }
@@ -1164,7 +1234,11 @@ fn terminate_worker_descendants(_process_group: u32) {}
 
 #[cfg(unix)]
 fn containment_description() -> &'static str {
-    "fresh process; Unix process-group cleanup; 1536 MiB RLIMIT_AS; not a security sandbox"
+    if super::rlimit::current_address_space_is_capped(WORKER_ADDRESS_SPACE) {
+        "fresh process; Unix process-group cleanup; 1536 MiB RLIMIT_AS; not a security sandbox"
+    } else {
+        "fresh process; Unix process-group cleanup; no RLIMIT_AS cap on this process; not a security sandbox"
+    }
 }
 
 #[cfg(not(unix))]
@@ -1343,10 +1417,15 @@ impl WorkerGate {
     }
 
     fn acquire(&self) -> WorkerPermit<'_> {
-        let mut state = self.state.lock().expect("PDF worker gate poisoned");
-        while state.0 >= state.1 {
-            state = self.ready.wait(state).expect("PDF worker gate poisoned");
-        }
+        let mut state = super::wait_until_slot(
+            "pdf worker",
+            &self.state,
+            &self.ready,
+            super::SLOT_HEARTBEAT,
+            |state| state.0 >= state.1,
+            |state| (state.0, state.1),
+            |line| eprintln!("{line}"),
+        );
         state.0 += 1;
         WorkerPermit(self)
     }
@@ -1725,6 +1804,48 @@ mod tests {
         assert!(!format!("{error:#}").is_empty());
         assert_eq!(budget.report()["phase_a_pdf_parser_responses"], 0);
         assert_eq!(budget.report()["reservations_started"], 0);
+    }
+
+    #[test]
+    fn worker_that_closes_its_pipes_but_keeps_running_still_times_out() {
+        // #1394: the supervisor now sleeps on pipe EOF instead of a fixed
+        // poll. A worker that closes stdout/stderr and then hangs must still
+        // be reaped by the timeout rather than waited on forever.
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = super::WORKER_BIN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("hang.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        let worker = dir.path().join("closing-worker");
+        std::fs::write(&worker, "#!/bin/sh\nexec >&- 2>&-\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let previous = std::env::var_os("XERJ_PDF_WORKER_BIN");
+        struct Restore(Option<std::ffi::OsString>, u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XERJ_PDF_WORKER_BIN", value),
+                    None => std::env::remove_var("XERJ_PDF_WORKER_BIN"),
+                }
+                super::WORKER_TIMEOUT_SECS.store(self.1, Ordering::Relaxed);
+            }
+        }
+        let _restore = Restore(previous, super::WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));
+        std::env::set_var("XERJ_PDF_WORKER_BIN", &worker);
+        super::configure_timeout(1);
+        let started = std::time::Instant::now();
+        let error = super::extract(&pdf, &mut |_| true).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -51,6 +51,29 @@ pub fn is_code_ext(ext: &str) -> bool {
     registry().iter().any(|d| d.exts.contains(&e.as_str()))
 }
 
+/// #2205: the `language` a code record carries is the registry row's NAME
+/// (`javascript`, `typescript`, `python` …), so `--lang js` matched nothing
+/// and `xerj code` answered "No passage". Resolve what a user types — a
+/// registry name in any case, or a file extension a row claims (`js`, `ts`,
+/// `py`, `rs` …) — to the stored name. `None` when nothing claims it, so the
+/// caller can pass an unknown value through unchanged.
+pub fn canonical_language(input: &str) -> Option<&'static str> {
+    let wanted = input.trim().trim_start_matches('.').to_ascii_lowercase();
+    let reg = registry();
+    reg.iter()
+        .find(|d| d.name == wanted)
+        .or_else(|| reg.iter().find(|d| d.exts.contains(&wanted.as_str())))
+        .map(|d| d.name)
+}
+
+/// The `--lang` value to filter on: the canonical language name when the
+/// input resolves to one, the input unchanged otherwise.
+pub fn lang_filter_value(input: &str) -> String {
+    canonical_language(input)
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string())
+}
+
 fn def(name: &'static str, exts: &'static [&'static str], lang: Language, q: &str) -> LangDef {
     let query = Query::new(&lang, q).unwrap_or_else(|e| panic!("bad {name} query: {e}"));
     // Text predicates (#eq?/#any-of?/#match?) are NOT applied by the core
@@ -327,6 +350,13 @@ pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<Ex
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    // #2337: SQL source is code, but `.sql` is not a registry extension.
+    // A registry row would claim dumps in the sniffer before content is
+    // read. The DDL scanner runs only after sniff has ruled a dump out
+    // (or the dump extractor emitted nothing and the caller fell through).
+    if crate::sniff::is_sql_filename(named) {
+        return super::sqlsrc::extract(path, named, sn.gzip, sink);
+    }
     let claimants: Vec<&LangDef> = registry()
         .iter()
         .filter(|d| d.exts.contains(&ext.as_str()))
@@ -1090,6 +1120,132 @@ fn cpp_declarator_is_const_qualified(node: tree_sitter::Node, source: &[u8]) -> 
     false
 }
 
+/// The literal value of a constant / macro / field declaration, or `None` for
+/// anything else (a function, a type, a declaration with no initialiser).
+///
+/// Applied to a definition's declaration text (the `code` slice of a [`Symbol`],
+/// which is `DefRecord.text`). The per-language rules are fixed by
+/// `docs/CORPUS_HUB_V2_IMPLEMENTATION.md` step 3. The captured value is trimmed
+/// and loses a trailing `;` or `,`.
+pub fn extract_value(lang: &str, decl: &str) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let v = s.trim().trim_end_matches([';', ',']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    }
+    // Quote-aware value end: when the matched value opens with `"`, take through
+    // its matching close quote so a `;` or `//` INSIDE the string is not read as
+    // a terminator. The lazy value regexes below otherwise stop at the first
+    // `;`/`//` and tear `"a;b"` down to `"a`, `"http://x"` down to `"http:`. The
+    // regex still locates where the value STARTS (`m.start()`); only its end is
+    // recomputed here. Every non-string value falls through to `clean`, byte for
+    // byte as before. NOTE: a backslash-escaped quote inside the string
+    // (`"a\"b"`) is a known limitation — the scan stops at the first `"`; such
+    // values are rare enough in a constant that handling escapes is not worth
+    // the extra code.
+    fn value_of(decl: &str, m: Option<regex::Match<'_>>) -> Option<String> {
+        let m = m?;
+        let rest = &decl[m.start()..];
+        if let Some(body) = rest.strip_prefix('"') {
+            if let Some(rel) = body.find('"') {
+                // opening quote + body + closing quote (quote is 1 ASCII byte)
+                return Some(rest[..rel + 2].to_string());
+            }
+        }
+        clean(m.as_str())
+    }
+    use std::sync::OnceLock;
+    static C_DEFINE: OnceLock<regex::Regex> = OnceLock::new();
+    static C_CONST: OnceLock<regex::Regex> = OnceLock::new();
+    static RUST: OnceLock<regex::Regex> = OnceLock::new();
+    static GO: OnceLock<regex::Regex> = OnceLock::new();
+    static UPPER: OnceLock<regex::Regex> = OnceLock::new();
+    match lang {
+        "c" | "cpp" | "objc" => {
+            let def = C_DEFINE.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*#\s*define\s+(\w+)\s+(.+?)\s*(?:/[/*].*)?$").unwrap()
+            });
+            if let Some(c) = def.captures(decl) {
+                if let Some(v) = value_of(decl, c.get(2)) {
+                    return Some(v);
+                }
+            }
+            let cst = C_CONST.get_or_init(|| {
+                regex::Regex::new(r"\b(?:static\s+)?const\s+\w[\w\s\*]*\b(\w+)\s*=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            cst.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "rust" => {
+            let re = RUST.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)\s*:\s*[^=]+=\s*(.+?)\s*;")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "go" => {
+            let re = GO.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(?:const\s+)?(\w+)\s*(?:[\w.\[\]*]+\s+)?=\s*(.+?)\s*$")
+                    .unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        "python" | "ruby" | "bash" | "sh" | "shell" => {
+            let re = UPPER.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.+?)\s*$").unwrap()
+            });
+            re.captures(decl).and_then(|c| value_of(decl, c.get(2)))
+        }
+        _ => None,
+    }
+}
+
+/// Every definition in one file, as [`DefRecord`]s for the hub pack's defs index.
+///
+/// `file_rel` is the path relative to the corpus root (forward slashes), `lang`
+/// is a registry language name (`registry()`), `text` is the file's decoded
+/// contents. Unknown languages yield no records. The declaration text is capped
+/// at 400 chars; constants and macros carry their value ([`extract_value`]).
+pub fn definitions(file_rel: &str, lang: &str, text: &str) -> Vec<xerj_common::hub::DefRecord> {
+    let Some(def) = registry().iter().find(|d| d.name == lang) else {
+        return Vec::new();
+    };
+    parse_symbols(def, text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            let decl: String = if s.code.chars().count() > 400 {
+                s.code.chars().take(400).collect()
+            } else {
+                s.code
+            };
+            // Only a named constant (`const`) carries a literal value. The
+            // per-language `extract_value` is a regex with no notion of symbol
+            // kind, so run on EVERY symbol it reads a function prototype's
+            // default argument (`void f(const int x = 5)` -> "5)"), a Go type
+            // alias's RHS (`type Handler = http.HandlerFunc`) or a mutable
+            // binding's initialiser as if it were a constant value. Of the
+            // capture-name kinds the queries emit, only `const` is value-bearing:
+            // `#define` is emitted as `const`, whereas `static` is the MUTABLE
+            // module binding (Go `var`, Rust `static`, a C++ mutable global) and
+            // every other kind is structural. Gate the call on kind.
+            let value = if s.kind == "const" {
+                extract_value(lang, &decl)
+            } else {
+                None
+            };
+            xerj_common::hub::DefRecord {
+                symbol: s.name,
+                kind: s.kind,
+                lang: lang.to_string(),
+                file: file_rel.to_string(),
+                line: s.line as u32,
+                text: decl,
+                value,
+            }
+        })
+        .collect()
+}
+
 fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     let mut parser = Parser::new();
     parser.set_language(&def.language).ok()?;
@@ -1199,43 +1355,19 @@ fn emit_code_doc(
         .to_string();
 
     let mut fields = Map::new();
-    fields.insert("title".into(), Value::String(title));
+    fields.insert("title".into(), Value::String(title.clone()));
     fields.insert("language".into(), Value::String(language.to_string()));
 
-    if !symbols.is_empty() {
-        // Searchable "kind name" list — this is what makes `class User` /
-        // `def save` retrieve the file, and it dedups repeated names.
-        let mut seen = std::collections::HashSet::new();
-        let defs: Vec<String> = symbols
-            .iter()
-            .filter(|s| seen.insert((s.kind.clone(), s.name.clone())))
-            .map(|s| format!("{} {}", s.kind, s.name))
-            .collect();
-        fields.insert("defs".into(), Value::String(defs.join("\n")));
-        let arr: Vec<Value> = symbols
-            .iter()
-            .map(|s| {
-                let mut m = Map::new();
-                m.insert("name".into(), Value::String(s.name.clone()));
-                m.insert("kind".into(), Value::String(s.kind.clone()));
-                m.insert("line".into(), Value::Number((s.line as u64).into()));
-                // #500: a client that wants the IMPLEMENTATION can now slice
-                // exactly `line`..`end_line` out of `body`. Without it the only
-                // way to bound a symbol was "up to where the next one starts",
-                // which returns a whole class for a class and the rest of the
-                // file for the last symbol — the coarse unit this issue is about.
-                m.insert("end_line".into(), Value::Number((s.end_line as u64).into()));
-                Value::Object(m)
-            })
-            .collect();
-        fields.insert("symbols".into(), Value::Array(arr));
-        fields.insert(
-            "symbol_count".into(),
-            Value::Number((symbols.len() as u64).into()),
-        );
-    }
+    insert_symbol_catalog(&mut fields, symbols);
     // The full source stays full-text searchable.
     fields.insert("body".into(), Value::String(text.to_string()));
+    // #2351: the file document has no `line`. The span of the stored text
+    // is what a `_source` include of start_line/end_line needs.
+    let line_count = text.lines().count() as u64;
+    if line_count > 0 {
+        fields.insert("start_line".into(), Value::Number(1.into()));
+        fields.insert("end_line".into(), Value::Number(line_count.into()));
+    }
 
     stats.records += 1;
     if !sink(RawRecord {
@@ -1250,17 +1382,69 @@ fn emit_code_doc(
         return false;
     }
 
-    // #500: promote each declaration to its OWN retrievable document. A
-    // constant/field/`#define`/signature lookup then returns the ~40–80 B
-    // declaration line with an exact `name` (mapped keyword), instead of only
-    // surviving folded inside the ~2–3 KB enclosing class/method body (the
-    // measured 32–48× byte blow-up + the rank-35 recall miss). The file
-    // document above keeps `body`/`defs` for full-text and cross-file search.
-    let file_path = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("source")
-        .to_string();
+    emit_symbol_records(&title, language, text, symbols, stats, sink)
+}
+
+/// `defs` / `symbols` / `symbol_count` for one file. Empty when nothing was
+/// captured, so a file with no definitions keeps the same field set it had
+/// before a grammar learned to see one (#178).
+fn insert_symbol_catalog(fields: &mut Map<String, Value>, symbols: &[Symbol]) {
+    if symbols.is_empty() {
+        return;
+    }
+    // Searchable "kind name" list — this is what makes `class User` /
+    // `def save` retrieve the file, and it dedups repeated names.
+    let mut seen = std::collections::HashSet::new();
+    let defs: Vec<String> = symbols
+        .iter()
+        .filter(|s| seen.insert((s.kind.clone(), s.name.clone())))
+        .map(|s| format!("{} {}", s.kind, s.name))
+        .collect();
+    fields.insert("defs".into(), Value::String(defs.join("\n")));
+    let arr: Vec<Value> = symbols
+        .iter()
+        .map(|s| {
+            let mut m = Map::new();
+            m.insert("name".into(), Value::String(s.name.clone()));
+            m.insert("kind".into(), Value::String(s.kind.clone()));
+            m.insert("line".into(), Value::Number((s.line as u64).into()));
+            // #2351: start_line matches line so a _source include of
+            // start_line/end_line locates the declaration. The file document
+            // and each symbol record both carry it.
+            m.insert("start_line".into(), Value::Number((s.line as u64).into()));
+            // #500: a client that wants the IMPLEMENTATION can now slice
+            // exactly `line`..`end_line` out of `body`. Without it the only
+            // way to bound a symbol was "up to where the next one starts",
+            // which returns a whole class for a class and the rest of the
+            // file for the last symbol — the coarse unit this issue is about.
+            m.insert("end_line".into(), Value::Number((s.end_line as u64).into()));
+            Value::Object(m)
+        })
+        .collect();
+    fields.insert("symbols".into(), Value::Array(arr));
+    fields.insert(
+        "symbol_count".into(),
+        Value::Number((symbols.len() as u64).into()),
+    );
+}
+
+/// #500: promote each declaration to its OWN retrievable document. A
+/// constant/field/`#define`/signature lookup then returns the ~40–80 B
+/// declaration line with an exact `name` (mapped keyword), instead of only
+/// surviving folded inside the ~2–3 KB enclosing class/method body (the
+/// measured 32–48× byte blow-up + the rank-35 recall miss). The file
+/// document above keeps `body`/`defs` for full-text and cross-file search.
+///
+/// `text`'s line `n` is source line `n`. Callers that parsed a slice shift
+/// `symbols` onto that coordinate first.
+fn emit_symbol_records(
+    file_path: &str,
+    language: &str,
+    text: &str,
+    symbols: &[Symbol],
+    stats: &mut ExtractStats,
+    sink: Sink,
+) -> bool {
     // A single declaration can be captured under two kinds at the same line+name
     // (e.g. `export const f = () => {}` → @function + @const). Those share the
     // `code:<line>:<name>` locator → the same `doc_id` → ES stores ONE document.
@@ -1281,15 +1465,18 @@ fn emit_code_doc(
             continue;
         }
         let mut sf = Map::new();
-        // `title` = the symbol so the hit reads as the declaration, `path` for
-        // citation, `name`/`code` searchable (the mapping exposes `name.keyword`
+        // `title` = the symbol so the hit reads as the declaration. `path`
+        // starts as the file name; `align_hit_locators` replaces that
+        // basename with the repo-relative path at stamp time (#2351).
+        // `name`/`code` stay searchable (the mapping exposes `name.keyword`
         // for exact-identifier ranking), `kind`/`line` for filtering + citation.
         sf.insert("title".into(), Value::String(name.clone()));
-        sf.insert("path".into(), Value::String(file_path.clone()));
+        sf.insert("path".into(), Value::String(file_path.to_string()));
         sf.insert("language".into(), Value::String(language.to_string()));
         sf.insert("name".into(), Value::String(name.clone()));
         sf.insert("kind".into(), Value::String(s.kind.clone()));
         sf.insert("line".into(), Value::Number((line as u64).into()));
+        sf.insert("start_line".into(), Value::Number((line as u64).into()));
         sf.insert(
             "end_line".into(),
             Value::Number((s.end_line.max(line) as u64).into()),
@@ -1298,13 +1485,16 @@ fn emit_code_doc(
         // #1237: symbol records carry a bounded `impl` slice (`body[line..=end_line]`,
         // capped at 16 KB on a UTF-8 char boundary) so `xerj code --fuse-symbols`
         // can score a second BM25 leg over definition bodies without length-norm
-        // dilution from a 4,000-line file. For container kinds (`class`), bound
-        // `impl` to the lines preceding the first nested definition so method
-        // bodies are not duplicated inside the enclosing class record.
-        // `reconcile_plan::ensure_compatible` exempts `impl` and `end_line` on
-        // pre-#1237 frozen datasets so incremental runs over older state dirs
-        // never abort.
-        let impl_end_line = if s.kind == "class" {
+        // dilution from a 4,000-line file. For every kind except
+        // `function`/`method` (i.e. containers: `class`, `module`, `trait`,
+        // `interface`, `impl`, `struct`, `extension`, ...), bound `impl` to the
+        // lines preceding the first nested definition so member bodies are not
+        // duplicated inside the enclosing record. Functions keep their whole
+        // body: a nested closure/inner def is part of what the function does.
+        // `reconcile_plan::ensure_compatible` exempts `impl`, `end_line`, and
+        // `start_line` on frozen datasets so incremental runs over older
+        // state dirs never abort.
+        let impl_end_line = if !matches!(s.kind.as_str(), "function" | "method") {
             symbols
                 .iter()
                 .filter(|child| child.line > line && child.line <= s.end_line)
@@ -1353,6 +1543,81 @@ fn emit_code_doc(
         }
     }
     true
+}
+
+/// Definitions inside inline `<script>` blocks of an HTML page (#2356).
+///
+/// `spans` are `(start, end)` byte offsets of script *content* (inside the
+/// tags, not including them) in `html`. Each span is parsed with the
+/// JavaScript grammar; line numbers are shifted onto the HTML file so
+/// `xerj def` cites `page.html:N`. The page's prose record is someone else's
+/// — this only adds the file-level `defs`/`symbols` catalog and the
+/// per-declaration records a `.js` file would get. It does not copy the
+/// script into a `body` field: the HTML extractor keeps API keys and other
+/// non-definition script text out of the page body.
+///
+/// A span over [`CODE_CAP`] is skipped. One minified block is not a file of
+/// definitions, and parsing it is the cost the code extractor already refuses.
+pub(crate) fn emit_inline_scripts(
+    path: &Path,
+    html: &str,
+    spans: &[(usize, usize)],
+    stats: &mut ExtractStats,
+    sink: Sink,
+) -> bool {
+    if spans.is_empty() {
+        return true;
+    }
+    let Some(def) = registry().iter().find(|d| d.name == "javascript") else {
+        return true;
+    };
+    let mut symbols = Vec::new();
+    for &(start, end) in spans {
+        if start >= end
+            || end > html.len()
+            || !html.is_char_boundary(start)
+            || !html.is_char_boundary(end)
+        {
+            continue;
+        }
+        let content = &html[start..end];
+        if content.len() as u64 > CODE_CAP || content.trim().is_empty() {
+            continue;
+        }
+        let mut found = parse_symbols(def, content).unwrap_or_default();
+        let offset = html[..start].bytes().filter(|&b| b == b'\n').count();
+        for s in &mut found {
+            s.line = s.line.saturating_add(offset);
+            s.end_line = s.end_line.saturating_add(offset);
+        }
+        symbols.append(&mut found);
+        if symbols.len() >= 5000 {
+            symbols.truncate(5000);
+            break;
+        }
+    }
+    if symbols.is_empty() {
+        return true;
+    }
+    let title = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("source")
+        .to_string();
+    let mut fields = Map::new();
+    fields.insert("title".into(), Value::String(title.clone()));
+    fields.insert("language".into(), Value::String("javascript".into()));
+    insert_symbol_catalog(&mut fields, &symbols);
+    stats.records += 1;
+    if !sink(RawRecord {
+        fields,
+        locator: "code".into(),
+        group: None,
+        origin: FieldOrigin::Extractor,
+    }) {
+        return false;
+    }
+    emit_symbol_records(&title, "javascript", html, &symbols, stats, sink)
 }
 
 // ── Per-language capture queries. Capture-name == emitted symbol kind. ─────────
@@ -2099,6 +2364,24 @@ const SCHEME_Q: &str = r#"
 mod tests {
     use super::*;
 
+    /// #2205: `--lang js` must filter on the stored `javascript`, not on a
+    /// value no record carries.
+    #[test]
+    fn a_lang_extension_resolves_to_the_stored_language_name() {
+        assert_eq!(lang_filter_value("js"), "javascript");
+        assert_eq!(lang_filter_value(".mjs"), "javascript");
+        assert_eq!(lang_filter_value("JavaScript"), "javascript");
+        assert_eq!(lang_filter_value("ts"), "typescript");
+        assert_eq!(lang_filter_value("py"), "python");
+        assert_eq!(lang_filter_value("python"), "python");
+        // An unknown value passes through unchanged.
+        assert_eq!(lang_filter_value("no-such-lang"), "no-such-lang");
+        // Every resolved name is one a code record can carry.
+        for name in registry().iter().map(|d| d.name) {
+            assert_eq!(canonical_language(name), Some(name));
+        }
+    }
+
     fn syms(lang: &str, src: &str) -> Vec<Symbol> {
         let def = registry().iter().find(|d| d.name == lang).unwrap();
         parse_symbols(def, src).unwrap()
@@ -2654,6 +2937,10 @@ mod tests {
             "…and must still stop where the body begins (#500): {code:?}"
         );
         assert_eq!(m.fields["line"], 5);
+        // #2351: a `_source` include of start_line/end_line has to locate a
+        // symbol. `line` stays; start_line is the same line.
+        assert_eq!(m.fields["start_line"], m.fields["line"]);
+        assert!(m.fields["end_line"].as_u64().unwrap() >= 5);
 
         let c = sym("DEFAULT_MAX_CONN");
         assert_eq!(
@@ -2678,6 +2965,9 @@ mod tests {
             .unwrap_or_else(|| panic!("{:?}", file_doc.fields["symbols"]));
         assert_eq!(entry["line"], 5);
         assert_eq!(entry["end_line"], 9);
+        assert_eq!(entry["start_line"], entry["line"]);
+        assert_eq!(file_doc.fields["start_line"], 1);
+        assert!(file_doc.fields["end_line"].as_u64().unwrap() >= 1);
     }
 
     /// The declaration slice is shape-based, not per-language, so the shapes
@@ -2839,9 +3129,12 @@ mod tests {
         }
         // Deliberately NOT claimed, each for a stated reason: fixed-form
         // Fortran would mis-parse under the free-form grammar; nim/crystal
-        // have no usable published grammar; sql routing is deferred; `.sls`
-        // is an R6RS library but also a SaltStack state file (YAML), and a
-        // single-claimant extension is never content-probed; `.edn` is data.
+        // have no usable published grammar; `.sql` is indexed as code by
+        // the DDL scanner in `sqlsrc` only after the dump sniff (#2337) —
+        // a registry row would claim INSERT/COPY dumps before that sniff;
+        // `.sls` is an R6RS library but also a SaltStack state file (YAML),
+        // and a single-claimant extension is never content-probed; `.edn`
+        // is data.
         for ext in ["f", "nim", "cr", "sql", "sls", "edn"] {
             assert!(!is_code_ext(ext), "{ext} must stay unclaimed (see #295)");
         }
@@ -4243,6 +4536,156 @@ mod tests {
         assert!(has(&s, "mint", "function"), "got {s:?}");
         assert!(has(&s, "onlyOwner", "function"), "got {s:?}");
         assert!(has(&s, "min", "function"), "got {s:?}");
+    }
+
+    /// The five literal cases fixed by `docs/CORPUS_HUB_V2_IMPLEMENTATION.md`
+    /// step 3: each value regex returns exactly this string (trailing comment
+    /// and `;`/`,` removed), and a bare signature is not a value.
+    #[test]
+    fn extract_value_literals() {
+        // C `#define` with a trailing block comment: the token, comment dropped.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
+        // Rust `pub(crate) const` with a typed initialiser: the whole RHS.
+        assert_eq!(
+            extract_value(
+                "rust",
+                "pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);"
+            ),
+            Some("Duration::from_secs(30)".to_string())
+        );
+        // C `#define` whose value is a parenthesised conditional expression.
+        assert_eq!(
+            extract_value("c", "#define MDB_MAXKEYSIZE ((MDB_DEVEL) ? 0 : 511)"),
+            Some("((MDB_DEVEL) ? 0 : 511)".to_string())
+        );
+        // Go const-block line: the shift expression, no trailing semicolon.
+        assert_eq!(
+            extract_value("go", "batchSize = 16 << 20"),
+            Some("16 << 20".to_string())
+        );
+        // A function signature carries no value.
+        assert_eq!(extract_value("rust", "fn main() {"), None);
+    }
+
+    /// `definitions` turns parsed symbols into `DefRecord`s: a `const` carries
+    /// its literal value and the 1-based line its name sits on; a function none.
+    #[test]
+    fn definitions_rust_const_and_fn() {
+        // `pub const LIMIT` on line 1, `fn helper` on line 2.
+        let src = "pub const LIMIT: u32 = 128;\nfn helper() {}\n";
+        let defs = definitions("src/lib.rs", "rust", src);
+        let Some(limit) = defs.iter().find(|d| d.symbol == "LIMIT") else {
+            panic!("no LIMIT def in {defs:?}");
+        };
+        assert_eq!(limit.value, Some("128".to_string()), "got {limit:?}");
+        assert_eq!(limit.line, 1, "got {limit:?}");
+        // The function declaration, if captured, has no value.
+        if let Some(helper) = defs.iter().find(|d| d.symbol == "helper") {
+            assert_eq!(helper.value, None, "got {helper:?}");
+        }
+    }
+
+    /// Fix A: `definitions` attaches a `value` only to a constant-kind symbol.
+    /// `extract_value` is a per-language regex with no notion of symbol kind, so
+    /// run on EVERY symbol it reads a prototype's default argument, a type
+    /// alias's RHS or a mutable `var`/`static` initialiser as a constant value.
+    /// The kind gate stops that; a real `const` still carries its value.
+    #[test]
+    fn definitions_only_values_constant_kinds() {
+        // C++ function prototype: `= 5` is a parameter default, never a value.
+        for d in definitions("x.cpp", "cpp", "void f(const int x = 5);") {
+            assert_eq!(d.value, None, "cpp prototype leaked a value: {d:?}");
+        }
+        // Go `type` alias: the RHS is a type, not a value.
+        for d in definitions("x.go", "go", "package p\ntype Handler = http.HandlerFunc\n") {
+            assert_ne!(d.kind, "const", "a Go type alias is not a constant: {d:?}");
+            assert_eq!(d.value, None, "go type alias leaked a value: {d:?}");
+        }
+        // Go package-level `var`: a mutable binding (kind `static`), not a value.
+        // It is still indexed as a symbol; it simply carries no `value`.
+        let gv = definitions("x.go", "go", "package p\nvar DefaultPort = 8080\n");
+        assert!(
+            gv.iter().any(|d| d.symbol == "DefaultPort"),
+            "the Go var should still be a symbol: {gv:?}"
+        );
+        for d in &gv {
+            assert_eq!(d.value, None, "go var leaked a value: {d:?}");
+        }
+        // The gate must NOT suppress a genuine constant's value.
+        let rc = definitions("x.rs", "rust", "pub const LIMIT: u32 = 128;\n");
+        let limit = rc
+            .iter()
+            .find(|d| d.symbol == "LIMIT")
+            .expect("const LIMIT captured");
+        assert_eq!(limit.kind, "const");
+        assert_eq!(limit.value.as_deref(), Some("128"));
+    }
+
+    /// Fix B: a quoted value is kept whole — a `;` or `//` inside the string is
+    /// not a terminator — while non-string values extract exactly as before.
+    #[test]
+    fn extract_value_keeps_quoted_strings_intact() {
+        // `//` inside a C string is not the start of a comment.
+        assert_eq!(
+            extract_value("c", r#"#define PATH "/usr//local/bin""#),
+            Some(r#""/usr//local/bin""#.to_string())
+        );
+        // A URL's `//` must not truncate the value down to `"http:`.
+        assert_eq!(
+            extract_value("c", r#"#define API_URL "http://x.com""#),
+            Some(r#""http://x.com""#.to_string())
+        );
+        // `;` inside a Rust string literal is not the statement terminator.
+        assert_eq!(
+            extract_value("rust", r#"const S: &str = "a;b";"#),
+            Some(r#""a;b""#.to_string())
+        );
+        // Non-string values are untouched: the trailing comment and `;` still go.
+        assert_eq!(
+            extract_value("c", "#define LZ4_VERSION_RELEASE  0    /* for tweaks */"),
+            Some("0".to_string())
+        );
+    }
+
+    /// The container bound is not specific to `class`: a Rust `mod` holding a
+    /// function must not copy that function's body into its own `impl`.
+    #[test]
+    fn emit_code_doc_bounds_every_container_kind_before_nested_defs() {
+        let mut records = Vec::new();
+        let mut stats = ExtractStats::default();
+        let src = "mod engine {\n    use std::fmt;\n    fn spin_up() {\n        let unique_marker = 1;\n    }\n}\n";
+        let s = syms("rust", src);
+        assert!(has(&s, "engine", "module"), "got {s:?}");
+        assert!(has(&s, "spin_up", "function"), "got {s:?}");
+        assert!(emit_code_doc(
+            Path::new("lib.rs"),
+            "rust",
+            src,
+            &s,
+            &mut stats,
+            &mut |rec| {
+                records.push(rec);
+                true
+            },
+        ));
+        let module_impl = records
+            .iter()
+            .find(|r| r.locator == "code:1:engine")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("module impl");
+        assert_eq!(module_impl, "mod engine {\n    use std::fmt;");
+        assert!(!module_impl.contains("unique_marker"));
+        let fn_impl = records
+            .iter()
+            .find(|r| r.locator == "code:3:spin_up")
+            .and_then(|r| r.fields.get("impl"))
+            .and_then(Value::as_str)
+            .expect("function impl");
+        assert!(fn_impl.contains("unique_marker"), "{fn_impl}");
     }
 
     #[test]

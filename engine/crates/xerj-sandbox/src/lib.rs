@@ -1,6 +1,19 @@
-//! OS-level sandboxed execution primitives for XERJ, ported from `sbx`.
+//! OS-level sandboxed execution primitives for XERJ, adapted from
+//! [`unsigned-gg/sbx`](https://github.com/unsigned-gg/sbx).
 //!
-//! Modules:
+//! # Adaptation & Open-Source Collaboration (`unsigned-gg/sbx`)
+//!
+//! This crate consolidates and adapts the core isolate primitives from
+//! [`unsigned-gg/sbx`](https://github.com/unsigned-gg/sbx) (`sbx-core`, `sbx-jail`,
+//! `sbx-evidence`, and `sbx-settle`) into a self-contained XERJ workspace crate, adding
+//! the [`executor`] subprocess runner for untrusted tool, hook, and plugin workloads.
+//!
+//! We actively invite open-source collaboration on [`unsigned-gg/sbx`](https://github.com/unsigned-gg/sbx)
+//! to advance cross-platform isolate primitives—including unprivileged kernel sandboxing
+//! (Linux Landlock ABI evolution, seccomp-bpf, macOS Seatbelt), out-of-band cryptographic
+//! and kernel containment evidence, and linear/single-consumption custody state machines.
+//!
+//! # Modules
 //! - [`rules`]: Filesystem and network [`AccessRules`] (default deny-all).
 //! - [`jail`]: Linux Landlock V2 and macOS Seatbelt (`sandbox-exec`) confinement
 //!   ([`Jail`], [`JailBuilder`], [`JailError`], [`current_thread_is_jailed`],

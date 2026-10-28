@@ -30,6 +30,8 @@
 //!    `fields_omitted`. A single field that alone exceeds the cap is dropped
 //!    whole, which is what guarantees the ladder terminates.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::{tool_text, Ctx};
@@ -52,6 +54,13 @@ pub const MAX_INDEXES: usize = 100;
 /// published contract if that ever grows.
 pub const MAX_EXAMPLES: usize = 5;
 
+/// Past this many datasets, the default `xerj_map` answer is a summary page
+/// (index, records, field names) instead of a full field entry per index.
+/// A hundred 4 KB entries is what truncated the tool result.
+pub const SUMMARY_AT: usize = 8;
+/// Datasets in one default summary page.
+pub const SUMMARY_PAGE: usize = 25;
+
 /// Parsed, validated `xerj_map` arguments.
 #[derive(Debug, Clone)]
 pub(crate) struct MapArgs {
@@ -59,6 +68,15 @@ pub(crate) struct MapArgs {
     pub index: Option<String>,
     /// Per-index byte budget for the rendered entry.
     pub max_bytes: usize,
+    /// Skip this many datasets (record-count order) before rendering.
+    pub offset: usize,
+    /// How many datasets to return. `None` is the summary page when the
+    /// catalog is large, and every fetched dataset otherwise.
+    pub limit: Option<usize>,
+    /// `Some(true)` forces full field entries. `Some(false)` forces the
+    /// summary. `None` summarizes when no index filter is set and more than
+    /// [`SUMMARY_AT`] datasets matched.
+    pub detail: Option<bool>,
 }
 
 /// Parse and validate the tool arguments. Present-but-mistyped is an error,
@@ -85,21 +103,53 @@ pub(crate) fn parse_args(args: &Value) -> Result<MapArgs, String> {
                 )
             })?,
     };
-    Ok(MapArgs { index, max_bytes })
+    let offset = match args.get("offset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| "`offset` must be an integer >= 0".to_string())?,
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| (1..=MAX_INDEXES).contains(n))
+                .ok_or_else(|| format!("`limit` must be an integer from 1 to {MAX_INDEXES}"))?,
+        ),
+    };
+    let detail = match args.get("detail") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err("`detail` must be a boolean".into()),
+    };
+    Ok(MapArgs {
+        index,
+        max_bytes,
+        offset,
+        limit,
+        detail,
+    })
 }
 
-/// The `_search` body for the catalog read. A pattern without a `*` becomes
-/// an engine-side `term` on `index_name` (exact); a glob filters client-side
-/// — one less engine query behaviour for this proxy to assume, and index
-/// counts are small.
+/// The `_search` body for the catalog read. Filter exact names with `term`
+/// and globs with `wildcard` before the 100-result cap. Filtering a glob only
+/// after the fetch could hide a matching dataset behind 100 larger ones.
 pub(crate) fn catalog_body(args: &MapArgs) -> Value {
     let mut must = vec![json!({ "term": { "doc_kind": "dataset" } })];
-    if let Some(name) = args.index.as_deref().filter(|p| !p.contains('*')) {
-        must.push(json!({ "term": { "index_name": name } }));
+    if let Some(name) = args.index.as_deref() {
+        if name.contains('*') {
+            must.push(json!({ "wildcard": { "index_name": name } }));
+        } else {
+            must.push(json!({ "term": { "index_name": name } }));
+        }
     }
+    let size = args.limit.unwrap_or(MAX_INDEXES).clamp(1, MAX_INDEXES);
     json!({
         "query": { "bool": { "must": must } },
-        "size": MAX_INDEXES,
+        "from": args.offset,
+        "size": size,
         "sort": [{ "record_count": "desc" }],
         // The dataset doc also carries sample_queries_json (by far its
         // largest field); project it out rather than transfer it to drop it.
@@ -318,7 +368,8 @@ pub(crate) fn render_response(resp: &Value, args: &MapArgs) -> String {
         .and_then(Value::as_u64)
         .unwrap_or(hits.len() as u64);
 
-    // Pattern filtering (glob only; exact names were filtered engine-side).
+    // Keep the local glob check so only the tool's documented `*` syntax
+    // reaches the response even if the engine supports more wildcard syntax.
     let docs: Vec<Value> = hits
         .iter()
         .filter_map(|h| h.get("_source").cloned())
@@ -374,13 +425,46 @@ pub(crate) fn render_response(resp: &Value, args: &MapArgs) -> String {
         })
     });
 
+    let summarize = match args.detail {
+        Some(true) => false,
+        Some(false) => true,
+        None => args.index.is_none() && indexes.len() > SUMMARY_AT,
+    };
+    let page_limit = if summarize {
+        args.limit.unwrap_or(SUMMARY_PAGE)
+    } else {
+        args.limit.unwrap_or(indexes.len())
+    };
+    let shown: Vec<Value> = if summarize {
+        indexes.iter().take(page_limit).map(summary_entry).collect()
+    } else {
+        indexes.into_iter().take(page_limit).collect()
+    };
     let mut out = Map::new();
-    out.insert("matched".into(), json!(indexes.len()));
+    out.insert("matched".into(), json!(shown.len()));
+    if summarize {
+        out.insert("summary".into(), json!(true));
+        out.insert(
+            "hint".into(),
+            json!(
+                "summary page — pass `index` (name or glob) or `detail: true` with \
+                 `offset`/`limit` for full field entries"
+            ),
+        );
+    }
     if let Some(p) = &args.index {
         out.insert("pattern".into(), json!(p));
     }
-    out.insert("indexes".into(), Value::Array(indexes));
-    let omitted = total.saturating_sub(hits.len() as u64);
+    out.insert("indexes".into(), Value::Array(shown.clone()));
+    // `from` already applied `offset` on a live fetch. Counting from the
+    // rendered page (not the fetched page) is what makes a summary of 25
+    // out of 161 say so, and it matches the old `total - hits` figure when
+    // the whole fetch is rendered.
+    let omitted = if summarize || args.limit.is_some() || args.offset > 0 {
+        total.saturating_sub(args.offset as u64 + shown.len() as u64)
+    } else {
+        total.saturating_sub(hits.len() as u64)
+    };
     if omitted > 0 {
         out.insert("indexes_omitted".into(), json!(omitted));
     }
@@ -394,13 +478,342 @@ pub(crate) fn render_response(resp: &Value, args: &MapArgs) -> String {
             )),
         );
     }
+    // #2351: top-level, so a per-index byte trim cannot drop it. Indexes
+    // written before the aliases still need `ax_path` and `line`.
+    out.insert(
+        "locator_hint".into(),
+        json!(xerj_autoindex::HIT_LOCATOR_HINT),
+    );
     Value::Object(out).to_string()
 }
 
-/// `xerj_map` dispatch: read the catalog, render the map. A missing catalog
-/// (the node never ran autoindex) is an error with the fix named — the
-/// response an agent can act on — while an empty-but-present catalog is a
-/// normal empty result, not an error.
+/// One summary row: enough to pick an index, not the field tables that
+/// overflow the tool result.
+fn summary_entry(entry: &Value) -> Value {
+    let names: Vec<Value> = entry
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|fs| {
+            fs.iter()
+                .filter_map(|f| f.get("name").cloned())
+                .take(40)
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "index": entry.get("index").cloned().unwrap_or(Value::Null),
+        "records": entry.get("records").cloned().unwrap_or(Value::Null),
+        "field_count": entry.get("field_count").cloned().unwrap_or(json!(0)),
+        "field_names": names,
+    })
+}
+
+/// Locator fields autoindex stamps on every record and maps as keyword
+/// (`xerj_autoindex::PROVENANCE_FIELDS`). Copied here so this proxy does not
+/// depend on that crate. The profiler never sees them, so a catalog written
+/// before #2120 omits them from `fields_json` even though they are queryable.
+const PROVENANCE_FIELDS: &[&str] = &[
+    "ax_path",
+    "ax_paths",
+    "ax_file",
+    "ax_locator",
+    "ax_dataset",
+    "ax_run",
+    "ax_format",
+];
+
+fn provenance_field(name: &str) -> Value {
+    json!({
+        "name": name,
+        "es_type": "keyword",
+        "coverage": 1.0,
+        "cardinality_est": 0,
+        "notes": [
+            "autoindex provenance locator, mapped keyword and stamped on every record; \
+             not sampled, so cardinality_est 0 means unmeasured"
+        ],
+    })
+}
+
+fn mapped_only_field(name: &str, spec: &Value) -> Value {
+    let es_type = spec.get("type").and_then(Value::as_str).unwrap_or("object");
+    if PROVENANCE_FIELDS.contains(&name) {
+        let mut field = provenance_field(name);
+        if let Some(obj) = field.as_object_mut() {
+            obj.insert("es_type".into(), json!(es_type));
+        }
+        field
+    } else {
+        json!({
+            "name": name,
+            "es_type": es_type,
+            "notes": ["mapped on the index but absent from the profiled catalog"],
+        })
+    }
+}
+
+/// Union each dataset's `fields_json` with the index mapping's top-level
+/// properties (or, when `mapping` is `None` because the mapping read failed,
+/// with [`PROVENANCE_FIELDS`]).
+///
+/// A corrupt `fields_json` is left alone: the renderer already turns that
+/// into an empty field list rather than an error, and inventing locators on
+/// top of a parse failure would hide the corruption.
+///
+/// Names are appended in sorted order. `render_response` re-sorts by
+/// coverage, so this order only matters for the bytes stored back into the
+/// hit, which nothing else reads.
+pub(crate) fn merge_mapped_fields(resp: &mut Value, mapping: Option<&Value>) {
+    let Some(hits) = resp.pointer_mut("/hits/hits").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for hit in hits.iter_mut() {
+        let Some(src) = hit.get_mut("_source").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let index = src
+            .get("index_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let raw = src
+            .get("fields_json")
+            .and_then(Value::as_str)
+            .unwrap_or("[]");
+        let Ok(mut fields) = serde_json::from_str::<Vec<Value>>(raw) else {
+            continue;
+        };
+        if fields.iter().any(|f| !f.is_object()) {
+            continue;
+        }
+        let present: std::collections::HashSet<String> = fields
+            .iter()
+            .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let properties = mapping.and_then(|m| {
+            m.get(&index)
+                .and_then(|v| v.pointer("/mappings/properties"))
+                .and_then(Value::as_object)
+        });
+        if let Some(props) = properties {
+            let mut names: Vec<&String> = props.keys().collect();
+            names.sort();
+            for name in names {
+                if name.starts_with('_') || present.contains(name.as_str()) {
+                    continue;
+                }
+                fields.push(mapped_only_field(name, &props[name]));
+            }
+        } else if mapping.is_none() {
+            for name in PROVENANCE_FIELDS {
+                if present.contains(*name) {
+                    continue;
+                }
+                fields.push(provenance_field(name));
+            }
+        }
+        if let Ok(encoded) = serde_json::to_string(&fields) {
+            src.insert("fields_json".into(), Value::String(encoded));
+        }
+    }
+}
+
+fn field_count_means(mapping_read: bool) -> &'static str {
+    if mapping_read {
+        "each indexes[].field_count is the catalog's profiled fields union that index's \
+         top-level mapping fields, the same set xerj_plan counts as top-level mapping fields. \
+         ax_* locators the profiler did not sample are included"
+    } else {
+        "each indexes[].field_count is the catalog's profiled fields plus the ax_* provenance \
+         locators autoindex maps as keyword. The live mapping could not be read, so other \
+         mapped-but-unprofiled fields are not listed. xerj_plan's field count is top-level \
+         mapping fields"
+    }
+}
+
+/// Note attached to a map that has family warnings. The array itself is the
+/// same objects the autoindex run summary stores on the catalog run document.
+const FAMILY_JUNK_NOTE: &str = "Each entry is a file family where every file, or a strict \
+     majority of its files, was junked during autoindex and not indexed. `top_reason` is the \
+     most common junk reason (ties break by Unicode code-point order). Clean families and \
+     minority junk are omitted. Exit codes are unchanged.";
+
+/// Latest run per `prefix`, then that run's `family_junk_warnings`, if any.
+///
+/// An older run's warnings are not reported once a newer run of the same
+/// prefix exists: the latest run is the summary. `started` is compared as a
+/// string (RFC3339 sorts chronologically). Equal `started` values break by
+/// `run_id`, code-point order, greater first — not by search hit order.
+pub(crate) fn family_warnings_from_runs(runs: &[Value]) -> Vec<Value> {
+    let mut latest: BTreeMap<&str, &Value> = BTreeMap::new();
+    for run in runs {
+        let prefix = run.get("prefix").and_then(Value::as_str).unwrap_or("");
+        match latest.get(prefix) {
+            Some(prev) if !run_is_newer(run, prev) => {}
+            _ => {
+                latest.insert(prefix, run);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (prefix, run) in latest {
+        let Some(warnings) = run.get("family_junk_warnings").and_then(Value::as_array) else {
+            continue;
+        };
+        for warning in warnings {
+            let mut copy = warning.clone();
+            if let Some(obj) = copy.as_object_mut() {
+                if !prefix.is_empty() && !obj.contains_key("prefix") {
+                    obj.insert("prefix".into(), json!(prefix));
+                }
+                if let Some(id) = run.get("run_id").filter(|_| !obj.contains_key("run_id")) {
+                    obj.insert("run_id".into(), id.clone());
+                }
+            }
+            out.push(copy);
+        }
+    }
+    out.sort_by(|left, right| {
+        let key = |value: &Value, field: &str| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        key(left, "prefix")
+            .cmp(&key(right, "prefix"))
+            .then(key(left, "family").cmp(&key(right, "family")))
+    });
+    out
+}
+
+fn run_field<'a>(value: &'a Value, field: &str) -> &'a str {
+    value.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+fn run_is_newer(candidate: &Value, current: &Value) -> bool {
+    match run_field(candidate, "started").cmp(run_field(current, "started")) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => run_field(candidate, "run_id") > run_field(current, "run_id"),
+    }
+}
+
+/// Add `family_junk_warnings` to a rendered map. A map with nothing to warn
+/// about is returned unchanged, so a clean catalog keeps the response it had.
+pub(crate) fn attach_family_junk_warnings(rendered: &str, runs: &[Value]) -> String {
+    let warnings = family_warnings_from_runs(runs);
+    if warnings.is_empty() {
+        return rendered.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(rendered) else {
+        return rendered.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return rendered.to_string();
+    };
+    obj.insert("family_junk_warnings".into(), Value::Array(warnings));
+    obj.insert("family_junk_warnings_note".into(), json!(FAMILY_JUNK_NOTE));
+    value.to_string()
+}
+
+/// Run documents from the catalog. Failure is an empty list: the field map
+/// is still returned. No server-side sort — `started` is not a date on every
+/// catalog this binary still reads.
+async fn fetch_run_sources(ctx: &Ctx) -> Vec<Value> {
+    let body = json!({
+        "size": 500,
+        "query": {"term": {"doc_kind": "run"}},
+        "_source": ["prefix", "run_id", "started", "family_junk_warnings"]
+    });
+    let url = format!("{}/{CATALOG_INDEX}/_search", ctx.base_url);
+    let mut req = ctx.client.post(&url).json(&body);
+    if let Some(auth) = &ctx.auth {
+        req = req.header("Authorization", auth);
+    }
+    let Ok(resp) = req.send().await else {
+        return Vec::new();
+    };
+    if !resp.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(text) = resp.text().await else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            hits.iter()
+                .filter_map(|hit| hit.get("_source").cloned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn annotate_field_count(rendered: &str, mapping_read: bool) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(rendered) else {
+        return rendered.to_string();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "field_count_means".into(),
+            json!(field_count_means(mapping_read)),
+        );
+    }
+    value.to_string()
+}
+
+async fn fetch_mappings(ctx: &Ctx, indexes: &[String]) -> Option<Value> {
+    if indexes.is_empty() {
+        return Some(json!({}));
+    }
+    let path = indexes
+        .iter()
+        .map(|name| super::enc(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = format!("{}/{path}/_mapping", ctx.base_url);
+    let mut req = ctx.client.get(&url);
+    if let Some(auth) = &ctx.auth {
+        req = req.header("Authorization", auth);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn index_names(resp: &Value) -> Vec<String> {
+    resp.pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            let mut names: Vec<String> = hits
+                .iter()
+                .filter_map(|h| {
+                    h.pointer("/_source/index_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        })
+        .unwrap_or_default()
+}
+
+/// `xerj_map` dispatch: read the catalog, union each index's live mapping so
+/// `ax_*` locators and any other mapped-but-unprofiled field are listed, then
+/// render. A missing catalog (the node never ran autoindex) is an error with
+/// the fix named — the response an agent can act on — while an empty-but-present
+/// catalog is a normal empty result, not an error.
 pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
     let parsed = match parse_args(args) {
         Ok(a) => a,
@@ -418,7 +831,21 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
                 match serde_json::from_str::<Value>(&text) {
-                    Ok(v) => tool_text(render_response(&v, &parsed), false),
+                    Ok(mut v) => {
+                        let mapping = fetch_mappings(ctx, &index_names(&v)).await;
+                        let mapping_read = mapping.is_some();
+                        merge_mapped_fields(&mut v, mapping.as_ref());
+                        let rendered =
+                            annotate_field_count(&render_response(&v, &parsed), mapping_read);
+                        // #2370: the field map lists datasets that were indexed.
+                        // A family that was entirely junked never becomes one,
+                        // so the map used to look complete. The run document
+                        // carries `family_junk_warnings` when that happened.
+                        // A failed read leaves the map as it was — the field
+                        // list is still the answer to "what can I query".
+                        let runs = fetch_run_sources(ctx).await;
+                        tool_text(attach_family_junk_warnings(&rendered, &runs), false)
+                    }
                     Err(e) => tool_text(
                         format!("xerj_map: catalog reply was not JSON ({e}): {text}"),
                         true,
@@ -433,6 +860,10 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
                     ),
                     true,
                 )
+            } else if let Some(proxied) =
+                crate::proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+            {
+                tool_text(proxied, true)
             } else {
                 tool_text(
                     format!("XERJ returned HTTP {status} from {CATALOG_INDEX}: {text}"),
@@ -440,7 +871,7 @@ pub(crate) async fn run(ctx: &Ctx, args: &Value) -> Value {
                 )
             }
         }
-        Err(e) => tool_text(format!("request to {url} failed: {e}"), true),
+        Err(e) => tool_text(crate::transport_failure_text(&ctx.base_url, &url, &e), true),
     }
 }
 
@@ -472,6 +903,9 @@ mod tests {
         MapArgs {
             index: index.map(str::to_string),
             max_bytes: DEFAULT_MAX_BYTES,
+            offset: 0,
+            limit: None,
+            detail: None,
         }
     }
 
@@ -511,6 +945,9 @@ mod tests {
         let resp = catalog_response(vec![dataset_doc("ax-logs", 10, fields)]);
         let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
         assert_eq!(out["matched"], 1);
+        let hint = out["locator_hint"].as_str().unwrap();
+        assert!(hint.contains("start_line"), "{hint}");
+        assert!(hint.contains("ax_path"), "{hint}");
         let idx = &out["indexes"][0];
         assert_eq!(idx["index"], "ax-logs");
         assert_eq!(idx["records"], 10);
@@ -647,6 +1084,9 @@ mod tests {
         let huge = MapArgs {
             index: None,
             max_bytes: 1_000_000,
+            offset: 0,
+            limit: None,
+            detail: None,
         };
         let full_len = serde_json::to_string(
             &serde_json::from_str::<Value>(&render_response(&resp_full, &huge)).unwrap()["indexes"]
@@ -670,6 +1110,9 @@ mod tests {
         let tight = MapArgs {
             index: None,
             max_bytes: budget,
+            offset: 0,
+            limit: None,
+            detail: None,
         };
         let out: Value = serde_json::from_str(&render_response(&resp_full, &tight)).unwrap();
         let idx = &out["indexes"][0];
@@ -705,6 +1148,9 @@ mod tests {
         let tight = MapArgs {
             index: None,
             max_bytes: MIN_MAX_BYTES,
+            offset: 0,
+            limit: None,
+            detail: None,
         };
         let out: Value = serde_json::from_str(&render_response(&resp, &tight)).unwrap();
         let idx = &out["indexes"][0];
@@ -716,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_names_filter_engine_side_and_globs_client_side() {
+    fn exact_names_and_globs_filter_engine_side() {
         let f = r#"[{"name":"a","es_type":"keyword","cardinality_est":1,"coverage":1.0,"examples":["a"]}]"#;
         let hits = vec![
             dataset_doc("ax-logs", 10, f),
@@ -729,9 +1175,13 @@ mod tests {
         let body = catalog_body(&args(Some("ax-logs")));
         assert_eq!(body["query"]["bool"]["must"].as_array().unwrap().len(), 2);
 
-        // Glob: no engine-side term; the client filter keeps only matches.
+        // A glob must filter before the 100-result cap: otherwise a matching
+        // low-record dataset can be omitted by unrelated larger datasets.
         let body = catalog_body(&args(Some("ax-*")));
-        assert_eq!(body["query"]["bool"]["must"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["query"]["bool"]["must"][1],
+            json!({ "wildcard": { "index_name": "ax-*" } })
+        );
         let out: Value =
             serde_json::from_str(&render_response(&resp, &args(Some("ax-*")))).unwrap();
         assert_eq!(out["matched"], 2);
@@ -769,6 +1219,26 @@ mod tests {
     }
 
     #[test]
+    fn many_datasets_render_as_a_summary_page() {
+        let f = r#"[{"name":"body","es_type":"text","cardinality_est":1,"coverage":1.0,"examples":["hello"]}]"#;
+        let hits: Vec<Value> = (0..12)
+            .map(|i| dataset_doc(&format!("ax-{i:02}"), 100 - i, f))
+            .collect();
+        let resp = catalog_response(hits);
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        assert_eq!(out["summary"], true);
+        assert_eq!(out["matched"], SUMMARY_PAGE.min(12));
+        assert!(out["indexes"][0].get("fields").is_none(), "{out}");
+        assert_eq!(out["indexes"][0]["field_names"][0], "body");
+        let mut full = args(None);
+        full.detail = Some(true);
+        let detailed: Value = serde_json::from_str(&render_response(&resp, &full)).unwrap();
+        assert!(detailed.get("summary").is_none(), "{detailed}");
+        assert_eq!(detailed["matched"], 12);
+        assert!(detailed["indexes"][0].get("fields").is_some());
+    }
+
+    #[test]
     fn indexes_past_the_fetch_cap_are_reported_not_silently_dropped() {
         let f = r#"[{"name":"a","es_type":"keyword","cardinality_est":1,"coverage":1.0}]"#;
         let mut resp = catalog_response(vec![dataset_doc("ax-a", 1, f)]);
@@ -776,6 +1246,101 @@ mod tests {
         let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
         assert_eq!(out["matched"], 1);
         assert_eq!(out["indexes_omitted"], 250 - 1);
+    }
+
+    #[test]
+    fn mapped_fields_the_catalog_omitted_are_unioned_in() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":2,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 28, fields)]);
+        let mapping = json!({
+            "ax-code": { "mappings": { "properties": {
+                "language": {"type": "keyword"},
+                "ax_path": {"type": "keyword"},
+                "ax_file": {"type": "keyword"},
+                "symbols": {"type": "object"},
+                "_internal": {"type": "keyword"}
+            }}}
+        });
+        merge_mapped_fields(&mut resp, Some(&mapping));
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        let idx = &out["indexes"][0];
+        // language (catalog) + ax_path + ax_file + symbols. `_internal` is not
+        // a user field, matching the planner's skip of `_`-prefixed names.
+        assert_eq!(idx["field_count"], 4, "{idx}");
+        let names: Vec<&str> = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert!(names.contains(&"ax_path"), "{names:?}");
+        assert!(names.contains(&"ax_file"), "{names:?}");
+        assert!(names.contains(&"symbols"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with('_')), "{names:?}");
+        let ax = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "ax_path")
+            .unwrap();
+        assert_eq!(ax["es_type"], "keyword");
+        assert_eq!(ax["coverage"], 1.0);
+        let language = idx["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "language")
+            .unwrap();
+        assert_eq!(
+            language["cardinality_est"], 2,
+            "a profiled field keeps its catalog stats"
+        );
+    }
+
+    #[test]
+    fn a_failed_mapping_read_still_lists_the_provenance_locators() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":1,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 1, fields)]);
+        merge_mapped_fields(&mut resp, None);
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        assert_eq!(
+            out["indexes"][0]["field_count"],
+            1 + PROVENANCE_FIELDS.len()
+        );
+        let names: Vec<&str> = out["indexes"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        for loc in PROVENANCE_FIELDS {
+            assert!(names.contains(loc), "missing {loc} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_mapping_that_omits_an_index_does_not_invent_locators() {
+        let fields =
+            r#"[{"name":"language","es_type":"keyword","cardinality_est":1,"coverage":1.0}]"#;
+        let mut resp = catalog_response(vec![dataset_doc("ax-code", 1, fields)]);
+        merge_mapped_fields(
+            &mut resp,
+            Some(&json!({"other": {"mappings": {"properties": {}}}})),
+        );
+        let out: Value = serde_json::from_str(&render_response(&resp, &args(None))).unwrap();
+        assert_eq!(out["indexes"][0]["field_count"], 1, "{out}");
+    }
+
+    #[test]
+    fn corrupt_fields_json_is_not_rewritten_by_the_mapping_merge() {
+        let mut resp = catalog_response(vec![dataset_doc("ax-bad", 5, "not json")]);
+        merge_mapped_fields(&mut resp, None);
+        assert_eq!(
+            resp["hits"]["hits"][0]["_source"]["fields_json"],
+            "not json"
+        );
     }
 
     #[test]
@@ -830,9 +1395,10 @@ mod tests {
         }
     }
 
-    /// Transport failure reaches the agent as isError with the URL named —
-    /// the same honesty as every other proxied tool. A silently empty map
-    /// here would be the worst failure mode: it reads as "no data".
+    /// Transport failure reaches the agent as isError, not as an empty map.
+    /// A silently empty map would be the worst failure mode: it reads as
+    /// "no data". Connection refused names the URL and the start command
+    /// (#2079); the catalog index is not the thing that is missing.
     #[tokio::test]
     async fn an_unreachable_node_is_an_error_not_an_empty_map() {
         let ctx = disconnected_ctx();
@@ -840,7 +1406,153 @@ mod tests {
         let res = crate::call_tool(&ctx, &msg).await;
         assert_eq!(res["isError"], true);
         let text = res["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("request to"), "{text}");
-        assert!(text.contains(CATALOG_INDEX), "{text}");
+        assert!(
+            text.contains("no XERJ node is listening at http://127.0.0.1:1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("xerj --insecure --data-dir ~/xerj-data"),
+            "{text}"
+        );
+        assert!(text.contains("xerj mcp does not start a node"), "{text}");
+        assert!(!text.contains("\"indexes\""), "{text}");
+    }
+
+    fn warning(family: &str, files: u64, junk: u64, reason: &str) -> Value {
+        json!({
+            "family": family,
+            "files": files,
+            "junk_files": junk,
+            "indexed_files": files - junk,
+            "extent": if junk == files { "all" } else { "most" },
+            "top_reason": reason,
+            "top_reason_files": junk
+        })
+    }
+
+    fn run_doc(prefix: &str, run_id: &str, started: &str, warnings: Vec<Value>) -> Value {
+        json!({
+            "prefix": prefix,
+            "run_id": run_id,
+            "started": started,
+            "family_junk_warnings": warnings
+        })
+    }
+
+    #[test]
+    fn a_clean_map_response_is_unchanged() {
+        let rendered = r#"{"matched":1,"indexes":[]}"#;
+        assert_eq!(
+            attach_family_junk_warnings(rendered, &[]),
+            rendered,
+            "no runs"
+        );
+        let clean = run_doc("ax", "run-2", "2026-10-24T00:00:02Z", vec![]);
+        assert_eq!(
+            attach_family_junk_warnings(rendered, &[clean]),
+            rendered,
+            "a run with an empty warning list adds nothing"
+        );
+    }
+
+    #[test]
+    fn the_map_names_an_all_junked_family_from_the_latest_run() {
+        let older = run_doc(
+            "ax",
+            "run-1",
+            "2026-10-24T00:00:01Z",
+            vec![warning("html", 2, 2, "old reason")],
+        );
+        let latest = run_doc(
+            "ax",
+            "run-2",
+            "2026-10-24T00:00:02Z",
+            vec![warning(
+                "pdf",
+                4,
+                4,
+                "could not start the isolated PDF parser",
+            )],
+        );
+        // Hit order is not the decision: the older run is listed last.
+        let rendered =
+            attach_family_junk_warnings(r#"{"matched":0,"indexes":[]}"#, &[latest, older]);
+        let out: Value = serde_json::from_str(&rendered).unwrap();
+        let warnings = out["family_junk_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{out}");
+        assert_eq!(warnings[0]["family"], "pdf");
+        assert_eq!(warnings[0]["files"], 4);
+        assert_eq!(warnings[0]["junk_files"], 4);
+        assert_eq!(warnings[0]["extent"], "all");
+        assert_eq!(
+            warnings[0]["top_reason"],
+            "could not start the isolated PDF parser"
+        );
+        assert_eq!(warnings[0]["prefix"], "ax");
+        assert_eq!(warnings[0]["run_id"], "run-2");
+        assert!(out["family_junk_warnings_note"]
+            .as_str()
+            .unwrap()
+            .contains("majority"));
+        // The field map itself is still there.
+        assert_eq!(out["matched"], 0);
+        assert!(out["indexes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_mostly_junked_family_is_reported_and_a_clean_family_is_not() {
+        let run = run_doc(
+            "papers",
+            "run-9",
+            "2026-10-24T12:00:00Z",
+            vec![warning("docx", 4, 3, "encrypted")],
+        );
+        let rendered = attach_family_junk_warnings(
+            r#"{"matched":1,"indexes":[{"index":"papers-notes"}]}"#,
+            &[run],
+        );
+        let out: Value = serde_json::from_str(&rendered).unwrap();
+        let warnings = out["family_junk_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["family"], "docx");
+        assert_eq!(warnings[0]["extent"], "most");
+        assert_eq!(warnings[0]["junk_files"], 3);
+        assert_eq!(warnings[0]["files"], 4);
+        assert_eq!(warnings[0]["indexed_files"], 1);
+        assert!(
+            warnings.iter().all(|w| w["family"] != "code"),
+            "a clean family is not added by the map layer: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn equal_start_times_break_by_run_id_and_prefixes_stay_apart() {
+        let low = run_doc(
+            "ax",
+            "run-a",
+            "2026-10-24T00:00:00Z",
+            vec![warning("pdf", 1, 1, "low")],
+        );
+        let high = run_doc(
+            "ax",
+            "run-b",
+            "2026-10-24T00:00:00Z",
+            vec![warning("pdf", 2, 2, "high")],
+        );
+        let other = run_doc(
+            "bench",
+            "run-1",
+            "2026-10-23T00:00:00Z",
+            vec![warning("csv", 3, 2, "header")],
+        );
+        let warnings = family_warnings_from_runs(&[low, other, high]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // Sorted by prefix, then family: ax before bench.
+        assert_eq!(warnings[0]["prefix"], "ax");
+        assert_eq!(warnings[0]["run_id"], "run-b");
+        assert_eq!(warnings[0]["top_reason"], "high");
+        assert_eq!(warnings[1]["prefix"], "bench");
+        assert_eq!(warnings[1]["family"], "csv");
+        assert_eq!(warnings[1]["extent"], "most");
     }
 }

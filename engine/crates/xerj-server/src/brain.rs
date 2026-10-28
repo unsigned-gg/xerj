@@ -36,7 +36,7 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const BOOT_POLL: Duration = Duration::from_millis(150);
 
 pub fn run_cli() -> i32 {
-    let args: Vec<String> = std::env::args().skip(2).collect();
+    let args: Vec<String> = xerj_common::argv::args_after_subcommand();
     let cfg = match parse(args) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
@@ -160,8 +160,10 @@ fn parse(args: Vec<String>) -> Result<Option<BrainCfg>, String> {
 }
 
 fn default_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join(".xerj").join("brain")
+    xerj_common::home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".xerj")
+        .join("brain")
 }
 
 /// (host, port) out of an `http://host[:port]` URL. Only plain-http local
@@ -615,6 +617,8 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         bulk_timeout_secs: 300,
         snapshot_max_bytes: 64u64 << 30,
         prefix: "ax".into(),
+        replace_prefix: false,
+        prefix_note: None,
         state_dir: None,
         fresh: cfg.fresh,
         follow_symlinks: false,
@@ -624,13 +628,14 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         // rather than inventing its own: build output does not belong in a
         // second brain either (#276).
         ignore: xerj_autoindex::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 2,
+        max_file_bytes: 2 << 30,
         sample: 500,
         no_semantic: false,
         code_analyzer: Default::default(),
         brain: Some(brain.to_string()),
         no_graph: false,
         dry_run: false,
+        walk_only: false,
         // The estimate/decision gate is an `xerj autoindex` CLI feature, and
         // `xerj brain` has no `--approve` of its own to answer it with. Arming
         // it here would stop the run with exit 4 and instructions the caller
@@ -638,6 +643,9 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         // grows its own answer flag. The estimate itself is still printed.
         max_minutes: 0,
         approve: None,
+        max_index_bytes: None,
+        budget_plan: None,
+        drop_indexed: false,
         json: false,
         quiet: false,
         // `xerj brain` is a foreground command a human watches; it gets the
@@ -647,6 +655,8 @@ fn index_cfg(cfg: &BrainCfg, brain: &str, api_key: Option<String>) -> IndexCfg {
         watch: false,
         label: None,
         debounce: std::time::Duration::from_millis(0),
+        exclude_rels: Vec::new(),
+        skip_corpus_data: false,
     }
 }
 
@@ -1001,6 +1011,7 @@ mod tests {
             journal_records: 42,
             files_done_journaled: 7,
             dataset_indices: 2,
+            state_dir: "/tmp/xerj-state".to_string(),
         }
         .into();
         assert!(zero_live_is_journal_server_disagreement(
@@ -1038,6 +1049,7 @@ mod tests {
             journal_records: 3,
             files_done_journaled: 1,
             dataset_indices: 1,
+            state_dir: "/tmp/xerj-state".to_string(),
         }
         .to_string();
         assert!(

@@ -525,10 +525,15 @@ impl Gate {
     }
 
     fn acquire(&self) -> GatePermit<'_> {
-        let mut state = self.state.lock().expect("mbox gate poisoned");
-        while state.0 >= state.1 {
-            state = self.ready.wait(state).expect("mbox gate poisoned");
-        }
+        let mut state = super::wait_until_slot(
+            "mbox parse",
+            &self.state,
+            &self.ready,
+            super::SLOT_HEARTBEAT,
+            |state| state.0 >= state.1,
+            |state| (state.0, state.1),
+            |line| eprintln!("{line}"),
+        );
         state.0 += 1;
         GatePermit(self)
     }
@@ -564,10 +569,15 @@ impl Budget {
     }
 
     fn acquire(&self, bytes: usize) {
-        let mut used = self.used.lock().expect("mbox budget poisoned");
-        while *used > 0 && used.saturating_add(bytes) > self.cap {
-            used = self.freed.wait(used).expect("mbox budget poisoned");
-        }
+        let mut used = super::wait_until_slot(
+            "mbox byte budget",
+            &self.used,
+            &self.freed,
+            super::SLOT_HEARTBEAT,
+            |used| *used > 0 && used.saturating_add(bytes) > self.cap,
+            |used| (*used, self.cap),
+            |line| eprintln!("{line}"),
+        );
         *used = used.saturating_add(bytes);
     }
 
@@ -745,10 +755,12 @@ fn extract_parallel<R: BufRead + Send>(
     let mut stats = ExtractStats::default();
     let mut failure: Option<std::io::Error> = None;
 
-    std::thread::scope(|scope| {
+    // #1122: see the spawn below. The scope joins before `reader` and
+    // the channels go out of scope.
+    xerj_common::thread_spawn::scope(|scope| {
         let splitter_tx = done_tx.clone();
         let (stop_ref, budget_ref) = (&stop, &budget);
-        scope.spawn(move || {
+        let splitter = move || {
             let mut split = Splitter::new(reader);
             let mut seq = 0u64;
             loop {
@@ -774,11 +786,19 @@ fn extract_parallel<R: BufRead + Send>(
             }
             let _ = splitter_tx.send(Done::End { total: seq });
             // `job_tx` drops here: the parsers drain what is queued and exit.
-        });
+        };
+        // #1122: `Builder::spawn_scoped` returns `Ok`, then the child panics
+        // if it cannot map an alternate signal stack (`panic = "abort"`
+        // takes the process with it). This scope uses `pthread_create`.
+        // Fewer parsers than asked for only costs speed; none at all — or
+        // no splitter — fails this mailbox through the ordinary error path
+        // below. A failed closure is dropped unrun.
+        let mut parsers = 0usize;
+        let mut spawn_error: Option<std::io::Error> = None;
         for _ in 0..workers {
             let job_rx = Arc::clone(&job_rx);
             let done_tx = done_tx.clone();
-            scope.spawn(move || loop {
+            let spawned = scope.spawn("xerj-mbox-parse", move || loop {
                 // Hold the lock only while waiting for a job, never while
                 // parsing one: the other parsers must be able to take theirs.
                 let job = match job_rx.lock() {
@@ -801,6 +821,35 @@ fn extract_parallel<R: BufRead + Send>(
                 {
                     return;
                 }
+            });
+            match spawned {
+                Ok(_) => parsers += 1,
+                Err(error) => {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let splitter_spawn = if parsers == 0 {
+            // Nobody would drain the job queue; dropping the splitter (and
+            // with it `job_tx` and the reader) is the clean way out.
+            drop(splitter);
+            Err(spawn_error.unwrap_or_else(|| {
+                std::io::Error::other("no mailbox parser threads were requested")
+            }))
+        } else {
+            scope.spawn("xerj-mbox-split", splitter)
+        };
+        if let Err(error) = splitter_spawn {
+            // The failed closure dropped `job_tx`, so any parsers that did
+            // start see a closed queue and exit; the consumer below reads
+            // this as an error at seq 0 and stops.
+            let _ = done_tx.send(Done::Error {
+                seq: 0,
+                error: std::io::Error::new(
+                    error.kind(),
+                    format!("could not start the mailbox reader threads: {error}"),
+                ),
             });
         }
         drop(done_tx);

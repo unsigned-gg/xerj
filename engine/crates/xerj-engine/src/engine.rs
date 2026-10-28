@@ -21,13 +21,20 @@ use crate::{EngineError, Result};
 
 // ── Memory-pressure drain plumbing (issue #948) ─────────────────────────────
 //
-// The parent RSS breaker used to only REJECT writes (429). Under a workload
+// The parent breaker used to only REJECT writes (429). Under a workload
 // whose caches hold gigabytes of re-hydratable state and whose memtable
 // holds raw write payloads, rejection frees nothing: the breaker stays
-// engaged, the client retries forever, and the run never finishes — exactly
+// engaged, the client retries, and the run never finishes — exactly
 // the #948 mailbox ingest (16 GiB cap, 26.5 GiB demand, 118-147 s engaged
-// stretches, 3-4 s releases). The sampler now also requests a DRAIN: flush
-// every index, release rebuildable caches, purge allocator pages.
+// stretches, 3-4 s releases) and the #2238 corpus-index loop (8 GiB auto
+// tier, dozens of indices under their own flush line but over the 2 GiB
+// summed-memtable budget, indexed count stuck at 0). The sampler requests
+// a DRAIN on either latch: flush every index, release rebuildable caches,
+// purge allocator pages. The latches do not share a timer. RSS uses
+// [`crate::governor::MemoryDrainSchedule`], which doubles its spacing up to
+// 15 minutes when a drain does not lower RSS (#1981). The summed-memtable
+// latch keeps the fixed 2 s window (#2238): that flush is what lets corpus
+// index move, and a stable RSS must not stretch it.
 
 /// Minimum spacing between automatic drains while the breaker stays engaged.
 /// The engage edge always fires immediately; repeats are rate-limited so a
@@ -35,11 +42,167 @@ use crate::{EngineError, Result};
 /// reads) without the drain worker competing with ingest for every tick.
 const MEMORY_DRAIN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Whether this sampler tick should ask the drain worker to run on the fixed
+/// window (#948, #2238).
+///
+/// The sampler passes the summed-memtable latch. A memtable-only trip used to
+/// be ignored, so a multi-index ingest that had filled the auto tier's 2 GiB
+/// memtable budget kept receiving HTTP 429 with nothing flushed and the
+/// indexed count stayed at 0. The engage edge fires immediately; while the
+/// latch stays up, repeats wait `min_interval`. Releasing the latch clears
+/// the timer so the next engage drains at once.
+///
+/// The RSS latch does not use this function. A drain that cannot shrink RSS
+/// backs off ([`crate::governor::MemoryDrainSchedule`], #1981). Applying that
+/// backoff to the memtable latch would stall corpus index while RSS sits
+/// still, which is the normal shape of a memtable-only trip.
+fn pressure_drain_due(
+    needs_drain: bool,
+    last_drain_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_interval: std::time::Duration,
+) -> bool {
+    if !needs_drain {
+        *last_drain_at = None;
+        return false;
+    }
+    let due = match *last_drain_at {
+        None => true,
+        Some(at) => now.saturating_duration_since(at) >= min_interval,
+    };
+    if due {
+        *last_drain_at = Some(now);
+    }
+    due
+}
+
+/// Whether this sample should request one drain for either parent latch.
+///
+/// RSS and the summed-memtable budget each keep their own clock. A flat RSS
+/// backs off ([`crate::governor::MemoryDrainSchedule`]); memtable pressure
+/// stays on [`MEMORY_DRAIN_MIN_INTERVAL`], including when the RSS clock is
+/// already stretched. One `true` is one request — the channel coalesces a
+/// second — so a staggered engage can ask slightly sooner than one window,
+/// and neither latch waits out the other's gap.
+fn sample_drain_due(
+    now: std::time::Instant,
+    rss: u64,
+    rss_engaged: bool,
+    memtable_engaged: bool,
+    rss_drains: &mut crate::governor::MemoryDrainSchedule,
+    last_memtable_drain_at: &mut Option<std::time::Instant>,
+) -> bool {
+    let rss_due = rss_drains.observe(now, rss, rss_engaged);
+    let memtable_due = pressure_drain_due(
+        memtable_engaged,
+        last_memtable_drain_at,
+        now,
+        MEMORY_DRAIN_MIN_INTERVAL,
+    );
+    rss_due || memtable_due
+}
+
 /// Bounded request channel from the sampler thread to the drain worker.
 /// Capacity 1 + try_send ⇒ requests coalesce: one arrives mid-drain is
 /// dropped, and the next sampler tick re-requests if still engaged.
 static MEMORY_DRAIN_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> =
     std::sync::OnceLock::new();
+
+/// Ask the drain worker to flush, at most once per [`MEMORY_DRAIN_MIN_INTERVAL`].
+///
+/// The sampler requests a drain on its own clock (`pressure_drain_due`). A
+/// write the breaker has just rejected also requests one (#2321): the 429
+/// itself does not free the memtable, and waiting for the next sample is how
+/// a client that retries immediately spends its patience against a budget
+/// nothing is flushing. This clock is separate, so the first rejection is
+/// immediate even when the sampler just fired. Later rejections from this
+/// path are spaced by the same interval, so a stream of 429s does not queue a
+/// drain per bulk. No worker (a library `Engine` that never called
+/// [`Engine::spawn_resource_sampler`]) is a no-op; callers that must flush
+/// inline use [`Engine::publish_memtables_if_budget_engaged`].
+pub(crate) fn request_memory_pressure_drain() {
+    if !drain_request_due() {
+        return;
+    }
+    if let Some(tx) = MEMORY_DRAIN_TX.get() {
+        let _ = tx.try_send(());
+    }
+}
+
+fn drain_request_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // `u64::MAX` is "never requested". Elapsed millis from process start do
+    // not reach it.
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    let now_ms = u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let prev = LAST_MS.load(Ordering::Relaxed);
+    let window_ms = u64::try_from(MEMORY_DRAIN_MIN_INTERVAL.as_millis()).unwrap_or(2_000);
+    if prev != u64::MAX && now_ms.saturating_sub(prev) < window_ms {
+        return false;
+    }
+    LAST_MS.store(now_ms, Ordering::Relaxed);
+    true
+}
+
+/// Spawn attempts (and the first back-off) for the governor's sampler and
+/// drain threads. They are started once, at boot; losing one disables the
+/// parent memory breaker for the life of the process, so a transient
+/// `EAGAIN` is worth riding out.
+const GOVERNOR_THREAD_SPAWN_ATTEMPTS: u32 = 3;
+const GOVERNOR_THREAD_SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Start one of the governor's background threads (#1122).
+///
+/// These used to be `let _ = Builder::spawn(..)`: a failed spawn was dropped
+/// on the floor, and the node silently ran with no memory breaker. Now the
+/// spawn is retried with back-off through `xerj_common::thread_spawn` (which
+/// never panics), and a final failure is logged at ERROR naming the thread
+/// and what the node loses. Returns whether the thread is running.
+///
+/// These threads deliberately do NOT consult the governor's spawn gate
+/// (`thread_spawn_safe`). The gate is a soft RSS watermark, not an OS
+/// allocation failure, and these are the threads that sample RSS, engage the
+/// breaker and drain memory. A node that boots above its watermark (a large
+/// WAL replay under a low `XERJ_MAX_PROCESS_MEMORY_MB`) would otherwise have
+/// every attempt refused and run with no breaker for the life of the process,
+/// which is exactly when the breaker is needed. A real spawn failure still
+/// comes back as an `Err` and is logged, not aborted.
+fn spawn_governor_thread<F>(name: &str, f: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    spawn_governor_thread_using(&xerj_common::thread_spawn::StdSpawn, || true, name, f)
+}
+
+fn spawn_governor_thread_using<S, G, F>(spawner: &S, gate: G, name: &str, f: F) -> bool
+where
+    S: xerj_common::thread_spawn::Spawn,
+    G: Fn() -> bool,
+    F: FnOnce() + Send + 'static,
+{
+    match xerj_common::thread_spawn::spawn_with_retry_using(
+        spawner,
+        gate,
+        name,
+        GOVERNOR_THREAD_SPAWN_ATTEMPTS,
+        GOVERNOR_THREAD_SPAWN_BACKOFF,
+        f,
+    ) {
+        Ok(_detached) => true,
+        Err(failure) => {
+            tracing::error!(
+                thread = name,
+                attempts = GOVERNOR_THREAD_SPAWN_ATTEMPTS,
+                error = %failure.error,
+                "could not start a resource-governor thread; the parent memory/disk \
+                 breaker is degraded until restart"
+            );
+            false
+        }
+    }
+}
 
 /// Allocator page purge hook, installed by the binary that owns the global
 /// allocator (xerj-server installs a jemalloc epoch+purge closure). Freeing
@@ -86,14 +249,24 @@ pub struct EmbeddingExecutionIdentity {
     /// while content-addressing it (#487) — the same number
     /// `NeuralEmbedder::dims` reports, so it is known without loading the
     /// model. It stays `None` for a `neural` node whose assets cannot be
-    /// resolved at all, and for `proxy`, whose width is whatever the remote
-    /// returns. A reader must not treat an absent width as 384.
+    /// resolved at all, and for a `proxy` whose endpoint has not confirmed a
+    /// width yet (#2306). A confirmed proxy reports the probed width. A reader
+    /// must not treat an absent width as 384.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
     pub semantic_contract: String,
     pub resumable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_resumable_reason: Option<String>,
+    /// Measured neural-ingest probe. Advisory and omitted when unset.
+    /// Not part of [`Self::identity_sha256`]: a different machine or a
+    /// warmer CPU must still resume the same index. Zero is never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_passages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_probe_millis: Option<u64>,
 }
 
 // ── Clustering types ─────────────────────────────────────────────────────────
@@ -750,18 +923,29 @@ pub struct Engine {
     /// `ShardRouter::update_from_metadata` whenever the Raft log
     /// commits a new shard assignment.
     pub shard_router: Arc<parking_lot::RwLock<xerj_cluster::router::ShardRouter>>,
+    /// One lock per `(index, shard)` held across a replica copy and the
+    /// in-sync publish that follows it. Document writes for a shard all run
+    /// on its primary, so this is what keeps two of those writes from
+    /// publishing different in-sync sets.
+    replica_sync: Arc<DashMap<(String, u32), Arc<tokio::sync::Mutex<()>>>>,
 
-    /// Exclusive advisory lock on `<data_dir>/node.lock`, held for the
-    /// engine's whole lifetime (RC4 blocker 13). Acquired in
-    /// [`Engine::new`] BEFORE any index is opened (i.e. before any WAL
-    /// replay or segment flush can touch the directory), so a second
-    /// xerj process pointed at a live data dir fails fast instead of
-    /// replaying the WAL and flushing duplicate segments into it — the
-    /// classic systemd double-start corruption. The lock is an OS-level
-    /// `flock`-style lock (`std::fs::File::try_lock`), so it dies with
-    /// the process: a `kill -9` releases it automatically and a stale
-    /// `node.lock` file never blocks the next boot.
-    _node_lock: Arc<std::fs::File>,
+    /// Exclusive lock on `<data_dir>/node.lock`, held for the engine's
+    /// whole lifetime (RC4 blocker 13). Acquired in [`Engine::new`] BEFORE
+    /// any index is opened (i.e. before any WAL replay or segment flush can
+    /// touch the directory), so a second xerj process pointed at a live data
+    /// dir fails fast instead of replaying the WAL and flushing duplicate
+    /// segments into it — the classic systemd double-start corruption.
+    ///
+    /// The OS lock dies with the process on Unix. A crash on Windows can
+    /// leave `LockFileEx` stuck on the file; `node_lock` reclaims it when
+    /// the PID it records is not running, and logs that reclaim. A live
+    /// holder still blocks a second start.
+    ///
+    /// Drop unlocks explicitly (`NodeLock`) before close. A `fork` in another
+    /// thread inherits the descriptor until that child execs; close alone
+    /// does not release `flock` across that window, so a second engine on
+    /// this directory would refuse to start after the holder was dropped.
+    _node_lock: Arc<crate::node_lock::NodeLock>,
 
     /// Serializes rewrites of `<data_dir>/cluster_state.json` (issue #203).
     ///
@@ -806,6 +990,11 @@ pub struct Engine {
     /// `redb/src/error.rs:65`; Apache-2.0/MIT, shape adapted, no code
     /// copied).
     cluster_state_boot: Arc<ClusterStateBootStatus>,
+    /// Raft proposer for cluster metadata. `None` unless
+    /// [`Engine::attach_cluster`] ran, which the server does only after the
+    /// cluster transport is up. Single-node boots leave this empty and every
+    /// index create/delete/mapping/settings path stays local.
+    cluster: Arc<parking_lot::Mutex<Option<xerj_cluster::ClusterHandle>>>,
 }
 
 impl Engine {
@@ -828,6 +1017,9 @@ impl Engine {
         // clone lineage. This ensures a later Engine re-reads same-path ONNX
         // assets while all Index config clones within one Engine share bytes.
         config.embedding.runtime_onnx_assets = Arc::new(std::sync::OnceLock::new());
+        // Same ownership rule for the proxy width cache: this engine probes
+        // into its own cell, and every index cloned from `config` shares it.
+        config.embedding.runtime_proxy_width = Arc::new(std::sync::RwLock::new(None));
         let data_dir = PathBuf::from(&config.server.data_dir);
         std::fs::create_dir_all(&data_dir)?;
 
@@ -835,7 +1027,7 @@ impl Engine {
         // scanning/opening any index below — Index::open replays the WAL
         // and can flush segments, which must never happen while another
         // process serves the same directory.
-        let node_lock = Arc::new(Self::acquire_node_lock(&data_dir)?);
+        let node_lock = Arc::new(crate::node_lock::acquire(&data_dir)?);
 
         // Classify durable cluster metadata before Index::open can replay a
         // WAL or startup reconciliation can rewrite it. The parsed document
@@ -955,9 +1147,11 @@ impl Engine {
             shard_router: Arc::new(parking_lot::RwLock::new(
                 xerj_cluster::router::ShardRouter::new(1),
             )),
+            replica_sync: Arc::new(DashMap::new()),
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
             cluster_state_boot: Arc::new(cluster_state_status),
+            cluster: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // A rejected cluster-state document means this binary cannot know the
@@ -1016,6 +1210,10 @@ impl Engine {
                                 Engine::apply_date_mapping_flags(&idx, m.value());
                             }
                             engine.load_or_backfill_index_created_at(&name_str);
+                            // Before the index is visible: a write that lands
+                            // in the same instant must already see the
+                            // persisted default pipeline (#2294).
+                            engine.rehydrate_index_settings_from_disk(&name_str);
                             engine.indices.insert(name_str, idx);
                         }
                         Err(e) => {
@@ -1117,61 +1315,6 @@ impl Engine {
         }
 
         Ok(engine)
-    }
-
-    /// Acquire the exclusive `<data_dir>/node.lock` advisory lock (RC4
-    /// blocker 13 — data-dir exclusivity).
-    ///
-    /// Uses `std::fs::File::try_lock` (flock-style, non-blocking): if
-    /// another process already holds the lock we fail fast with the
-    /// holder's pid instead of replaying its WAL and flushing duplicate
-    /// segments into a live directory. On success our own pid is written
-    /// into the file purely as a diagnostic for the *next* contender —
-    /// exclusivity comes from the OS lock, never from the pid content,
-    /// so a stale file left by `kill -9` (lock auto-released at process
-    /// death) can never wedge a reboot.
-    fn acquire_node_lock(data_dir: &std::path::Path) -> Result<std::fs::File> {
-        use std::io::Write;
-        let lock_path = data_dir.join("node.lock");
-        // Never O_TRUNC here: truncation must only happen AFTER the lock
-        // is ours, or a losing contender would erase the holder's pid.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        match file.try_lock() {
-            Ok(()) => {
-                let _ = file.set_len(0);
-                let _ = writeln!(&file, "{}", std::process::id());
-                let _ = file.sync_all();
-                Ok(file)
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                let holder = std::fs::read_to_string(&lock_path)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "unknown".to_string());
-                Err(EngineError::Common(xerj_common::XerjError::config(
-                    format!(
-                        "data dir '{}' is already in use by another running xerj process \
-                     (pid {holder}, lock file '{}') — refusing to start. Two processes \
-                     serving one data dir would replay each other's WAL and corrupt \
-                     segments; stop the other process or point this one at its own \
-                     server.data_dir.",
-                        data_dir.display(),
-                        lock_path.display(),
-                    ),
-                )))
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(EngineError::Common(xerj_common::XerjError::config(
-                    format!("failed to acquire node lock '{}': {e}", lock_path.display()),
-                )))
-            }
-        }
     }
 
     /// Drop PIT contexts whose `expires_at` is in the past. Cheap
@@ -1338,42 +1481,103 @@ impl Engine {
     /// into `schema` (adding any the schema does not already define). Applied
     /// on every create path so template behavior is independent of whether the
     /// caller supplied settings.
-    fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
+    ///
+    /// The cluster proposer calls this once and replicates the effective
+    /// schema. The applier must not call it again: nodes can have different
+    /// local templates, and a second pass would diverge.
+    ///
+    /// `semantic_text` stays a text field with an embedding contract. It used
+    /// to fall through to `object` here, so a template that matched (its
+    /// `keyword` fields appeared) still could not embed (#2281). The raw ES
+    /// mapping and settings are merged separately by
+    /// [`Engine::merge_index_template`] — this pass only builds the native
+    /// schema, and `schema_to_es_properties` cannot spell `semantic_text`.
+    pub(crate) fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
         let mut effective_schema = schema;
+        let mut new_semantic_targets = Vec::new();
         if let Some(tmpl) = self.best_matching_template(name) {
-            if let Some(props) = tmpl.mappings.get("properties") {
-                if let Some(obj) = props.as_object() {
-                    for (field_name, field_def) in obj {
-                        let es_type = field_def
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("object");
-                        let native_type = es_type_to_field_type(es_type);
-                        if !effective_schema
-                            .fields
-                            .iter()
-                            .any(|f| &f.name == field_name)
-                        {
-                            let mut fc = xerj_common::types::FieldConfig::new(
-                                field_name.clone(),
-                                native_type,
-                            );
-                            // #790: a template's `date_nanos` keeps nanosecond
-                            // precision; `FieldConfig::new` already made a
-                            // plain `date` millisecond-scaled.
-                            if native_type == xerj_common::types::FieldType::Date
-                                && es_type == "date_nanos"
-                            {
-                                fc.options.date_precision =
-                                    Some(xerj_common::types::DatePrecision::Nanos);
-                            }
-                            let _ = effective_schema.add_field(fc);
-                        }
+            if let Some(props) = tmpl.mappings.get("properties").and_then(Value::as_object) {
+                for (field_name, field_def) in props {
+                    if effective_schema
+                        .fields
+                        .iter()
+                        .any(|f| &f.name == field_name)
+                    {
+                        continue;
                     }
+                    let fc = field_from_template_property(field_name, field_def);
+                    if let Some(embedding) = fc.embedding.as_ref() {
+                        new_semantic_targets.push(
+                            embedding
+                                .target_field
+                                .clone()
+                                .unwrap_or_else(|| format!("{field_name}_vector")),
+                        );
+                    }
+                    let _ = effective_schema.add_field(fc);
                 }
             }
         }
+        // Only companions of fields this pass added. A caller that already
+        // built the schema (the ES create handler) has its own companions;
+        // adding them again would fail the duplicate-name check, and running
+        // this for every create would change indexes that have no template.
+        for target in new_semantic_targets {
+            if effective_schema.fields.iter().any(|f| f.name == target) {
+                continue;
+            }
+            let source = effective_schema.fields.iter().find(|f| {
+                f.embedding.as_ref().and_then(|e| e.target_field.as_deref())
+                    == Some(target.as_str())
+            });
+            let Some(source) = source else {
+                continue;
+            };
+            let mut companion =
+                xerj_common::types::FieldConfig::new(target, xerj_common::types::FieldType::Vector);
+            companion.options.dimensions = source.options.dimensions;
+            companion.options.similarity = source.options.similarity.clone();
+            let _ = effective_schema.add_field(companion);
+        }
         effective_schema
+    }
+
+    /// Merge the highest-priority matching template into a create body.
+    ///
+    /// Request mappings and settings win where both sides name the same field
+    /// or setting. Template values fill the gaps. With no matching template
+    /// the inputs are returned unchanged.
+    ///
+    /// Callers that persist the ES mapping blob and `index_settings` must use
+    /// this result. [`Engine::apply_index_template`] only updates the native
+    /// schema, which cannot round-trip `semantic_text` or
+    /// `index.default_pipeline` (#2281).
+    pub fn merge_index_template(
+        &self,
+        index_name: &str,
+        mappings: Value,
+        settings: Value,
+    ) -> (Value, Value) {
+        let Some(tmpl) = self.best_matching_template(index_name) else {
+            return (mappings, settings);
+        };
+        (
+            merge_template_mappings(&tmpl.mappings, mappings),
+            merge_template_settings(&tmpl.settings, settings),
+        )
+    }
+
+    /// `true` when `index` does not exist yet and a matching template declares
+    /// `semantic_text`. Bulk classifies the embed path before auto-create, so
+    /// a template-only field would otherwise take the turbo path and never be
+    /// embedded (#2281).
+    pub(crate) fn absent_index_template_has_semantic_text(&self, index: &str) -> bool {
+        if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
+            return false;
+        }
+        self.best_matching_template(index)
+            .and_then(|t| t.mappings.get("properties").cloned())
+            .is_some_and(|props| json_properties_have_semantic_text(&props))
     }
 
     /// Create a new index with explicit settings (e.g. custom analysis configuration).
@@ -1391,7 +1595,9 @@ impl Engine {
         // must reject here so HTTP, gRPC, direct CLI, and Console callers share
         // the same fail-closed boundary.
         self.ensure_cluster_state_writable()?;
-        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+        // Same rejection order as before the exact-create split: a bad name
+        // fails before the visibility and already-exists checks.
+        let _ = IndexName::new(name).map_err(EngineError::Common)?;
 
         // Per-index authorization backstop (issue #79): a caller that may not
         // see this name must not be able to bring it into existence either —
@@ -1424,9 +1630,39 @@ impl Engine {
 
         // Apply matching template (highest priority wins) on every create path.
         let effective_schema = self.apply_index_template(name, schema);
+        self.create_index_exact(name, effective_schema, settings)
+    }
+
+    /// Create `name` with `schema` exactly as given.
+    ///
+    /// Does not apply index templates and does not consult the per-request
+    /// visibility guard. The single-node create path applies the template and
+    /// checks visibility first. The cluster applier calls this so every member
+    /// materialises the schema the accepting node already resolved.
+    pub(crate) fn create_index_exact(
+        &self,
+        name: &str,
+        schema: Schema,
+        settings: serde_json::Value,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+
+        if self.indices.contains_key(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_already_exists(name),
+            ));
+        }
+
+        if let Some(f) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
+            ));
+        }
+
         let idx = Index::create_with_settings(
             index_name,
-            effective_schema,
+            schema,
             settings,
             &self.config,
             &self.data_dir,
@@ -1570,6 +1806,54 @@ impl Engine {
                 file: path.display().to_string(),
                 reason: format!("{e} ({} bytes on disk)", bytes.len()),
             }),
+        }
+    }
+
+    /// Copy `<data_dir>/<name>/settings.json` into `index_settings`.
+    ///
+    /// Create and `PUT /_settings` fill that map, and [`Self::default_pipeline_for`]
+    /// reads only the map. `GET /_settings` falls back to the file when the
+    /// entry is missing, so after a restart the binding was still reported
+    /// and ordinary writes no longer ran it (#2294). Boot, failed-index
+    /// retry, and snapshot restore all open an existing index through
+    /// `Index::open` and must rebuild the map from the same file `open` loaded.
+    ///
+    /// A missing file, or a JSON `null`, drops any stale entry: restoring a
+    /// snapshot that was created without settings must not keep the pipeline
+    /// the previous index had in memory. An unreadable or unparseable file is
+    /// logged and left as-is. `Index::open` already refuses an unparseable
+    /// `settings.json` before this runs, so a parse error here is a change
+    /// between those two reads, not a second copy of that refusal.
+    fn rehydrate_index_settings_from_disk(&self, name: &str) {
+        let path = self.data_dir.join(name).join("settings.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(settings) if !settings.is_null() => {
+                    self.index_settings.insert(name.to_string(), settings);
+                }
+                Ok(_) => {
+                    self.index_settings.remove(name);
+                }
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "settings.json did not parse while rebuilding index settings; \
+                         leaving the in-memory binding unchanged"
+                    );
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.index_settings.remove(name);
+            }
+            Err(e) => {
+                warn!(
+                    name,
+                    error = %e,
+                    "settings.json unreadable while rebuilding index settings; \
+                     leaving the in-memory binding unchanged"
+                );
+            }
         }
     }
 
@@ -2382,6 +2666,24 @@ impl Engine {
     /// sitting in the document on disk — the same lie in a different shape.
     /// A typed 503 is the only honest answer while the node cannot see the
     /// operator's configuration.
+    /// Install the Raft handle the server built for this process.
+    ///
+    /// Called once, after console bootstrap, so system indices created during
+    /// boot stay node-local. Later calls replace the handle.
+    pub fn attach_cluster(&self, handle: xerj_cluster::ClusterHandle) {
+        *self.cluster.lock() = Some(handle);
+    }
+
+    /// `true` when metadata writes must go through the Raft log.
+    pub fn has_cluster(&self) -> bool {
+        self.cluster.lock().is_some()
+    }
+
+    /// Clone of the proposer. The lock is not held across the subsequent await.
+    pub fn cluster_handle(&self) -> Option<xerj_cluster::ClusterHandle> {
+        self.cluster.lock().clone()
+    }
+
     pub fn ensure_cluster_state_writable(&self) -> Result<()> {
         if self.cluster_state_boot.is_writable() {
             return Ok(());
@@ -3016,6 +3318,46 @@ impl Engine {
         vec![name.to_string()]
     }
 
+    /// The concrete index a write to `name` must target when `name` is an
+    /// alias: a single backing index, or exactly one marked
+    /// `is_write_index: true`. `Ok(None)` means `name` is not an alias (a
+    /// concrete index or a name the caller may auto-create). More than one
+    /// candidate is ambiguous and refused with ES's message.
+    ///
+    /// `get_index` deliberately resolves an alias to its FIRST backing index,
+    /// which is fine for reads by name but wrong for a write: a two-index
+    /// alias silently sent the document to whichever member was listed first,
+    /// ignoring `is_write_index`. Write paths resolve through this function
+    /// before they touch a mapping, pipeline, or store.
+    pub fn write_target(&self, name: &str) -> std::result::Result<Option<String>, String> {
+        let Some(backings) = self.aliases.get(name) else {
+            return Ok(None);
+        };
+        if backings.len() == 1 {
+            return Ok(Some(backings[0].clone()));
+        }
+        let mut writes = backings.iter().filter(|backing| {
+            let Some(meta) = self.index_alias_metadata.get(backing.as_str()) else {
+                return false;
+            };
+            meta.get(name)
+                .and_then(|alias_meta| alias_meta.get("is_write_index"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+        let first = writes.next().cloned();
+        let second = writes.next();
+        match (first, second) {
+            (Some(target), None) => Ok(Some(target)),
+            (None, _) => Err(format!(
+                "no write index is defined for alias [{name}]. The write index may be \
+                 explicitly disabled using is_write_index=false or the alias points to \
+                 multiple indices without one being designated as a write index"
+            )),
+            (Some(_), Some(_)) => Err(format!("alias [{name}] has more than one write index")),
+        }
+    }
+
     /// Delete an index and all its data.
     ///
     /// Also drops any aliases that pointed only at this index (matching ES
@@ -3036,6 +3378,33 @@ impl Engine {
                 xerj_common::XerjError::index_not_found(name),
             ));
         }
+        if let Some(handle) = self.cluster_handle() {
+            // A name this node does not have is a local 404. Proposing it
+            // would delete the index on peers and, on the ES surface, come
+            // back as acknowledged once the not-found is swallowed.
+            if !self.indices.contains_key(name) && !self.failed_indices.contains_key(name) {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::index_not_found(name),
+                ));
+            }
+            let effect = handle
+                .propose(xerj_cluster::ClusterCommand::DeleteIndex {
+                    name: name.to_string(),
+                })
+                .await
+                .map_err(crate::cluster_apply::propose_error)?;
+            return crate::cluster_apply::effect_result(name, effect);
+        }
+        self.delete_index_local(name).await
+    }
+
+    /// Remove `name` from this node's storage.
+    ///
+    /// Does not propose. The cluster applier calls this after the delete has
+    /// committed. The single-node [`Engine::delete_index`] falls through here
+    /// after the visibility check.
+    pub(crate) async fn delete_index_local(&self, name: &str) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
         match self.indices.remove(name).map(|(_, v)| v) {
             Some(idx) => {
                 // The handle is pulled out of the map first so no write can
@@ -3231,6 +3600,7 @@ impl Engine {
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
+                self.rehydrate_index_settings_from_disk(name);
                 self.indices.insert(name.to_string(), idx);
                 self.failed_indices.remove(name);
                 info!(name, "failed index reopened");
@@ -3386,35 +3756,166 @@ impl Engine {
                 xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
             ));
         }
-        // Auto-create with empty schema.
-        self.create_index(name, Schema::empty())?;
+        // Auto-create. A matching template supplies the mapping and settings
+        // an explicit `PUT /{index}` would have merged in (#2281). The schema
+        // is filled by `apply_index_template` inside `create_index_with_settings`;
+        // the raw mapping and the display settings are what `GET /_mapping`
+        // and `default_pipeline_for` read, and neither is implied by the schema.
+        let (mappings, settings) = self.merge_index_template(name, Value::Null, Value::Null);
+        self.create_index_with_settings(name, Schema::empty(), settings.clone())?;
+        if mappings.as_object().is_some_and(|m| !m.is_empty()) {
+            self.put_index_mapping(name, mappings)?;
+        }
+        if settings.as_object().is_some_and(|m| !m.is_empty()) {
+            self.index_settings.insert(name.to_string(), settings);
+        }
         self.get_index(name)
     }
 
     /// V4 M5.2 — route a document to the node that owns its shard.
     ///
-    /// Returns `Ok(None)` when the doc belongs to this node (handle it
-    /// locally via the existing `Index::index_document_with_version`
-    /// path). Returns `Ok(Some(node_id))` when the doc belongs to a
-    /// peer and must be forwarded via the cluster transport.
+    /// Returns `None` when this node should write the document itself:
+    /// there is no shard assignment (single-node mode, and any index that
+    /// was not created through the replicated shard plan), or the assigned
+    /// owner is this node. Returns `Some(node_id)` when a peer owns the
+    /// shard. Callers forward that write; they do not also store it here.
     ///
-    /// In single-node mode (`num_shards == 1` and the router has no
-    /// assignments) this always resolves to "local" and the caller
-    /// takes the existing fast path — zero overhead for single-node
-    /// deployments.
+    /// With no cluster handle the owner comparison uses `"local"`, which
+    /// no replicated plan names, and the empty routing table makes every
+    /// call `None`.
     pub fn route_write(&self, index: &str, doc_id: &str) -> Option<String> {
+        let me = self.routing_node_id();
         let router = self.shard_router.read();
-        let (_shard, owner) = router.route_doc(index, doc_id);
-        match owner {
-            // No assignment yet — treat as local. This is the
-            // single-node default path.
+        match router.route_doc(index, doc_id).1 {
             None => None,
-            Some(owner) if owner == self.node_id.as_str() => None,
+            Some(owner) if owner == me => None,
             Some(owner) => Some(owner.to_string()),
         }
     }
 
-    /// Read-only view of the local node id.
+    /// `true` when a replicated shard plan names this node as the primary
+    /// for `doc_id`. An index with no plan is `false` — that is not the
+    /// same as [`Engine::route_write`] returning `None`, which also covers
+    /// the unassigned case.
+    pub fn owns_shard(&self, index: &str, doc_id: &str) -> bool {
+        let me = self.routing_node_id();
+        let router = self.shard_router.read();
+        matches!(router.route_doc(index, doc_id).1, Some(owner) if owner == me)
+    }
+
+    /// Node ids that hold at least one primary of `index`, sorted.
+    pub fn shard_search_targets(&self, index: &str) -> Vec<String> {
+        self.shard_router.read().search_targets(index)
+    }
+
+    /// Identity [`Engine::route_write`] compares against shard owners.
+    ///
+    /// The cluster handle's node id when one is attached, otherwise the
+    /// single-node `"local"` id.
+    pub fn routing_node_id(&self) -> String {
+        self.cluster
+            .lock()
+            .as_ref()
+            .map(|handle| handle.node_id().to_string())
+            .unwrap_or_else(|| self.node_id.to_string())
+    }
+
+    /// Replace `index`'s primary assignments and widen the hash width so
+    /// every shard in `plan` is reachable.
+    pub fn install_shard_plan(&self, index: &str, plan: &[xerj_cluster::ShardAssignment]) {
+        if plan.is_empty() {
+            return;
+        }
+        let mut router = self.shard_router.write();
+        let width = plan
+            .iter()
+            .map(|assignment| assignment.shard.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.clear_index(index);
+        for assignment in plan {
+            router.assign(index, assignment.shard, &assignment.node_id);
+            for replica in &assignment.replicas {
+                if replica != &assignment.node_id {
+                    router.add_replica(index, assignment.shard, replica);
+                }
+            }
+        }
+    }
+
+    /// `(shard, primary node)` for `doc_id`, when the index has a plan.
+    pub fn primary_of(&self, index: &str, doc_id: &str) -> Option<(u32, String)> {
+        let router = self.shard_router.read();
+        let (shard, owner) = router.route_doc(index, doc_id);
+        owner.map(|owner| (shard, owner.to_string()))
+    }
+
+    /// Primary node id for one shard of `index`, when the plan names one.
+    pub fn shard_primary(&self, index: &str, shard: u32) -> Option<String> {
+        self.shard_router.read().primary_node(index, shard)
+    }
+
+    /// Replica node ids a read or a copy uses, excluding the primary.
+    ///
+    /// The create-time list until an in-sync update commits, then the
+    /// replicas that confirmed the last acknowledged write.
+    pub fn replica_nodes(&self, index: &str, shard: u32) -> Vec<String> {
+        self.shard_router.read().get_replicas(index, shard)
+    }
+
+    /// Replicas named at create, excluding the primary. The quorum uses this
+    /// count, which does not shrink when a replica falls out of sync.
+    pub fn placed_replica_nodes(&self, index: &str, shard: u32) -> Vec<String> {
+        self.shard_router.read().placed_replicas(index, shard)
+    }
+
+    /// Record the replicas that may serve a later read of this shard.
+    ///
+    /// Ids outside the create-time list are ignored. A shard with no placed
+    /// replicas is left as it is.
+    pub fn set_shard_in_sync(&self, index: &str, shard: u32, nodes: &[String]) {
+        self.shard_router.write().set_in_sync(index, shard, nodes);
+    }
+
+    /// Lock that serializes replica copies of one shard on this process.
+    pub fn replica_sync_lock(&self, index: &str, shard: u32) -> Arc<tokio::sync::Mutex<()>> {
+        self.replica_sync
+            .entry((index.to_string(), shard))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Primary shards of `index` owned by `node_id`, sorted.
+    pub fn shards_owned_by(&self, index: &str, node_id: &str) -> Vec<u32> {
+        self.shard_router.read().shards_owned_by(index, node_id)
+    }
+
+    /// Shards of `index` for which this node is a replica, sorted.
+    pub fn local_replica_shards(&self, index: &str) -> Vec<u32> {
+        let me = self.routing_node_id();
+        self.shard_router.read().replica_shards_for(index, &me)
+    }
+
+    /// Record one primary without dropping the index's other shards.
+    pub fn assign_one_shard(&self, index: &str, shard: u32, node_id: &str) {
+        let mut router = self.shard_router.write();
+        let width = shard.saturating_add(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.assign(index, shard, node_id);
+    }
+
+    /// Drop `index` from the routing table. Called when a delete commits.
+    pub fn clear_shard_plan(&self, index: &str) {
+        self.shard_router.write().clear_index(index);
+    }
+
+    /// Read-only view of the single-node id (`"local"` unless a test
+    /// replaced the field). Cluster routing uses [`Engine::routing_node_id`].
     pub fn local_node_id(&self) -> &str {
         self.node_id.as_str()
     }
@@ -3859,6 +4360,11 @@ impl Engine {
     /// Return the effective embedding identity without exposing configuration
     /// secrets or local asset paths.
     pub fn embedding_execution_identity(&self) -> Result<EmbeddingExecutionIdentity> {
+        // #2306: a proxy resume needs a confirmed vector width. The probe runs
+        // here, on the identity request autoindex makes before it writes, and
+        // not on index open — open compares the model+endpoint digest, which
+        // does not wait on the endpoint.
+        crate::index::confirm_proxy_embedding_width(&self.config.embedding, &self.data_dir);
         crate::index::embedding_execution_identity(&self.config.embedding)
     }
 
@@ -3890,13 +4396,65 @@ impl Engine {
     /// new way to wedge. Returns the number of indexes drained; closed
     /// indexes are skipped (their caches were already released at close).
     pub async fn drain_rebuildable_memory(&self) -> usize {
-        let loaded: Vec<Arc<Index>> = self
+        let loaded = self.open_indices_largest_memtable_first();
+        self.release_rebuildable_memory(&loaded).await
+    }
+
+    /// Open indices, largest live memtable first (#2321).
+    ///
+    /// The summed budget stays engaged until enough bytes are retired. DashMap
+    /// iteration order can flush a tiny index first and leave the breaker up
+    /// for the rest of the walk; the index holding the bytes goes first so
+    /// the next sample can admit writes while the smaller ones are still
+    /// publishing.
+    fn open_indices_largest_memtable_first(&self) -> Vec<Arc<Index>> {
+        let mut loaded: Vec<Arc<Index>> = self
             .indices
             .iter()
             .filter(|e| !self.closed_indices.contains_key(e.key().as_str()))
             .map(|e| Arc::clone(e.value()))
             .collect();
-        self.release_rebuildable_memory(&loaded).await
+        loaded.sort_by_key(|idx| std::cmp::Reverse(idx.memtable_bytes()));
+        loaded
+    }
+
+    /// Publish memtables that are holding the process budget, before a search
+    /// walks them (#2321).
+    ///
+    /// A `{prefix}-*` search scans every index's memtable, frozen generations
+    /// included. On the 8 GiB auto tier that sum sits at 2 GiB while each
+    /// index is still under its own flush line — the same shape that answers
+    /// writes with HTTP 429. Scanning it is the multi-minute query a restart
+    /// (flush to segments) brought down to seconds. Flush, largest first, and
+    /// wait until the charged bytes drop or 30 s pass. Cache release is
+    /// intentionally not done here: the search that follows has to read the
+    /// segments just published.
+    ///
+    /// A no-op when the memtable breaker is off, so an ordinary search does
+    /// not flush. No governor (an `Index` built directly) is also a no-op.
+    pub async fn publish_memtables_if_budget_engaged(&self) -> usize {
+        let Some(governor) = crate::governor::global() else {
+            return 0;
+        };
+        if !governor.memtable_breaker_engaged() {
+            return 0;
+        }
+        let loaded = self.open_indices_largest_memtable_first();
+        let mut published = 0usize;
+        for idx in &loaded {
+            if idx.memtable_bytes() > 0 && idx.flush().await.is_ok() {
+                published += 1;
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            governor.refresh_memtable(self.total_memtable_bytes());
+            if !governor.memtable_breaker_engaged() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        published
     }
 
     /// Flush then release the rebuildable caches of exactly `indices`, then
@@ -3952,28 +4510,30 @@ impl Engine {
         // instead of dying with this thread's runtime.
         let drain_handle = tokio::runtime::Handle::try_current().ok();
         let (drain_tx, drain_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let _ = MEMORY_DRAIN_TX.set(drain_tx);
         let weak_c = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("xerj-mem-drain".to_string())
-            .spawn(move || {
-                let Some(handle) = drain_handle else {
-                    // Spawned outside a runtime (unit tests): the drain
-                    // method stays directly callable; only the sampler's
-                    // automatic wiring is inert.
-                    return;
+        let drain_worker = spawn_governor_thread("xerj-mem-drain", move || {
+            let Some(handle) = drain_handle else {
+                // Spawned outside a runtime (unit tests): the drain
+                // method stays directly callable; only the sampler's
+                // automatic wiring is inert.
+                return;
+            };
+            while let Ok(()) = drain_rx.recv() {
+                let Some(engine) = weak_c.upgrade() else {
+                    return; // engine dropped
                 };
-                while let Ok(()) = drain_rx.recv() {
-                    let Some(engine) = weak_c.upgrade() else {
-                        return; // engine dropped
-                    };
-                    let drained = handle.block_on(engine.drain_rebuildable_memory());
-                    tracing::info!(
+                let drained = handle.block_on(engine.drain_rebuildable_memory());
+                tracing::info!(
                         indexes = drained,
                         "memory breaker engaged — drained rebuildable state (flush + cache release + purge)"
                     );
-                }
-            });
+            }
+        });
+        // Publish the request channel only once a worker is draining it: with
+        // no worker, the sampler's requests have nowhere to go.
+        if drain_worker {
+            let _ = MEMORY_DRAIN_TX.set(drain_tx);
+        }
 
         // ── Thread A: memory + disk ──────────────────────────────────────
         // Touches NO engine lock — just `/proc/self/statm` + `statvfs`. Kept
@@ -3986,92 +4546,128 @@ impl Engine {
         let data_dir = self.data_dir.to_string_lossy().to_string();
         let cluster_settings = self.cluster_settings.clone();
         const FLOOD_STAGE_SETTING: &str = "cluster.routing.allocation.disk.watermark.flood_stage";
-        let _ = std::thread::Builder::new()
-            .name("xerj-mem-sampler".to_string())
-            .spawn(move || {
-                tracing::info!(
-                    period_ms = crate::governor::SAMPLE_INTERVAL_MS,
-                    "memory/disk sampler thread started (parent circuit breaker)"
-                );
-                // #948 drain bookkeeping: None while the breaker is
-                // disengaged (so the next engage edge fires immediately),
-                // Some(last-drain) while engaged (rate-limited repeats).
-                let mut last_drain_at: Option<std::time::Instant> = None;
-                loop {
-                    std::thread::sleep(period);
-                    if weak_a.strong_count() == 0 {
-                        return; // engine dropped
-                    }
-                    let governor = match crate::governor::global() {
-                        Some(g) => g,
-                        None => return,
-                    };
-                    let rss = crate::governor::current_rss_bytes();
-                    let (disk_pct, disk_avail) =
-                        crate::governor::disk_used_pct_and_avail(&data_dir);
-                    governor.refresh_memory_disk(rss, disk_pct, disk_avail);
+        const BREAKER_LIMIT_SETTING: &str = "indices.breaker.total.limit";
+        const DISK_THRESHOLD_SETTING: &str = "cluster.routing.allocation.disk.threshold_enabled";
+        // Snapshot the uncapped machine memory once: a percentage override is
+        // resolved against it, and it is the hard clamp for an absolute one.
+        let machine_memory_bytes = crate::governor::effective_memory_limit_bytes();
+        spawn_governor_thread("xerj-mem-sampler", move || {
+            tracing::info!(
+                period_ms = crate::governor::SAMPLE_INTERVAL_MS,
+                "memory/disk sampler thread started (parent circuit breaker)"
+            );
+            // Two clocks (#948). RSS backs off when a drain does not lower
+            // it (#1981). The summed-memtable latch stays on the 2 s window
+            // (#2238), including while that RSS clock is already stretched:
+            // a stable RSS is the normal shape of a memtable-only trip, and
+            // backing off there leaves corpus index at 429 with nothing
+            // flushed. try_send never blocks, so Thread A's no-lock contract
+            // still holds.
+            let mut rss_drains =
+                crate::governor::MemoryDrainSchedule::new(MEMORY_DRAIN_MIN_INTERVAL);
+            let mut last_memtable_drain_at: Option<std::time::Instant> = None;
+            loop {
+                std::thread::sleep(period);
+                if weak_a.strong_count() == 0 {
+                    return; // engine dropped
+                }
+                let governor = match crate::governor::global() {
+                    Some(g) => g,
+                    None => return,
+                };
+                // Working set on Linux and macOS. On Windows, the max of the
+                // working set and commit charge, plus available commit, so a
+                // no-pagefile box trips before VirtualAlloc aborts (#1122).
+                let observed = crate::governor::current_process_memory_bytes();
+                let available_commit = xerj_common::resource::available_commit_bytes();
+                let (disk_pct, disk_avail) = crate::governor::disk_used_pct_and_avail(&data_dir);
+                governor.refresh_memory_observing(observed, disk_pct, disk_avail, available_commit);
 
-                    // Issue #948 — a breaker that only rejects never lets a
-                    // memory-pinned workload finish: caches hold gigabytes
-                    // of re-hydratable state and the memtable holds raw
-                    // write payloads, and 429s free none of it. Request a
-                    // drain on the engage edge and at most once per window
-                    // while engaged. try_send never blocks, so Thread A's
-                    // no-lock/no-block contract above still holds.
-                    if governor.memory_breaker_engaged() {
-                        let fire = match last_drain_at {
-                            None => true,
-                            Some(at) => at.elapsed() >= MEMORY_DRAIN_MIN_INTERVAL,
-                        };
-                        if fire {
-                            last_drain_at = Some(std::time::Instant::now());
-                            if let Some(tx) = MEMORY_DRAIN_TX.get() {
-                                let _ = tx.try_send(());
-                            }
-                        }
-                    } else {
-                        last_drain_at = None;
-                    }
-
-                    // Runtime disk flood-stage override, matching ES's
-                    // `PUT _cluster/settings` unblock without a restart. A
-                    // non-blocking read: on contention we just keep last
-                    // tick's threshold and retry next sample, never stall
-                    // the memory/disk breaker on this lock.
-                    if let Ok(settings) = cluster_settings.try_read() {
-                        let flood_override = settings
-                            .get("persistent")
-                            .and_then(|p| p.get(FLOOD_STAGE_SETTING))
-                            .or_else(|| {
-                                settings
-                                    .get("transient")
-                                    .and_then(|t| t.get(FLOOD_STAGE_SETTING))
-                            })
-                            .and_then(crate::governor::parse_flood_stage_pct);
-                        governor.set_disk_flood_pct_override(flood_override);
+                if sample_drain_due(
+                    std::time::Instant::now(),
+                    // Same figure the breaker just compared: working set, or
+                    // on Windows the max of working set and commit charge.
+                    // Backing off on the working set alone would stretch
+                    // drains while commit charge is the value still climbing.
+                    observed,
+                    governor.memory_breaker_engaged(),
+                    governor.memtable_breaker_engaged(),
+                    &mut rss_drains,
+                    &mut last_memtable_drain_at,
+                ) {
+                    if let Some(tx) = MEMORY_DRAIN_TX.get() {
+                        let _ = tx.try_send(());
                     }
                 }
-            });
+
+                // Runtime disk flood-stage override, matching ES's
+                // `PUT _cluster/settings` unblock without a restart. A
+                // non-blocking read: on contention we just keep last
+                // tick's threshold and retry next sample, never stall
+                // the memory/disk breaker on this lock.
+                if let Ok(settings) = cluster_settings.try_read() {
+                    let flood_override = settings
+                        .get("persistent")
+                        .and_then(|p| p.get(FLOOD_STAGE_SETTING))
+                        .or_else(|| {
+                            settings
+                                .get("transient")
+                                .and_then(|t| t.get(FLOOD_STAGE_SETTING))
+                        })
+                        .and_then(crate::governor::parse_flood_stage_pct);
+                    governor.set_disk_flood_pct_override(flood_override);
+
+                    // `threshold_enabled: false` turns the flood stage
+                    // off and releases an engaged block, as in ES.
+                    let threshold_enabled = settings
+                        .get("persistent")
+                        .and_then(|p| p.get(DISK_THRESHOLD_SETTING))
+                        .or_else(|| {
+                            settings
+                                .get("transient")
+                                .and_then(|t| t.get(DISK_THRESHOLD_SETTING))
+                        })
+                        .and_then(crate::governor::parse_setting_bool);
+                    governor.set_disk_threshold_enabled(threshold_enabled);
+
+                    // Runtime parent-memory-breaker watermark override
+                    // (#1250): raise the watermark on a big box live via
+                    // `PUT _cluster/settings {indices.breaker.total.limit}`,
+                    // no restart — the live equivalent of the boot-only
+                    // XERJ_MAX_PROCESS_MEMORY_MB cap.
+                    let breaker_override = settings
+                        .get("persistent")
+                        .and_then(|p| p.get(BREAKER_LIMIT_SETTING))
+                        .or_else(|| {
+                            settings
+                                .get("transient")
+                                .and_then(|t| t.get(BREAKER_LIMIT_SETTING))
+                        })
+                        .and_then(|v| {
+                            crate::governor::parse_breaker_total_limit(v, machine_memory_bytes)
+                        });
+                    governor.set_memory_watermark_override(breaker_override);
+                }
+            }
+        });
 
         // ── Thread B: summed memtable budget ─────────────────────────────
         // Each per-index `size_bytes()` is one relaxed atomic load of the
         // aggregate the shards maintain incrementally — no shard locks, so
         // this never blocks under a turbo batch (#872).
         let weak_b = Arc::downgrade(self);
-        let _ = std::thread::Builder::new()
-            .name("xerj-memtable-sampler".to_string())
-            .spawn(move || loop {
-                std::thread::sleep(period);
-                let engine = match weak_b.upgrade() {
-                    Some(e) => e,
-                    None => return, // engine dropped
-                };
-                let governor = match crate::governor::global() {
-                    Some(g) => g,
-                    None => return,
-                };
-                governor.refresh_memtable(engine.total_memtable_bytes());
-            });
+        spawn_governor_thread("xerj-memtable-sampler", move || loop {
+            std::thread::sleep(period);
+            let engine = match weak_b.upgrade() {
+                Some(e) => e,
+                None => return, // engine dropped
+            };
+            let governor = match crate::governor::global() {
+                Some(g) => g,
+                None => return,
+            };
+            governor.refresh_memtable(engine.total_memtable_bytes());
+        });
     }
 
     // ── Transform pipeline methods ────────────────────────────────────────────
@@ -4092,14 +4688,24 @@ impl Engine {
     /// write addressed to an alias does not pick up its backing index's default
     /// pipeline. That is a known gap, identical on every write path.
     pub fn default_pipeline_for(&self, index: &str) -> Option<String> {
-        self.index_settings.get(index).and_then(|v| {
-            v.get("index")
-                .and_then(|ix| ix.get("default_pipeline"))
-                .or_else(|| v.get("index.default_pipeline"))
-                .or_else(|| v.get("default_pipeline"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        if let Some(p) = self
+            .index_settings
+            .get(index)
+            .and_then(|v| pipeline_setting(v.value()))
+        {
+            return Some(p);
+        }
+        // A write that auto-creates the index resolves the pipeline before
+        // that create (#2281). The template's default applies only then.
+        // An index that already exists keeps the pipeline persisted in its
+        // `settings.json`, which boot, retry, and snapshot restore copy back
+        // into this map (#2294). Falling through to the template would attach
+        // a pipeline the index was not created with.
+        if self.indices.contains_key(index) || self.failed_indices.contains_key(index) {
+            return None;
+        }
+        self.best_matching_template(index)
+            .and_then(|t| pipeline_setting(&t.settings))
     }
 
     /// Compile and register a typed transform pipeline from a JSON config,
@@ -4327,12 +4933,15 @@ impl Engine {
     ) -> Result<Value> {
         self.ensure_cluster_state_writable()?;
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        // No hub-pack root here: the pack cache is a restore-only source, so a
+        // client can never write a snapshot into the user's home directory.
         let snap_dir = validate_snapshot_path(
             repo_path,
             name,
             &snap_dir,
             &self.data_dir,
             &self.config.limits.snapshot_repo_allowlist,
+            None,
         )?;
         std::fs::create_dir_all(&snap_dir).map_err(EngineError::Io)?;
 
@@ -4426,12 +5035,22 @@ impl Engine {
     ) -> Result<Vec<String>> {
         self.ensure_cluster_state_writable()?;
         let snap_dir = std::path::Path::new(repo_path).join(name);
+        // `limits.hub_pack_restore`: the Corpus Hub pack cache of the user this
+        // server runs as is a restore source by default, so `xerj hub pull`
+        // works against a server the user started by hand (not only against the
+        // node `xerj ask` starts, which allowlists it in its own config).
+        let hub_packs = if self.config.limits.hub_pack_restore {
+            xerj_common::hub::hub_packs_dir()
+        } else {
+            None
+        };
         let snap_dir = validate_snapshot_path(
             repo_path,
             name,
             &snap_dir,
             &self.data_dir,
             &self.config.limits.snapshot_repo_allowlist,
+            hub_packs.as_deref(),
         )?;
         let manifest_path = snap_dir.join("manifest.json");
 
@@ -4587,6 +5206,9 @@ impl Engine {
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
+                    // Replace whatever the live map held. A snapshot created
+                    // without settings must not keep the previous binding.
+                    self.rehydrate_index_settings_from_disk(idx_name);
                     self.indices.insert(idx_name.clone(), idx);
                     // Restoring from a snapshot is *the* repair for an index
                     // that failed to open, so clear the recorded failure —
@@ -4649,6 +5271,7 @@ fn validate_snapshot_path(
     snap_dir: &std::path::Path,
     data_dir: &std::path::Path,
     allowlist: &[String],
+    hub_packs: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf> {
     if repo_path.is_empty() {
         return Err(EngineError::Common(
@@ -4689,6 +5312,10 @@ fn validate_snapshot_path(
             .iter()
             .map(|b| base_canon(std::path::Path::new(b))),
     );
+    // The hub pack cache (restore only — create passes `None`). Unlike an
+    // operator's allowlist entry it is implicit, so it is trusted only in the
+    // shape `xerj hub pull` makes it; see `trusted_hub_pack_root`.
+    allowed_bases.extend(hub_packs.and_then(trusted_hub_pack_root));
     if !allowed_bases.iter().any(|base| repo_base.starts_with(base)) {
         return Err(EngineError::Common(
             xerj_common::XerjError::invalid_mapping(format!(
@@ -4742,6 +5369,50 @@ fn validate_snapshot_path(
     }
 }
 
+/// The canonical hub pack-cache root a restore may read from, or `None` when
+/// `packs` is not safe to trust implicitly.
+///
+/// `limits.snapshot_repo_allowlist` entries are canonicalized as given: an
+/// operator who allowlists a symlink means its target. The hub root is NOT an
+/// operator's choice — it is derived from the environment — so it is held to
+/// the shape `xerj hub pull` creates (`create_dir_all`, by the same user):
+///
+///   - it exists and is a real directory, not a symlink (`symlink_metadata`),
+///     so `~/.xerj/hub/packs -> /` cannot widen the grant to the whole disk;
+///   - canonicalizing it changes nothing but its parent's resolution (its own
+///     last component is not a link);
+///   - it is not a filesystem root;
+///   - on Unix it is owned by the server's effective user, so a shared or
+///     pre-created directory (a `HOME` under a world-writable dir) is not
+///     honoured.
+///
+/// What is inside it is still checked per request: the caller canonicalizes the
+/// repo location, so `packs/x -> /etc` resolves outside this root and is
+/// refused, and `..` components are rejected before this is consulted.
+fn trusted_hub_pack_root(packs: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !packs.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(packs).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return None;
+        }
+    }
+    let canon = packs.canonicalize().ok()?;
+    let parent = packs.parent()?.canonicalize().ok()?;
+    if canon != parent.join(packs.file_name()?) || canon.parent().is_none() {
+        return None;
+    }
+    Some(canon)
+}
+
 /// Recursively copy all files from `src` to `dst`, recording relative paths in `files`.
 fn copy_dir_recursive(
     src: &std::path::Path,
@@ -4789,11 +5460,236 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     dp[m][n]
 }
 
+/// `index.default_pipeline` in any of the three spellings settings arrive in.
+fn pipeline_setting(v: &Value) -> Option<String> {
+    v.get("index")
+        .and_then(|ix| ix.get("default_pipeline"))
+        .or_else(|| v.get("index.default_pipeline"))
+        .or_else(|| v.get("default_pipeline"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn value_is_empty_object(v: &Value) -> bool {
+    v.is_null() || v.as_object().is_some_and(|m| m.is_empty())
+}
+
+/// Template mappings fill fields the request did not declare. A request
+/// property replaces the template's property of the same name. Other mapping
+/// keys (`dynamic`, `_source`, …) follow the same rule.
+fn merge_template_mappings(template: &Value, request: Value) -> Value {
+    let Some(template_obj) = template.as_object().filter(|m| !m.is_empty()) else {
+        return request;
+    };
+    let Some(request_obj) = request.as_object().filter(|m| !m.is_empty()) else {
+        return template.clone();
+    };
+    let mut out = template_obj.clone();
+    for (key, value) in request_obj {
+        if key == "properties" {
+            let mut props = out
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(req_props) = value.as_object() {
+                for (field, def) in req_props {
+                    props.insert(field.clone(), def.clone());
+                }
+                out.insert("properties".to_string(), Value::Object(props));
+            } else {
+                out.insert(key.clone(), value.clone());
+            }
+        } else {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Deep-merge `over` onto `base`. Objects combine; `over` wins on a leaf.
+fn deep_merge_request_wins(base: &Value, over: &Value) -> Value {
+    match (base.as_object(), over.as_object()) {
+        (Some(base), Some(over)) => {
+            let mut out = base.clone();
+            for (k, v) in over {
+                match out.get(k) {
+                    Some(existing) if existing.is_object() && v.is_object() => {
+                        out.insert(k.clone(), deep_merge_request_wins(existing, v));
+                    }
+                    _ => {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        _ => over.clone(),
+    }
+}
+
+/// Write `pipeline` in both spellings `default_pipeline_for` and
+/// `GET /_settings` read. Nested `index.default_pipeline` is what the settings
+/// response shows once an `index` object exists; a sibling dotted key is
+/// dropped by that response, which is how a template pipeline disappeared
+/// beside `xerj autoindex`'s `index.xerj_ingest_shards` (#2281).
+fn write_default_pipeline(settings: &mut Value, pipeline: &str) {
+    if !settings.is_object() {
+        *settings = serde_json::json!({});
+    }
+    let Some(obj) = settings.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "index.default_pipeline".to_string(),
+        Value::String(pipeline.to_string()),
+    );
+    let index = obj
+        .entry("index".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(index_obj) = index.as_object_mut() {
+        index_obj.insert(
+            "default_pipeline".to_string(),
+            Value::String(pipeline.to_string()),
+        );
+    }
+}
+
+/// Copy single-segment `index.<key>` entries into the nested `index` object
+/// when that object does not already name them. Keys with a further dot
+/// (`index.query.strict_unknown_fields`) stay as dotted keys: that is a
+/// spelling the reader looks up literally, and folding it would hide it.
+fn hoist_single_segment_index_keys(mut settings: Value) -> Value {
+    let dotted: Vec<(String, Value)> = {
+        let Some(obj) = settings.as_object() else {
+            return settings;
+        };
+        obj.iter()
+            .filter_map(|(k, v)| {
+                let rest = k.strip_prefix("index.")?;
+                if rest.is_empty() || rest.contains('.') {
+                    return None;
+                }
+                Some((rest.to_string(), v.clone()))
+            })
+            .collect()
+    };
+    if dotted.is_empty() {
+        return settings;
+    }
+    let Some(obj) = settings.as_object_mut() else {
+        return settings;
+    };
+    let index = obj
+        .entry("index".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(index_obj) = index.as_object_mut() {
+        for (k, v) in dotted {
+            index_obj.entry(k).or_insert(v);
+        }
+    }
+    settings
+}
+
+fn merge_template_settings(template: &Value, request: Value) -> Value {
+    let request_pipeline = pipeline_setting(&request);
+    let template_pipeline = pipeline_setting(template);
+    let Some(template_obj) = template.as_object().filter(|m| !m.is_empty()) else {
+        return request;
+    };
+    let mut merged = if value_is_empty_object(&request) {
+        Value::Object(template_obj.clone())
+    } else {
+        deep_merge_request_wins(&Value::Object(template_obj.clone()), &request)
+    };
+    // The request's spelling wins over the template's, whichever of the two
+    // forms each side used. Filling gaps via deep-merge alone keeps a
+    // template nested value when the request only set the dotted key.
+    if let Some(pipeline) = request_pipeline.or(template_pipeline) {
+        write_default_pipeline(&mut merged, &pipeline);
+    }
+    hoist_single_segment_index_keys(merged)
+}
+
+/// One template property, in the same native shape `es_properties_to_fields`
+/// builds for an explicit mapping. `semantic_text` is text plus an embedding
+/// contract — not `object` (#2281).
+fn field_from_template_property(name: &str, field_def: &Value) -> xerj_common::types::FieldConfig {
+    use xerj_common::types::{EmbeddingConfig, FieldConfig, FieldType};
+    let es_type = field_def
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("object");
+    let native_type = es_type_to_field_type(es_type);
+    let mut fc = FieldConfig::new(name.to_string(), native_type);
+    // #790: a template's `date_nanos` keeps nanosecond precision;
+    // `FieldConfig::new` already made a plain `date` millisecond-scaled.
+    if native_type == FieldType::Date && es_type == "date_nanos" {
+        fc.options.date_precision = Some(xerj_common::types::DatePrecision::Nanos);
+    }
+    if es_type == "semantic_text" {
+        // Same default as `es_properties_to_fields`: analyzed text has no
+        // doc values unless the mapping asks. An explicit `true` is kept.
+        fc.options.doc_values = field_def
+            .get("doc_values")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let dims = field_def
+            .get("dimensions")
+            .or_else(|| field_def.get("dims"))
+            .and_then(Value::as_u64)
+            .map(|d| d as usize)
+            .unwrap_or(xerj_ai::local::DEFAULT_DIMS);
+        fc.options.dimensions = Some(dims);
+        fc.options.similarity = Some(
+            field_def
+                .get("similarity")
+                .and_then(Value::as_str)
+                .unwrap_or("cosine")
+                .to_string(),
+        );
+        let target_field = field_def
+            .get("target_field")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{name}_vector"));
+        fc.embedding = Some(EmbeddingConfig {
+            endpoint: field_def
+                .get("inference_endpoint")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            model: field_def
+                .get("inference_id")
+                .or_else(|| field_def.get("model_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            target_field: Some(target_field),
+        });
+    }
+    fc
+}
+
+fn json_properties_have_semantic_text(props: &Value) -> bool {
+    let Some(obj) = props.as_object() else {
+        return false;
+    };
+    obj.values().any(|spec| {
+        spec.get("type").and_then(Value::as_str) == Some("semantic_text")
+            || spec
+                .get("properties")
+                .is_some_and(json_properties_have_semantic_text)
+    })
+}
+
 /// Convert an ES field type string to a native FieldType.
 fn es_type_to_field_type(es_type: &str) -> xerj_common::types::FieldType {
     use xerj_common::types::FieldType;
     match es_type {
-        "text" => FieldType::Text,
+        // `semantic_text` carries the source text. The embedding lives on the
+        // companion vector. Falling through to `Object` is what made a
+        // template field report `type: object` (#2281).
+        "text" | "semantic_text" => FieldType::Text,
         "keyword" | "constant_keyword" | "wildcard" => FieldType::Keyword,
         "long" | "integer" | "short" | "byte" | "unsigned_long" => FieldType::Long,
         "double" | "float" | "half_float" | "scaled_float" => FieldType::Double,
@@ -4820,7 +5716,7 @@ mod snapshot_path_security_tests {
         let outside = tempfile::TempDir::new().unwrap();
         let repo = outside.path().to_str().unwrap();
         let snap = std::path::Path::new(repo).join("s1");
-        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+        let err = validate_snapshot_path(repo, "s1", &snap, data.path(), &[], None)
             .expect_err("external repo location must be rejected");
         assert!(err.to_string().contains("outside data_dir"), "{err}");
     }
@@ -4832,7 +5728,7 @@ mod snapshot_path_security_tests {
         std::fs::create_dir_all(&repo_dir).unwrap();
         let repo = repo_dir.to_str().unwrap();
         let snap = repo_dir.join("s1");
-        validate_snapshot_path(repo, "s1", &snap, data.path(), &[])
+        validate_snapshot_path(repo, "s1", &snap, data.path(), &[], None)
             .expect("a repo under data_dir must be allowed");
     }
 
@@ -4842,8 +5738,15 @@ mod snapshot_path_security_tests {
         let ext = tempfile::TempDir::new().unwrap();
         let repo = ext.path().to_str().unwrap().to_string();
         let snap = std::path::Path::new(&repo).join("s1");
-        validate_snapshot_path(&repo, "s1", &snap, data.path(), std::slice::from_ref(&repo))
-            .expect("an allowlisted external root must be permitted");
+        validate_snapshot_path(
+            &repo,
+            "s1",
+            &snap,
+            data.path(),
+            std::slice::from_ref(&repo),
+            None,
+        )
+        .expect("an allowlisted external root must be permitted");
     }
 
     #[test]
@@ -4851,7 +5754,7 @@ mod snapshot_path_security_tests {
         let data = tempfile::TempDir::new().unwrap();
         let snap = data.path().join("..");
         let repo = data.path().to_str().unwrap();
-        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[]).is_err());
+        assert!(validate_snapshot_path(repo, "..", &snap, data.path(), &[], None).is_err());
     }
 
     #[test]
@@ -4864,15 +5767,146 @@ mod snapshot_path_security_tests {
         let data = tempfile::TempDir::new().unwrap();
         let repo = format!("{}/../../xerj-escape", data.path().display());
         let snap = std::path::Path::new(&repo).join("s1");
-        let err = validate_snapshot_path(&repo, "s1", &snap, data.path(), &[])
+        let err = validate_snapshot_path(&repo, "s1", &snap, data.path(), &[], None)
             .expect_err("a location containing `..` must be rejected");
         assert!(err.to_string().contains(".."), "unexpected error: {err}");
         // And it stays rejected even if the operator allowlists a broad root:
         // the `..` guard runs before containment, so a parent-ref cannot be
         // laundered through the allowlist either.
-        let err2 = validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()])
-            .expect_err("`..` must be rejected even with a permissive allowlist");
+        let err2 =
+            validate_snapshot_path(&repo, "s1", &snap, data.path(), &["/".to_string()], None)
+                .expect_err("`..` must be rejected even with a permissive allowlist");
         assert!(err2.to_string().contains(".."), "unexpected error: {err2}");
+    }
+}
+
+#[cfg(test)]
+mod hub_pack_restore_root_tests {
+    //! `limits.hub_pack_restore`: the Corpus Hub pack cache is a restore-only
+    //! snapshot root, trusted only in the shape `xerj hub pull` creates it.
+    use super::{trusted_hub_pack_root, validate_snapshot_path};
+    use std::path::{Path, PathBuf};
+
+    /// `<tmp>/hub/packs/lz4/0774d055/snapshot/<snap>` as `xerj hub pull`
+    /// extracts it, plus a data_dir elsewhere. Returns (tmp, data, packs, repo).
+    fn layout() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let packs = root.join("hub").join("packs");
+        let repo = packs.join("lz4").join("0774d055").join("snapshot");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(repo.join("snap-1")).unwrap();
+        (tmp, data, packs, repo)
+    }
+
+    fn check(repo: &Path, data: &Path, hub: Option<&Path>) -> Result<PathBuf, String> {
+        let repo_s = repo.to_str().unwrap();
+        validate_snapshot_path(repo_s, "snap-1", &repo.join("snap-1"), data, &[], hub)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_pulled_pack_is_restorable_from_the_hub_cache_without_an_allowlist() {
+        let (_t, data, packs, repo) = layout();
+        let snap = check(&repo, &data, Some(&packs)).expect("restore from the pack cache");
+        assert!(snap.starts_with(&packs), "{}", snap.display());
+    }
+
+    #[test]
+    fn without_the_hub_root_the_same_location_is_refused_as_before() {
+        // Create passes `None`, and so does `hub_pack_restore = false`: the
+        // pack cache is then exactly as foreign as any other path.
+        let (_t, data, _packs, repo) = layout();
+        let err = check(&repo, &data, None).expect_err("no hub root, no grant");
+        assert!(err.contains("snapshot_repo_allowlist"), "{err}");
+    }
+
+    #[test]
+    fn the_grant_covers_the_pack_cache_only_not_its_parent_or_a_sibling() {
+        let (_t, data, packs, _repo) = layout();
+        let hub = packs.parent().unwrap();
+        // The hub root itself (catalogue, node data, config) is not a restore source.
+        std::fs::create_dir_all(hub.join("node").join("snap-1")).unwrap();
+        assert!(check(&hub.join("node"), &data, Some(&packs)).is_err());
+        // A sibling sharing the name as a string prefix is not inside it.
+        let sibling = hub.join("packs-evil");
+        std::fs::create_dir_all(sibling.join("snap-1")).unwrap();
+        assert!(check(&sibling, &data, Some(&packs)).is_err());
+        // Nor is an unrelated absolute path.
+        assert!(check(Path::new("/etc"), &data, Some(&packs)).is_err());
+    }
+
+    #[test]
+    fn traversal_out_of_the_pack_cache_is_refused() {
+        let (_t, data, packs, _repo) = layout();
+        let outside = packs.parent().unwrap().parent().unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("snap-1")).unwrap();
+        let escape = packs
+            .join("lz4")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("outside");
+        let err = check(&escape, &data, Some(&packs)).expect_err("`..` refused");
+        assert!(err.contains(".."), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_pack_cache_cannot_point_the_restore_elsewhere() {
+        let (_t, data, packs, _repo) = layout();
+        let outside = packs.parent().unwrap().parent().unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("snap-1")).unwrap();
+        let link = packs.join("evil");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let err = check(&link, &data, Some(&packs)).expect_err("escaping link refused");
+        assert!(err.contains("snapshot_repo_allowlist"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pack_cache_that_is_itself_a_symlink_is_not_trusted() {
+        // `~/.xerj/hub/packs -> /` would otherwise turn the grant into the
+        // whole disk; `-> <elsewhere>` would move it somewhere nobody chose.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let hub = root.join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        let packs = hub.join("packs");
+        std::os::unix::fs::symlink("/", &packs).unwrap();
+        assert_eq!(trusted_hub_pack_root(&packs), None);
+        assert!(check(Path::new("/etc"), &data, Some(&packs)).is_err());
+
+        let real = root.join("elsewhere");
+        std::fs::create_dir_all(real.join("snap-1")).unwrap();
+        std::fs::remove_file(&packs).unwrap();
+        std::os::unix::fs::symlink(&real, &packs).unwrap();
+        assert_eq!(trusted_hub_pack_root(&packs), None);
+        assert!(check(&packs, &data, Some(&packs)).is_err());
+        assert!(check(&real, &data, Some(&packs)).is_err());
+    }
+
+    #[test]
+    fn a_missing_relative_or_non_directory_pack_cache_is_not_trusted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert_eq!(trusted_hub_pack_root(&root.join("absent")), None);
+        assert_eq!(trusted_hub_pack_root(Path::new("relative/packs")), None);
+        let file = root.join("packs");
+        std::fs::write(&file, b"not a dir").unwrap();
+        assert_eq!(trusted_hub_pack_root(&file), None);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        assert_eq!(trusted_hub_pack_root(&file), Some(file.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_filesystem_root_is_never_a_pack_cache() {
+        assert_eq!(trusted_hub_pack_root(Path::new("/")), None);
     }
 }
 
@@ -5068,5 +6102,326 @@ mod api_key_record_migration_tests {
         assert!(engine.has_open_index("alpha"));
         engine.delete_index("alpha").await.unwrap();
         assert!(!engine.has_open_index("alpha"));
+    }
+}
+
+#[cfg(test)]
+mod governor_thread_spawn_tests {
+    use super::spawn_governor_thread_using;
+    use xerj_common::thread_spawn::{BoxedJob, Spawn};
+
+    /// A spawner that always fails the way `pthread_create` does at a
+    /// thread or memory limit.
+    struct AlwaysEagain;
+
+    impl Spawn for AlwaysEagain {
+        fn spawn(
+            &self,
+            _name: &str,
+            _job: BoxedJob,
+        ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
+            Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+        }
+    }
+
+    #[test]
+    fn a_governor_thread_that_cannot_spawn_reports_false_instead_of_aborting() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_ran = std::sync::Arc::clone(&ran);
+        let started = spawn_governor_thread_using(
+            &AlwaysEagain,
+            || true,
+            "xerj-test",
+            move || {
+                job_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(!started);
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_closed_spawn_gate_is_respected() {
+        // A working spawner, but the gate is closed. Production passes an
+        // always-open gate for these threads (see `spawn_governor_thread`);
+        // this pins the plumbing for a caller that does gate.
+        let started = spawn_governor_thread_using(
+            &xerj_common::thread_spawn::StdSpawn,
+            || false,
+            "xerj-test",
+            || {},
+        );
+        assert!(!started);
+    }
+}
+
+#[cfg(test)]
+mod index_template_merge_tests {
+    //! #2281: a template's `semantic_text` and `index.default_pipeline` have
+    //! to survive the merge with the body `xerj autoindex` actually sends.
+    use super::{field_from_template_property, merge_template_mappings, merge_template_settings};
+    use serde_json::json;
+
+    #[test]
+    fn dotted_template_pipeline_survives_an_autoindex_settings_body() {
+        let template = json!({ "index.default_pipeline": "jsqlite-copy" });
+        let request = json!({
+            "index": { "xerj_ingest_shards": 1 },
+            "index.query.strict_unknown_fields": true,
+            "analysis": { "analyzer": { "default": { "type": "code" } } }
+        });
+        let merged = merge_template_settings(&template, request);
+        assert_eq!(
+            merged.pointer("/index/default_pipeline"),
+            Some(&json!("jsqlite-copy")),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.get("index.default_pipeline"),
+            Some(&json!("jsqlite-copy")),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.pointer("/index/xerj_ingest_shards"),
+            Some(&json!(1)),
+            "{merged}"
+        );
+        assert_eq!(
+            merged.get("index.query.strict_unknown_fields"),
+            Some(&json!(true)),
+            "{merged}"
+        );
+        assert!(
+            merged
+                .pointer("/index/query.strict_unknown_fields")
+                .is_none(),
+            "a multi-dot key must stay dotted: {merged}"
+        );
+        assert_eq!(
+            merged.pointer("/analysis/analyzer/default/type"),
+            Some(&json!("code")),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn the_request_pipeline_wins_in_either_spelling() {
+        let dotted_request = merge_template_settings(
+            &json!({ "index": { "default_pipeline": "from-template" } }),
+            json!({ "index.default_pipeline": "from-request" }),
+        );
+        assert_eq!(
+            dotted_request.pointer("/index/default_pipeline"),
+            Some(&json!("from-request")),
+            "{dotted_request}"
+        );
+        let nested_request = merge_template_settings(
+            &json!({ "index.default_pipeline": "from-template" }),
+            json!({ "index": { "default_pipeline": "from-request" } }),
+        );
+        assert_eq!(
+            nested_request.pointer("/index/default_pipeline"),
+            Some(&json!("from-request")),
+            "{nested_request}"
+        );
+        assert_eq!(
+            nested_request.get("index.default_pipeline"),
+            Some(&json!("from-request")),
+            "{nested_request}"
+        );
+    }
+
+    #[test]
+    fn request_properties_replace_template_properties_of_the_same_name() {
+        let merged = merge_template_mappings(
+            &json!({
+                "properties": {
+                    "diagnostic_semantic": { "type": "semantic_text" },
+                    "diagnostic_template_marker": { "type": "keyword" }
+                }
+            }),
+            json!({
+                "properties": {
+                    "impl": { "type": "text" },
+                    "diagnostic_semantic": { "type": "keyword" }
+                }
+            }),
+        );
+        assert_eq!(
+            merged.pointer("/properties/diagnostic_semantic/type"),
+            Some(&json!("keyword"))
+        );
+        assert_eq!(
+            merged.pointer("/properties/diagnostic_template_marker/type"),
+            Some(&json!("keyword"))
+        );
+        assert_eq!(
+            merged.pointer("/properties/impl/type"),
+            Some(&json!("text"))
+        );
+    }
+
+    #[test]
+    fn semantic_text_is_text_with_an_embedding_contract() {
+        use xerj_common::types::FieldType;
+        let semantic = field_from_template_property(
+            "diagnostic_semantic",
+            &json!({ "type": "semantic_text" }),
+        );
+        assert_eq!(semantic.field_type, FieldType::Text);
+        assert!(!semantic.options.doc_values);
+        let embedding = semantic.embedding.expect("embedding");
+        assert_eq!(
+            embedding.target_field.as_deref(),
+            Some("diagnostic_semantic_vector")
+        );
+        assert_eq!(semantic.options.dimensions, Some(384));
+
+        let keyword = field_from_template_property(
+            "diagnostic_template_marker",
+            &json!({ "type": "keyword" }),
+        );
+        assert_eq!(keyword.field_type, FieldType::Keyword);
+        assert!(keyword.embedding.is_none());
+    }
+}
+
+#[cfg(test)]
+mod pressure_drain_tests {
+    use super::{pressure_drain_due, sample_drain_due, MEMORY_DRAIN_MIN_INTERVAL};
+    use crate::governor::MemoryDrainSchedule;
+    use std::time::{Duration, Instant};
+
+    /// #2238: the engage edge drains immediately, a still-engaged latch does
+    /// not drain again inside the window, and releasing the latch arms the
+    /// next engage. The sampler passes the memtable latch; the RSS latch
+    /// has its own schedule.
+    #[test]
+    fn pressure_drain_fires_on_the_engage_edge_and_respects_the_window() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let window = Duration::from_secs(2);
+        assert!(pressure_drain_due(true, &mut last, t0, window));
+        assert!(
+            !pressure_drain_due(true, &mut last, t0 + Duration::from_millis(500), window),
+            "one engaged stretch drains once per window"
+        );
+        assert!(pressure_drain_due(
+            true,
+            &mut last,
+            t0 + Duration::from_secs(2),
+            window
+        ));
+        assert!(!pressure_drain_due(
+            false,
+            &mut last,
+            t0 + Duration::from_secs(3),
+            window
+        ));
+        assert!(last.is_none(), "a released latch clears the timer");
+        assert!(
+            pressure_drain_due(true, &mut last, t0 + Duration::from_secs(3), window),
+            "the next engage drains immediately"
+        );
+    }
+
+    /// #1981 x #2238: a flat RSS backs off, and that backoff must not hide a
+    /// memtable trip. Corpus index hits the summed budget while RSS is
+    /// stable; the flush that frees it stays on the 2 s window. A memtable
+    /// engage that arrives during an RSS gap drains on that sample, not at
+    /// the end of the gap.
+    #[test]
+    fn memtable_pressure_is_not_stretched_by_the_rss_backoff() {
+        let min = MEMORY_DRAIN_MIN_INTERVAL;
+        let t0 = Instant::now();
+        let stuck = 64 * 1024 * 1024;
+        let mut rss_drains = MemoryDrainSchedule::new(min);
+        let mut last_memtable = None;
+
+        let mut rss_fires = 0u32;
+        let mut t = Duration::ZERO;
+        let warmup = Duration::from_secs(60);
+        while t < warmup {
+            if sample_drain_due(
+                t0 + t,
+                stuck,
+                true,
+                false,
+                &mut rss_drains,
+                &mut last_memtable,
+            ) {
+                rss_fires += 1;
+            }
+            t += min;
+        }
+        assert!(
+            rss_fires < 20,
+            "a flat RSS must back off across 60s, fired {rss_fires}"
+        );
+        assert!(
+            !sample_drain_due(
+                t0 + warmup,
+                stuck,
+                true,
+                false,
+                &mut rss_drains,
+                &mut last_memtable,
+            ),
+            "the RSS clock is still inside its backed-off gap"
+        );
+        assert!(
+            sample_drain_due(
+                t0 + warmup,
+                stuck,
+                true,
+                true,
+                &mut rss_drains,
+                &mut last_memtable,
+            ),
+            "a memtable engage drains immediately during that gap"
+        );
+        assert!(!sample_drain_due(
+            t0 + warmup + Duration::from_millis(500),
+            stuck,
+            true,
+            true,
+            &mut rss_drains,
+            &mut last_memtable,
+        ));
+        assert!(sample_drain_due(
+            t0 + warmup + min,
+            stuck,
+            true,
+            true,
+            &mut rss_drains,
+            &mut last_memtable,
+        ));
+
+        // Memtable only, RSS stable and disengaged: every 2 s step fires.
+        // Folding this latch into the RSS backoff would drop fires well
+        // below the step count.
+        let mut rss_drains = MemoryDrainSchedule::new(min);
+        let mut last_memtable = None;
+        let horizon = Duration::from_secs(120);
+        let mut mem_fires = 0u32;
+        let mut t = Duration::ZERO;
+        while t < horizon {
+            if sample_drain_due(
+                t0 + t,
+                stuck,
+                false,
+                true,
+                &mut rss_drains,
+                &mut last_memtable,
+            ) {
+                mem_fires += 1;
+            }
+            t += min;
+        }
+        let steps = (horizon.as_secs() / min.as_secs()) as u32;
+        assert_eq!(
+            mem_fires, steps,
+            "memtable pressure keeps the fixed window while RSS does not fall"
+        );
     }
 }

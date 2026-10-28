@@ -523,7 +523,9 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
         return Ok(QueryNode::Match {
             field,
             query,
-            operator: BoolOperator::Or,
+            // No `operator` key exists in the shorthand. Log indices resolve
+            // this to AND (#1504); every other index treats it as OR.
+            operator: BoolOperator::Omitted,
             analyzer: None,
             boost: None,
             minimum_should_match: None,
@@ -544,7 +546,12 @@ fn parse_match(params: &Value) -> Result<QueryNode> {
         .get("query")
         .and_then(scalar_to_string)
         .ok_or_else(|| qerr("`match.query` must be a non-empty scalar"))?;
-    let operator = parse_bool_operator(vobj.get("operator"))?;
+    // Absent key → Omitted, not OR. An explicit "or" stays OR, including on
+    // a log index whose default is AND (#1504).
+    let operator = match vobj.get("operator") {
+        None => BoolOperator::Omitted,
+        some => parse_bool_operator(some)?,
+    };
     let analyzer = vobj
         .get("analyzer")
         .and_then(|v| v.as_str())
@@ -924,6 +931,7 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
                     value: tokens[0].clone(),
                     boost: fb,
                     constant_score: false,
+                    case_insensitive: false,
                 };
                 should.push(prefix);
                 continue;
@@ -957,6 +965,7 @@ fn parse_multi_match(params: &Value) -> Result<QueryNode> {
                 value: tokens[last].clone(),
                 boost: None,
                 constant_score: false,
+                case_insensitive: false,
             });
             let (im, is, imm) = if operator_and {
                 (inner_clauses, vec![], None)
@@ -1169,6 +1178,7 @@ fn date_resolve_err(e: dates::DateResolveError, fmt: Option<&str>, value: &str) 
             let _ = value; // value context already inside the math substring
             format!("operator not supported for date math [{m}]")
         }
+        UnknownTimeZone(tz) => format!("Unknown time-zone ID: {tz}"),
     };
     QueryError::Parse(ParseError::Invalid(msg))
 }
@@ -1182,9 +1192,10 @@ fn resolve_range_bound(
     round_up: bool,
     formats: Option<&[dates::DateFmt]>,
     fmt_raw: Option<&str>,
+    tz: Option<&dates::TimeZone>,
 ) -> Result<Value> {
     match &v {
-        Value::String(s) => match dates::resolve_date_bound_str(s, round_up, formats) {
+        Value::String(s) => match dates::resolve_date_bound_str_in(s, round_up, formats, tz) {
             Ok(Some(iso)) => Ok(Value::String(iso)),
             Ok(None) => Ok(v),
             Err(e) => Err(date_resolve_err(e, fmt_raw, s)),
@@ -1192,7 +1203,7 @@ fn resolve_range_bound(
         Value::Number(n) => match formats {
             // ES stringifies numbers under an explicit date format
             // (`gte: 1500, format: "uuuu"` parses "1500" as a year).
-            Some(fmts) => match dates::resolve_date_bound_num(n, round_up, fmts) {
+            Some(fmts) => match dates::resolve_date_bound_num_in(n, round_up, fmts, tz) {
                 Ok(Some(iso)) => Ok(Value::String(iso)),
                 Ok(None) => Ok(v),
                 Err(e) => Err(date_resolve_err(e, fmt_raw, &n.to_string())),
@@ -1242,19 +1253,29 @@ fn parse_range(params: &Value) -> Result<QueryNode> {
         Some(f) => Some(dates::compile_formats(f).map_err(|e| date_resolve_err(e, fmt_raw, ""))?),
         None => None,
     };
+    // `time_zone` applies to bounds without their own offset and to date
+    // math rounding; an unknown zone is a 400, as in ES.
+    let tz = match inner.get("time_zone").and_then(|v| v.as_str()) {
+        Some(raw) => {
+            Some(dates::TimeZone::parse(raw).map_err(|e| date_resolve_err(e, fmt_raw, raw))?)
+        }
+        None => None,
+    };
+    let tz = tz.as_ref();
+    let fmts = formats.as_deref();
     // Round-up bounds: `lte` includes its whole covered interval, `gt`
     // excludes its whole covered interval.  `gte`/`lt` round down.
     if let Some(v) = gte.take() {
-        gte = Some(resolve_range_bound(v, false, formats.as_deref(), fmt_raw)?);
+        gte = Some(resolve_range_bound(v, false, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = gt.take() {
-        gt = Some(resolve_range_bound(v, true, formats.as_deref(), fmt_raw)?);
+        gt = Some(resolve_range_bound(v, true, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = lte.take() {
-        lte = Some(resolve_range_bound(v, true, formats.as_deref(), fmt_raw)?);
+        lte = Some(resolve_range_bound(v, true, fmts, fmt_raw, tz)?);
     }
     if let Some(v) = lt.take() {
-        lt = Some(resolve_range_bound(v, false, formats.as_deref(), fmt_raw)?);
+        lt = Some(resolve_range_bound(v, false, fmts, fmt_raw, tz)?);
     }
 
     if gte.is_none() && gt.is_none() && lte.is_none() && lt.is_none() {
@@ -1289,6 +1310,7 @@ fn parse_prefix(params: &Value) -> Result<QueryNode> {
             value: value.to_string(),
             boost: None,
             constant_score: true,
+            case_insensitive: false,
         });
     }
 
@@ -1314,6 +1336,10 @@ fn parse_prefix(params: &Value) -> Result<QueryNode> {
             value,
             boost,
             constant_score: true,
+            case_insensitive: inner
+                .get("case_insensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
         name,
     ))
@@ -1730,7 +1756,7 @@ fn qs_range_bound(raw: &str) -> Option<Value> {
 /// query_string range bound.
 fn qs_resolve_bound(v: Option<Value>, round_up: bool) -> Result<Option<Value>> {
     match v {
-        Some(b) => Ok(Some(resolve_range_bound(b, round_up, None, None)?)),
+        Some(b) => Ok(Some(resolve_range_bound(b, round_up, None, None, None)?)),
         None => Ok(None),
     }
 }
@@ -1830,10 +1856,10 @@ fn qs_parse_cmp_range(q: &str, field: &str, rest: &str, mut i: usize) -> Result<
     let (mut gt, mut gte, mut lt, mut lte) = (None, None, None, None);
     // ES rounding: `>` and `<=` round the bound up, `>=` and `<` round down.
     match op {
-        ">" => gt = Some(resolve_range_bound(bound, true, None, None)?),
-        ">=" => gte = Some(resolve_range_bound(bound, false, None, None)?),
-        "<" => lt = Some(resolve_range_bound(bound, false, None, None)?),
-        _ => lte = Some(resolve_range_bound(bound, true, None, None)?),
+        ">" => gt = Some(resolve_range_bound(bound, true, None, None, None)?),
+        ">=" => gte = Some(resolve_range_bound(bound, false, None, None, None)?),
+        "<" => lt = Some(resolve_range_bound(bound, false, None, None, None)?),
+        _ => lte = Some(resolve_range_bound(bound, true, None, None, None)?),
     }
     Ok((
         QsTok::Range {
@@ -2401,6 +2427,7 @@ fn parse_regexp(params: &Value) -> Result<QueryNode> {
         return Ok(QueryNode::Regexp {
             field,
             pattern: pattern.to_string(),
+            case_insensitive: false,
         });
     }
 
@@ -2409,7 +2436,15 @@ fn parse_regexp(params: &Value) -> Result<QueryNode> {
         .ok_or_else(|| qerr("`regexp` field value must be a string or object"))?;
 
     let pattern = string_field(inner, "value")?;
-    Ok(QueryNode::Regexp { field, pattern })
+    let case_insensitive = inner
+        .get("case_insensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(QueryNode::Regexp {
+        field,
+        pattern,
+        case_insensitive,
+    })
 }
 
 fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
@@ -2483,6 +2518,246 @@ fn parse_match_phrase_prefix(params: &Value) -> Result<QueryNode> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum SqsTok {
+    Term(String),
+    Phrase(String),
+    And,    // `+`
+    Or,     // `|`
+    Not,    // `-`
+    LParen, // `(`
+    RParen, // `)`
+}
+
+fn unescape_sqs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(nxt) = chars.next() {
+                out.push(nxt);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn tokenize_simple_query_string(q: &str) -> Vec<SqsTok> {
+    let bytes = q.as_bytes();
+    let mut out: Vec<SqsTok> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            out.push(SqsTok::LParen);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            out.push(SqsTok::RParen);
+            i += 1;
+            continue;
+        }
+        if c == '|' {
+            i += 1;
+            if i < bytes.len() && bytes[i] as char == '|' {
+                i += 1;
+            }
+            out.push(SqsTok::Or);
+            continue;
+        }
+        if c == '+' {
+            out.push(SqsTok::And);
+            i += 1;
+            continue;
+        }
+        if c == '-' {
+            out.push(SqsTok::Not);
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() {
+                if bytes[j] as char == '\\' && j + 1 < bytes.len() {
+                    j += 2;
+                } else if bytes[j] as char == '"' {
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            let phrase = unescape_sqs(&q[start..j]);
+            if !phrase.is_empty() {
+                out.push(SqsTok::Phrase(phrase));
+            }
+            if j < bytes.len() && bytes[j] as char == '"' {
+                i = j + 1;
+            } else {
+                i = j;
+            }
+            continue;
+        }
+
+        // Bare term: read until whitespace, '(', ')', '|', or '"'
+        // NOTE: '+' or '-' inside a term (e.g. "c++", "node-fetch", "2024-05-01")
+        // is part of the term, so we do not stop on '+' or '-' mid-term.
+        let start = i;
+        while i < bytes.len() {
+            let ch = bytes[i] as char;
+            if ch.is_ascii_whitespace() || ch == '(' || ch == ')' || ch == '|' || ch == '"' {
+                break;
+            }
+            if ch == '\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        let tok = unescape_sqs(&q[start..i]);
+        if !tok.is_empty() {
+            out.push(SqsTok::Term(tok));
+        }
+    }
+    out
+}
+
+fn parse_sqs_unary(
+    toks: &[SqsTok],
+    pos: &mut usize,
+    fields: &[String],
+    lenient: bool,
+    default_and: bool,
+) -> Option<QueryNode> {
+    while *pos < toks.len() {
+        match &toks[*pos] {
+            SqsTok::LParen => {
+                *pos += 1;
+                let _depth_guard = DepthGuard::enter().ok()?;
+                let inner = parse_sqs_level(toks, pos, fields, lenient, default_and);
+                if *pos < toks.len() && matches!(toks[*pos], SqsTok::RParen) {
+                    *pos += 1;
+                }
+                return inner;
+            }
+            SqsTok::RParen => {
+                *pos += 1;
+            }
+            SqsTok::Term(term) => {
+                *pos += 1;
+                return Some(make_simple_query_node(term, false, fields, lenient));
+            }
+            SqsTok::Phrase(phrase) => {
+                *pos += 1;
+                return Some(make_simple_query_node(phrase, true, fields, lenient));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_sqs_level(
+    toks: &[SqsTok],
+    pos: &mut usize,
+    fields: &[String],
+    lenient: bool,
+    default_and: bool,
+) -> Option<QueryNode> {
+    let mut clauses: Vec<(QsOccur, QueryNode)> = Vec::new();
+
+    while *pos < toks.len() && !matches!(toks[*pos], SqsTok::RParen) {
+        let mut conj = QsConj::None;
+        let mut req_mod = false;
+        let mut not_mod = false;
+
+        while let Some(t) = toks.get(*pos) {
+            match t {
+                SqsTok::And => {
+                    if clauses.is_empty() || conj != QsConj::None {
+                        req_mod = true;
+                    } else {
+                        conj = QsConj::And;
+                    }
+                }
+                SqsTok::Or => {
+                    conj = QsConj::Or;
+                }
+                SqsTok::Not => {
+                    not_mod = true;
+                }
+                _ => break,
+            }
+            *pos += 1;
+        }
+
+        if *pos >= toks.len() || matches!(toks[*pos], SqsTok::RParen) {
+            break;
+        }
+
+        let Some(node) = parse_sqs_unary(toks, pos, fields, lenient, default_and) else {
+            continue;
+        };
+
+        if let Some(prev) = clauses.last_mut() {
+            if prev.0 != QsOccur::MustNot {
+                if conj == QsConj::And {
+                    prev.0 = QsOccur::Must;
+                } else if conj == QsConj::Or && default_and {
+                    prev.0 = QsOccur::Should;
+                }
+            }
+        }
+
+        let required = if default_and {
+            !not_mod && conj != QsConj::Or
+        } else {
+            req_mod || (conj == QsConj::And && !not_mod)
+        };
+
+        let occur = if not_mod {
+            QsOccur::MustNot
+        } else if required {
+            QsOccur::Must
+        } else {
+            QsOccur::Should
+        };
+
+        clauses.push((occur, node));
+    }
+
+    if clauses.is_empty() {
+        return None;
+    }
+
+    let (mut must, mut should, mut must_not) = (Vec::new(), Vec::new(), Vec::new());
+    for (occur, node) in clauses {
+        match occur {
+            QsOccur::Must => must.push(node),
+            QsOccur::Should => should.push(node),
+            QsOccur::MustNot => must_not.push(node),
+        }
+    }
+
+    let minimum_should_match =
+        (must.is_empty() && !should.is_empty()).then_some(MinShouldMatch::Fixed(1));
+
+    Some(QueryNode::Bool {
+        must,
+        should,
+        must_not,
+        filter: Vec::new(),
+        minimum_should_match,
+    })
+}
+
 fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
     let obj = params
         .as_object()
@@ -2509,72 +2784,80 @@ fn parse_simple_query_string(params: &Value) -> Result<QueryNode> {
         .unwrap_or("or")
         .to_lowercase();
 
+    let default_and = default_operator == "and";
+
     let mm: Option<MinShouldMatch> = obj
         .get("minimum_should_match")
         .and_then(|v| parse_min_should_match(v).ok());
     // #1284: same default as `multi_match` / `query_string`.
     let lenient = parse_lenient(obj.get("lenient")).unwrap_or_else(|| targets_every_field(&fields));
 
-    // Tokenize the query: split on whitespace; leading +/-/| signal per-term operators.
-    let mut must: Vec<QueryNode> = Vec::new();
-    let mut should: Vec<QueryNode> = Vec::new();
-    let mut must_not: Vec<QueryNode> = Vec::new();
+    let toks = tokenize_simple_query_string(&query);
+    let mut pos = 0;
+    let parsed = parse_sqs_level(&toks, &mut pos, &fields, lenient, default_and);
 
-    for tok in query.split_whitespace() {
-        // Detect a leading per-term sign.
-        let (sign, term_text) = if let Some(rest) = tok.strip_prefix('+') {
-            ('+', rest)
-        } else if let Some(rest) = tok.strip_prefix('-') {
-            ('-', rest)
-        } else if let Some(rest) = tok.strip_prefix('|') {
-            ('|', rest)
-        } else {
-            (' ', tok)
-        };
-        if term_text.is_empty() {
-            continue;
-        }
-        let node = make_simple_query_node(term_text, &fields, lenient);
-        match sign {
-            '+' => must.push(node),
-            '-' => must_not.push(node),
-            '|' => should.push(node),
-            _ => {
-                // Unsigned token: dispatched per default_operator.
-                if default_operator == "and" {
-                    must.push(node);
-                } else {
-                    should.push(node);
-                }
+    let node = match parsed {
+        Some(QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match: auto_mm,
+        }) => {
+            let final_mm = if mm.is_some() { mm } else { auto_mm };
+            QueryNode::Bool {
+                must,
+                should,
+                must_not,
+                filter,
+                minimum_should_match: final_mm,
             }
         }
-    }
-
-    // No tokens parsed (rare empty query): treat query as a literal term.
-    if must.is_empty() && should.is_empty() && must_not.is_empty() {
-        let node = make_simple_query_node(&query, &fields, lenient);
-        return Ok(node);
-    }
-
-    let final_mm = if !should.is_empty() && must.is_empty() && mm.is_none() {
-        // Default: at least 1 should clause must match.
-        Some(MinShouldMatch::Fixed(1))
-    } else {
-        mm
+        Some(other) => other,
+        None => make_simple_query_node(&query, false, &fields, lenient),
     };
 
-    Ok(QueryNode::Bool {
-        must,
-        should,
-        must_not,
-        filter: Vec::new(),
-        minimum_should_match: final_mm,
-    })
+    Ok(node)
 }
 
-/// Build a Match or MultiMatch node for a term in a simple_query_string.
-fn make_simple_query_node(term: &str, fields: &[String], lenient: bool) -> QueryNode {
-    if fields.len() == 1 {
+/// Build a Match, MatchPhrase, or MultiMatch node for a term in a simple_query_string.
+fn make_simple_query_node(
+    term: &str,
+    is_phrase: bool,
+    fields: &[String],
+    lenient: bool,
+) -> QueryNode {
+    if is_phrase {
+        if fields.len() == 1 {
+            QueryNode::MatchPhrase {
+                field: fields[0].clone(),
+                query: term.to_string(),
+                slop: 0,
+                analyzer: None,
+                boost: None,
+                lenient,
+            }
+        } else if fields.is_empty() {
+            QueryNode::QueryString {
+                query: format!("\"{}\"", term),
+                default_field: None,
+                default_operator: None,
+                boost: None,
+            }
+        } else {
+            QueryNode::MultiMatch {
+                fields: fields.to_vec(),
+                query: term.to_string(),
+                match_type: crate::ast::MultiMatchType::Phrase,
+                operator: None,
+                analyzer: None,
+                boost: None,
+                slop: 0,
+                max_expansions: 50,
+                lenient,
+            }
+        }
+    } else if fields.len() == 1 {
         QueryNode::Match {
             field: fields[0].clone(),
             query: term.to_string(),
@@ -3067,12 +3350,16 @@ fn parse_hybrid(params: &Value) -> Result<QueryNode> {
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let entry = v
-                .as_object()
-                .ok_or_else(|| qerr(format!("`hybrid.queries[{i}]` must be an object")))?;
-            let q_val = entry
-                .get("query")
-                .ok_or_else(|| qerr(format!("`hybrid.queries[{i}]` missing `query`")))?;
+            let entry = v.as_object().ok_or_else(|| {
+                qerr(format!(
+                    "`hybrid.queries[{i}]` must be an object {{\"query\": <clause>, \"weight\": <number>}}"
+                ))
+            })?;
+            let q_val = entry.get("query").ok_or_else(|| {
+                qerr(format!(
+                    "`hybrid.queries[{i}]` missing `query`; each item is {{\"query\": <clause>, \"weight\": <number>}} (weight defaults to 1)"
+                ))
+            })?;
             let query = parse_query(q_val)?;
             let weight = entry.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             Ok(WeightedQuery { query, weight })
@@ -4464,6 +4751,7 @@ fn parse_match_bool_prefix(params: &Value) -> Result<QueryNode> {
             value: fold(&raw_tokens[0]),
             boost: None,
             constant_score: true,
+            case_insensitive: false,
         });
     }
 
@@ -4500,6 +4788,9 @@ fn parse_match_bool_prefix(params: &Value) -> Result<QueryNode> {
         value: fold(&raw_tokens[last_idx]),
         boost: None,
         constant_score: false,
+        // `match_bool_prefix` lowers to an internal prefix over ANALYZED
+        // tokens — no user-facing `case_insensitive` option to thread.
+        case_insensitive: false,
     });
 
     // operator:and → every clause must match; otherwise should + mm.
@@ -4955,7 +5246,7 @@ mod tests {
     fn test_match_shorthand() {
         let node = q(json!({"match": {"title": "hello world"}}));
         assert!(
-            matches!(node, QueryNode::Match { ref field, ref query, operator: BoolOperator::Or, .. }
+            matches!(node, QueryNode::Match { ref field, ref query, operator: BoolOperator::Omitted, .. }
             if field == "title" && query == "hello world")
         );
     }
@@ -4985,6 +5276,25 @@ mod tests {
             assert_eq!(analyzer, Some("english".to_string()));
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    /// #1504: a long-form `match` that leaves `operator` out is not the same
+    /// node as one that says `"operator": "or"`. The log-index default can
+    /// fill the gap; it must not override an explicit OR.
+    #[test]
+    fn match_without_an_operator_is_omitted_and_explicit_or_is_or() {
+        let omitted = q(json!({"match": {"message": {"query": "SIP 403 Forbidden"}}}));
+        match omitted {
+            QueryNode::Match { operator, .. } => assert_eq!(operator, BoolOperator::Omitted),
+            other => panic!("expected match, got {other:?}"),
+        }
+        let explicit = q(json!({
+            "match": {"message": {"query": "SIP 403 Forbidden", "operator": "or"}}
+        }));
+        match explicit {
+            QueryNode::Match { operator, .. } => assert_eq!(operator, BoolOperator::Or),
+            other => panic!("expected match, got {other:?}"),
         }
     }
 
@@ -5288,6 +5598,23 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn test_range_date_time_zone() {
+        let node = q(json!({"range": {"date": {
+            "gte": "2024-03-10", "lt": "2024-03-11", "time_zone": "+05:30"
+        }}}));
+        if let QueryNode::Range { gte, lt, .. } = node {
+            assert_eq!(gte, Some(json!("2024-03-09T18:30:00.000Z")));
+            assert_eq!(lt, Some(json!("2024-03-10T18:30:00.000Z")));
+        } else {
+            panic!("wrong variant");
+        }
+        let err = parse_query(
+            &json!({"range": {"date": {"gte": "2024-03-10", "time_zone": "Mars/Base"}}}),
+        );
+        assert!(err.is_err(), "an unknown time_zone must be rejected");
     }
 
     #[test]
@@ -6171,6 +6498,38 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_item_missing_query_names_the_query_weight_shape() {
+        let err = parse_query(&json!({
+            "hybrid": {
+                "queries": [
+                    {"weight": 1.0},
+                    {"query": {"match_all": {}}}
+                ]
+            }
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`hybrid.queries[0]` missing `query`"), "{msg}");
+        assert!(
+            msg.contains("{\"query\": <clause>, \"weight\": <number>}"),
+            "{msg}"
+        );
+        assert!(msg.contains("weight defaults to 1"), "{msg}");
+
+        let err = parse_query(&json!({
+            "hybrid": { "queries": ["rotate keys"] }
+        }))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "`hybrid.queries[0]` must be an object {\"query\": <clause>, \"weight\": <number>}"
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn test_hybrid_learned_rejected() {
         // Learned fusion is not implemented — must fail loud rather than
         // silently substituting RRF. Both the string and object forms.
@@ -6814,5 +7173,112 @@ mod tests {
                 "`{name}` must refuse with an explanatory message, got: {err}"
             );
         }
+    }
+
+    // ── #1751: simple_query_string standalone and infix operators ──────────────
+
+    #[test]
+    fn simple_query_string_honors_operators_grouping_and_phrases() {
+        // `fox | bear` under `default_operator: and` must be OR (should clauses).
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "fox | bear",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool {
+                should,
+                must,
+                minimum_should_match,
+                ..
+            } => {
+                assert!(
+                    must.is_empty(),
+                    "must be empty under OR conjunction: {must:?}"
+                );
+                assert_eq!(should.len(), 2);
+                assert_eq!(minimum_should_match, Some(MinShouldMatch::Fixed(1)));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `fox + lazy` under default operator must be AND (must clauses).
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "fox + lazy",
+                "fields": ["title"]
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, should, .. } => {
+                assert_eq!(must.len(), 2, "both terms must be required: {must:?}");
+                assert!(should.is_empty());
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `"quick brown" | bear` under `default_operator: and` must produce MatchPhrase and Match in should.
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "\"quick brown\" | bear",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool { should, must, .. } => {
+                assert!(must.is_empty());
+                assert_eq!(should.len(), 2);
+                assert!(
+                    matches!(&should[0], QueryNode::MatchPhrase { ref query, .. } if query == "quick brown")
+                );
+                assert!(
+                    matches!(&should[1], QueryNode::Match { ref query, .. } if query == "bear")
+                );
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // `(fox | bear) + brown` under `default_operator: and` must group (fox | bear) and require brown.
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "(fox | bear) + brown",
+                "fields": ["title"],
+                "default_operator": "and"
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, .. } => {
+                assert_eq!(must.len(), 2);
+                assert!(
+                    matches!(&must[0], QueryNode::Bool { ref should, .. } if should.len() == 2)
+                );
+                assert!(matches!(&must[1], QueryNode::Match { ref query, .. } if query == "brown"));
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // Negation with `-`
+        let node = q(json!({
+            "simple_query_string": {
+                "query": "+fox -dog",
+                "fields": ["title"]
+            }
+        }));
+        match node {
+            QueryNode::Bool { must, must_not, .. } => {
+                assert_eq!(must.len(), 1);
+                assert_eq!(must_not.len(), 1);
+            }
+            other => panic!("expected Bool, got {other:?}"),
+        }
+
+        // Resilient to trailing/standalone operators and unclosed quotes/parens
+        let _ = q(json!({ "simple_query_string": { "query": "fox |" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "(fox | bear" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "\"unclosed phrase" } }));
+        let _ = q(json!({ "simple_query_string": { "query": "++ -- ||" } }));
     }
 }

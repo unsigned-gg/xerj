@@ -11,7 +11,7 @@ use axum::{
     Json,
 };
 use chrono::{Datelike, TimeZone, Timelike, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -262,7 +262,7 @@ fn configured_members(config: &xerj_common::config::Config) -> Vec<(String, std:
 /// Node count for `/_cluster/health`: `1` when cluster mode is off, else the
 /// distinct configured membership (own address + peers, so a peer list that
 /// also names this node is not double-counted).
-fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
+pub(crate) fn configured_node_count(config: &xerj_common::config::Config) -> u32 {
     if !config.cluster.enabled {
         return 1;
     }
@@ -710,6 +710,143 @@ pub struct CatFormatParams {
     /// #1201: `bytes=b|k|kb|…` — re-render size columns in that unit.
     #[serde(default)]
     pub bytes: Option<String>,
+    /// ES `expand_wildcards`: `open` (default) omits `.xerj_*` console
+    /// indices, `hidden` lists only those, `open,hidden` and `all` list
+    /// both. `closed` is accepted and does not drop closed indices —
+    /// `_cat/indices` keeps a closed index visible (issue #463).
+    /// `.xerj-memory-*` brains stay in the default listing: they are the
+    /// caller's data, and insecure mode asserts they remain visible.
+    #[serde(default)]
+    pub expand_wildcards: Option<String>,
+    /// Xerj console escape hatch: `include_system=true` adds `.xerj_*`
+    /// indices without dropping the rows the other flags selected.
+    #[serde(default)]
+    pub include_system: Option<String>,
+}
+
+/// Which names `_cat/indices` may list when the request did not name them
+/// explicitly. A concrete path (`/_cat/indices/.xerj_users`) always returns
+/// that row; this only filters the unscoped listing and wildcard expansion.
+///
+/// "Hidden" here is a console system index (`.xerj_*`), not every
+/// dot-prefixed name. `.xerj-memory-*` is the caller's brain and stays in
+/// the default listing.
+struct CatVisibility {
+    include_visible: bool,
+    include_hidden: bool,
+}
+
+impl CatVisibility {
+    fn parse(params: &CatFormatParams) -> Result<Self, ApiError> {
+        let include_system = match params.include_system.as_deref().map(str::trim) {
+            None => false,
+            Some("" | "true" | "1" | "yes") => true,
+            Some("false" | "0" | "no") => false,
+            Some(other) => {
+                return Err(ApiError::new(xerj_common::XerjError::invalid_query(
+                    format!("unknown include_system value `{other}` (expected true or false)"),
+                )));
+            }
+        };
+        let raw = params.expand_wildcards.as_deref().unwrap_or("open");
+        let tokens: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Self {
+                include_visible: true,
+                include_hidden: include_system,
+            });
+        }
+        let mut open = false;
+        let mut closed = false;
+        let mut hidden = false;
+        let mut all = false;
+        let mut none = false;
+        for token in &tokens {
+            match *token {
+                "open" => open = true,
+                "closed" => closed = true,
+                "hidden" => hidden = true,
+                "all" => all = true,
+                "none" => none = true,
+                other => {
+                    return Err(ApiError::new(xerj_common::XerjError::invalid_query(
+                        format!(
+                            "unknown expand_wildcards value `{other}` \
+                             (expected open, closed, hidden, none, or all)"
+                        ),
+                    )));
+                }
+            }
+        }
+        if all {
+            open = true;
+            closed = true;
+            hidden = true;
+        }
+        // `none` alone matches nothing. Mixed with another state, the other
+        // state wins (ES unions the listed wildcard states).
+        if none && !open && !closed && !hidden {
+            return Ok(Self {
+                include_visible: false,
+                include_hidden: include_system,
+            });
+        }
+        // `open` and `closed` both keep non-hidden rows. Closed indices stay
+        // listed (issue #463); this parameter's load-bearing distinction here
+        // is hidden vs not.
+        Ok(Self {
+            include_visible: open || closed,
+            include_hidden: hidden || include_system,
+        })
+    }
+
+    /// Unscoped `GET /_cat/indices`, or one comma-separated pattern part.
+    fn keeps(&self, name: &str, part: Option<&str>) -> bool {
+        // `.xerj_*` is the console's own store (users, sessions, audit, …).
+        // `.xerj-memory-*` uses a hyphen and is not in this set.
+        let hidden_name = name.starts_with(".xerj_");
+        match part {
+            None => {
+                if hidden_name {
+                    self.include_hidden
+                } else {
+                    self.include_visible
+                }
+            }
+            Some(part) => {
+                let wildcard = part == "_all" || part == "*" || part.contains('*');
+                if !wildcard {
+                    return name == part;
+                }
+                let matches = part == "_all" || part == "*" || glob_match_simple(part, name);
+                if !matches {
+                    return false;
+                }
+                if hidden_name {
+                    // A pattern that itself starts with '.' opts hidden names
+                    // back in, the same rule wildcard ops already use.
+                    self.include_hidden || part.starts_with('.')
+                } else {
+                    self.include_visible
+                }
+            }
+        }
+    }
+
+    fn listed(&self, name: &str, pattern: Option<&str>) -> bool {
+        match pattern {
+            None => self.keeps(name, None),
+            Some(pat) => pat
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .any(|part| self.keeps(name, Some(part))),
+        }
+    }
 }
 
 impl CatFormatParams {
@@ -757,14 +894,26 @@ async fn cat_indices_inner(
     // operator can delete or retry, and omitting them is what made a failed
     // index invisible to every dashboard (issue #206).
     let failed = state.engine.list_failed_indices();
+    // `.xerj_*` console indices are hidden the way ES hides its system
+    // indices. Default `expand_wildcards=open` omits them; `hidden` / `all`
+    // / `open,hidden`, `include_system=true`, a concrete name, or a pattern
+    // that itself starts with '.' brings them back. `.xerj-memory-*` is not
+    // in that set.
+    let visibility = match CatVisibility::parse(&params) {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
 
     // Narrow to the path pattern when present (`/_cat/indices/{pattern}`):
     // a comma-separated list of concrete names and/or `*` globs. ES rules:
     //   • a CONCRETE name matching nothing → 404 index_not_found_exception
     //   • a WILDCARD matching nothing      → empty 200
-    // Absent pattern lists the whole cluster (unchanged behavior).
+    // Absent pattern lists non-hidden indices (hidden ones need an opt-in).
     let selected: Vec<&xerj_engine::engine::IndexInfo> = match pattern.as_deref() {
-        None => indices.iter().collect(),
+        None => indices
+            .iter()
+            .filter(|info| visibility.listed(&info.name, None))
+            .collect(),
         Some(pat) => {
             let parts: Vec<&str> = pat
                 .split(',')
@@ -783,35 +932,42 @@ async fn cat_indices_inner(
             }
             indices
                 .iter()
-                .filter(|info| {
-                    parts.iter().any(|&p| {
-                        p == "_all"
-                            || p == "*"
-                            || info.name == p
-                            || glob_match_simple(p, &info.name)
-                    })
-                })
+                .filter(|info| visibility.listed(&info.name, Some(pat)))
                 .collect()
         }
     };
 
     let mut rows = Vec::new();
     for info in &selected {
+        let idx = state.engine.get_index(&info.name).ok();
         // Real on-disk size: recursive byte sum of the index's data_dir.
         // Single-shard (pri=1, rep=0), so store.size == pri.store.size, and
         // dataset.size (the 8.13 column) equals store.size for a fully-mounted
         // (non-partial, non-searchable-snapshot) shard.
-        let size = state
-            .engine
-            .get_index(&info.name)
+        let size = idx
+            .as_ref()
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
+        // #2140: `docs.count` is a BARE count, so it must omit the autoindex
+        // file-card anchors the same way `_count` (#1624) and `autoindex map`
+        // do. Reading the raw stats count here made an operator see one phantom
+        // document per indexed file and distrust both numbers.
+        let doc_count = match idx.as_ref() {
+            Some(idx) => content_doc_count(idx).await,
+            None => info.doc_count,
+        };
+        // #2140: the deleted column was a hard-coded 0 even when updates had
+        // superseded documents or deletes had tombstoned them. Report the real
+        // pre-merge count (physical minus live), the same definition ES gives
+        // `docs.deleted`.
+        let deleted = idx.as_ref().map(|idx| idx.deleted_doc_count()).unwrap_or(0);
         // Emit the stable REAL settings uuid (the same value
         // GET /{index}/_settings returns), not a fresh random one per call.
         rows.push((
             info.name.clone(),
             stable_index_uuid(&info.name),
-            info.doc_count,
+            doc_count,
+            deleted,
             size,
             human_bytes(size),
         ));
@@ -823,20 +979,10 @@ async fn cat_indices_inner(
     // would be a claim we cannot back. Selected via the same pattern rules
     // as the healthy set above (issue #206: a failed index is still an
     // index the operator can see and delete, not silently omitted).
-    let selected_failed: Vec<&xerj_engine::engine::FailedIndex> = match pattern.as_deref() {
-        None => failed.iter().collect(),
-        Some(pat) => failed
-            .iter()
-            .filter(|f| {
-                pat.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .any(|p| {
-                        p == "_all" || p == "*" || f.name == p || glob_match_simple(p, &f.name)
-                    })
-            })
-            .collect(),
-    };
+    let selected_failed: Vec<&xerj_engine::engine::FailedIndex> = failed
+        .iter()
+        .filter(|f| visibility.listed(&f.name, pattern.as_deref()))
+        .collect();
     let failed_rows: Vec<(String, String)> = selected_failed
         .iter()
         .map(|f| (f.name.clone(), stable_index_uuid(&f.name)))
@@ -866,7 +1012,7 @@ async fn cat_indices_inner(
         ],
         rows: Vec::new(),
     };
-    for (name, uuid, doc_count, size, hsize) in &rows {
+    for (name, uuid, doc_count, deleted, size, hsize) in &rows {
         table.rows.push(vec![
             crate::cat::CatCell::plain("green"),
             crate::cat::CatCell::plain("open"),
@@ -875,7 +1021,7 @@ async fn cat_indices_inner(
             crate::cat::CatCell::plain("1"),
             crate::cat::CatCell::plain("0"),
             crate::cat::CatCell::plain(doc_count.to_string()),
-            crate::cat::CatCell::plain("0"),
+            crate::cat::CatCell::plain(deleted.to_string()),
             crate::cat::CatCell::size(*size, hsize.clone()),
             crate::cat::CatCell::size(*size, hsize.clone()),
         ]);
@@ -1019,6 +1165,228 @@ mod cat_format_json_tests {
             "text/plain; charset=utf-8"
         );
     }
+
+    async fn put_index(app: &axum::Router, name: &str) {
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/{name}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK, "create {name}");
+    }
+
+    fn index_names(body: &Value) -> Vec<&str> {
+        body.as_array()
+            .expect("json array")
+            .iter()
+            .filter_map(|row| row["index"].as_str())
+            .collect()
+    }
+
+    /// Field reports: a fresh node lists the fourteen `.xerj_*` console
+    /// indices beside the user's data. Those are the console's own store.
+    /// `.xerj-memory-*` brains stay listed — insecure mode relies on that.
+    #[tokio::test]
+    async fn cat_indices_hides_system_indices_unless_asked() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        put_index(&app, "logs").await;
+        put_index(&app, ".xerj_users").await;
+        put_index(&app, ".xerj-memory-x").await;
+
+        let (status, body) = get(&app, "/_cat/indices?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut names = index_names(&body);
+        names.sort();
+        assert_eq!(names, vec![".xerj-memory-x", "logs"]);
+
+        let (status, body) = get(&app, "/_cat/indices?format=json&expand_wildcards=hidden").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(index_names(&body), vec![".xerj_users"]);
+
+        for query in [
+            "expand_wildcards=open,hidden",
+            "expand_wildcards=all",
+            "include_system=true",
+        ] {
+            let (status, body) = get(&app, &format!("/_cat/indices?format=json&{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}");
+            let mut names = index_names(&body);
+            names.sort();
+            assert_eq!(
+                names,
+                vec![".xerj-memory-x", ".xerj_users", "logs"],
+                "{query}"
+            );
+        }
+
+        let (status, body) = get(&app, "/_cat/indices/.xerj_users?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(index_names(&body), vec![".xerj_users"]);
+
+        let (status, body) = get(&app, "/_cat/indices/.xerj*?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut dotted = index_names(&body);
+        dotted.sort();
+        assert_eq!(dotted, vec![".xerj-memory-x", ".xerj_users"]);
+
+        let (status, body) = get(&app, "/_cat/indices/*?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut starred = index_names(&body);
+        starred.sort();
+        assert_eq!(starred, vec![".xerj-memory-x", "logs"]);
+    }
+
+    async fn put_doc(app: &axum::Router, index: &str, id: &str, body: Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/{index}/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "index {index}/{id}: {}",
+            response.status()
+        );
+    }
+
+    async fn refresh(app: &axum::Router, index: &str) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/{index}/_refresh"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "refresh {index}");
+    }
+
+    /// #2140: `docs.count` in `_cat/indices` is a BARE count, so it has to omit
+    /// the autoindex file-card anchors exactly as `_count` (#1624) and
+    /// `autoindex map` do. Reading the raw stats count made every indexed file
+    /// add one phantom document to the cat column while `_count` omitted it, and
+    /// an operator comparing the two could not tell which number was real.
+    #[tokio::test]
+    async fn cat_indices_docs_count_omits_file_card_anchors_like_bare_count() {
+        let state = test_state();
+        let app = crate::router::build_es_compat_router(state);
+        put_index(&app, "cards").await;
+        put_doc(&app, "cards", "rec", json!({"body": "a real record"})).await;
+        put_doc(
+            &app,
+            "cards",
+            "card",
+            json!({"ax_locator": "file", "title": "a.rs", "ax_path": "a.rs"}),
+        )
+        .await;
+        refresh(&app, "cards").await;
+
+        let (status, count) = get(&app, "/cards/_count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count["count"], 1, "bare _count omits the file card (#1624)");
+
+        let (status, body) = get(&app, "/_cat/indices?format=json&h=index,docs.count").await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "cards")
+            .expect("cards row");
+        assert_eq!(
+            row["docs.count"], "1",
+            "docs.count must match the bare _count, not the physical doc total"
+        );
+
+        let (status, shards) = get(&app, "/_cat/shards?format=json").await;
+        assert_eq!(status, StatusCode::OK);
+        let shard = shards
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "cards")
+            .expect("cards shard row");
+        assert_eq!(shard["docs"], "1", "the shard column adds up to docs.count");
+
+        // The card stays searchable: #1624 only changed the bare count, and a
+        // graph anchor must not become an invisible document.
+        let (status, body) = get(&app, "/cards/_search?q=ax_locator:file").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["hits"]["total"]["value"], 1);
+    }
+
+    /// A state whose merge thresholds are far above the test's segment count,
+    /// so "three flushes leave three segments" is a fact rather than a race
+    /// with a background merge.
+    fn test_state_without_merges() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = xerj_common::config::Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = xerj_common::config::WalSync::Async;
+        config.merge.min_merge_count = 100;
+        config.merge.max_merge_count = 100;
+        let metrics = xerj_common::metrics::Metrics::new().expect("metrics");
+        let engine = xerj_engine::Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    /// #2140: `docs.deleted` is the pre-merge physical-minus-live count, not a
+    /// hard-coded 0. Three flushes of the same `_id` leave two superseded
+    /// versions in segments; `_cat/indices`, `_stats` and `_cluster/stats` must
+    /// all say 2, and a bare `_count` must still say 1.
+    #[tokio::test]
+    async fn deleted_doc_count_is_reported_by_cat_and_stats() {
+        let state = test_state_without_merges();
+        let app = crate::router::build_es_compat_router(state);
+        put_index(&app, "del").await;
+        for body in ["v1", "v2", "v3"] {
+            put_doc(&app, "del", "1", json!({"body": body})).await;
+            refresh(&app, "del").await;
+        }
+
+        let (status, count) = get(&app, "/del/_count").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(count["count"], 1, "one live _id");
+
+        let (status, body) = get(
+            &app,
+            "/_cat/indices?format=json&h=index,docs.count,docs.deleted",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body
+            .as_array()
+            .expect("json array")
+            .iter()
+            .find(|row| row["index"] == "del")
+            .expect("del row");
+        assert_eq!(row["docs.count"], "1");
+        assert_eq!(row["docs.deleted"], "2", "two superseded versions: {body}");
+
+        let (status, stats) = get(&app, "/del/_stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            stats["indices"]["del"]["primaries"]["docs"]["deleted"], 2,
+            "{stats}"
+        );
+        assert_eq!(stats["_all"]["primaries"]["docs"]["deleted"], 2, "{stats}");
+
+        let (status, cluster) = get(&app, "/_cluster/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cluster["indices"]["docs"]["deleted"], 2, "{cluster}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1047,6 +1415,62 @@ pub struct EsCreateIndexMappings {
     pub properties: Option<Value>,
 }
 
+/// Display-side settings blob stored for `GET /{index}/_settings` at create.
+///
+/// `None` when the request carried neither settings nor an index-sort
+/// decision — the single-node path then leaves `index_settings` untouched.
+fn create_time_index_settings(
+    body_settings: Option<&Value>,
+    explicit_sort_field: &Option<String>,
+    explicit_sort_order: &str,
+    declared_timestamp_date: bool,
+) -> Option<Value> {
+    if let Some(settings) = body_settings {
+        let mut s = settings.clone();
+        if let Some(f) = explicit_sort_field.as_ref() {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!(f));
+                o.insert(
+                    "__xy_index_sort_order".to_string(),
+                    json!(explicit_sort_order),
+                );
+                o.insert("__xy_index_sort_explicit".to_string(), json!(true));
+            }
+        } else if declared_timestamp_date {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
+                o.insert("__xy_index_sort_order".to_string(), json!("desc"));
+            }
+        }
+        return Some(s);
+    }
+    if let Some(f) = explicit_sort_field.as_ref() {
+        return Some(json!({
+            "__xy_index_sort_field": f,
+            "__xy_index_sort_order": explicit_sort_order,
+            "__xy_index_sort_explicit": true,
+        }));
+    }
+    if declared_timestamp_date {
+        return Some(json!({
+            "__xy_index_sort_field": "@timestamp",
+            "__xy_index_sort_order": "desc",
+        }));
+    }
+    None
+}
+
+/// Alias map with date-math names resolved. `None` when the body has no
+/// `aliases` object.
+fn resolved_create_aliases(body: &Value) -> Option<serde_json::Map<String, Value>> {
+    let aliases = body.get("aliases")?.as_object()?;
+    let mut resolved = serde_json::Map::new();
+    for (alias, opts) in aliases {
+        resolved.insert(resolve_date_math_index(alias), opts.clone());
+    }
+    Some(resolved)
+}
+
 pub async fn create_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -1059,9 +1483,10 @@ pub async fn create_index(
 
     // Leading dots are allowed for system indices like .kibana, .security-*.
     if index.starts_with('_') || index.starts_with('-') || index.starts_with('+') {
-        let e = xerj_common::XerjError::invalid_mapping(format!(
-            "Invalid index name [{index}]: must not start with '_', '-', or '+'"
-        ));
+        let e = xerj_common::XerjError::invalid_index_name(
+            index.clone(),
+            format!("Invalid index name [{index}]: must not start with '_', '-', or '+'"),
+        );
         return ApiError::new(e).into_response();
     }
 
@@ -1075,10 +1500,31 @@ pub async fn create_index(
         return ApiError::new(e).into_response();
     }
 
+    if let Some(refusal) = create_index_body_refusal(&index, &body) {
+        return refusal;
+    }
+
+    // A matching index template contributes mappings and settings the request
+    // did not set. The request wins on a field or setting it names. Merged
+    // before validation and schema build so `semantic_text` is parsed by the
+    // same mapper as an explicit mapping, and `index.default_pipeline` is
+    // stored where `default_pipeline_for` and `GET /_settings` read it
+    // (#2281). A schema-only pass cannot: the stored mapping was the request
+    // body, so a template `semantic_text` was rendered back as `object`, and
+    // the template's settings were never copied.
+    let (mappings_val, merged_settings) = state.engine.merge_index_template(
+        &index,
+        body.get("mappings").cloned().unwrap_or(Value::Null),
+        body.get("settings").cloned().unwrap_or(Value::Null),
+    );
+    let settings_ref = (!merged_settings.is_null()).then_some(&merged_settings);
+
     // Validate mapping field types before creating — ES returns
     // mapper_parsing_exception for unsupported types.
-    let mappings_val = body.get("mappings").cloned().unwrap_or(Value::Null);
     if let Some(props) = mappings_val.get("properties").and_then(Value::as_object) {
+        if let Some(refusal) = empty_field_name_refusal(props) {
+            return refusal;
+        }
         if let Err(reason) = validate_properties(props) {
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
@@ -1125,8 +1571,7 @@ pub async fn create_index(
     // @timestamp heuristic. Mirror the field + order into the
     // `__xy_index_sort_*` internal keys so the search handler's
     // default-sort hook picks them up.
-    let explicit_sort_field: Option<String> = body
-        .get("settings")
+    let explicit_sort_field: Option<String> = settings_ref
         .and_then(|s| {
             s.pointer("/index/sort/field")
                 .or_else(|| s.pointer("/index/sort.field"))
@@ -1138,8 +1583,7 @@ pub async fn create_index(
             Value::Array(mut a) => a.first_mut().and_then(|x| x.as_str().map(String::from)),
             _ => None,
         });
-    let explicit_sort_order: String = body
-        .get("settings")
+    let explicit_sort_order: String = settings_ref
         .and_then(|s| {
             s.pointer("/index/sort/order")
                 .or_else(|| s.pointer("/index/sort.order"))
@@ -1153,12 +1597,51 @@ pub async fn create_index(
         })
         .unwrap_or_else(|| "asc".to_string());
 
-    // Thread the request's `settings` into the store config at create time
-    // (custom analysis config, and the per-index `index.xerj_ingest_shards` WAL
-    // shard override that `xerj autoindex` uses to keep each of its hundreds of
-    // indices at a single WAL file descriptor). create_index_with_settings
-    // applies index templates identically to create_index.
-    let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    // Thread the merged `settings` into the store config at create time
+    // (custom analysis config, the template's `index.default_pipeline`, and
+    // the per-index `index.xerj_ingest_shards` WAL shard override that
+    // `xerj autoindex` uses to keep each of its hundreds of indices at a
+    // single WAL file descriptor). create_index_with_settings applies index
+    // templates to the schema; the mapping blob and display settings below
+    // are the merged body, so a template field is not re-derived from the
+    // native type.
+    let create_settings = merged_settings;
+    let display_settings = create_time_index_settings(
+        (!create_settings.is_null()).then_some(&create_settings),
+        &explicit_sort_field,
+        &explicit_sort_order,
+        declared_timestamp_date,
+    );
+    let resolved_aliases = resolved_create_aliases(&body);
+
+    // Cluster members replicate the create. The accepting node evaluates
+    // templates and date-math aliases; peers apply that result. ILM attach
+    // stays on this node either way — it is not in the log.
+    if state.engine.has_cluster() {
+        let spec = xerj_engine::ReplicatedIndexSpec {
+            name: index.clone(),
+            schema,
+            settings: create_settings,
+            mappings: mappings_val,
+            index_settings: display_settings.unwrap_or(Value::Null),
+            aliases: resolved_aliases
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null),
+        };
+        return match state.engine.replicate_index_create(spec).await {
+            Ok(()) => {
+                if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
+                    let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
+                }
+                let mut resp = EsIndexResponse::ok(&index);
+                resp.warnings = embedder_warnings(&state, &body);
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        };
+    }
+
     match state
         .engine
         .create_index_with_settings(&index, schema, create_settings)
@@ -1167,44 +1650,8 @@ pub async fn create_index(
             // Store the raw settings / mappings / aliases blob as written.
             // These are used by `GET /{index}/_settings`, `GET /{index}/_mapping`,
             // `GET /{index}`, and cluster health replica checks.
-            if let Some(settings) = body.get("settings") {
-                let mut s = settings.clone();
-                if let Some(f) = explicit_sort_field.as_ref() {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!(f));
-                        o.insert(
-                            "__xy_index_sort_order".to_string(),
-                            json!(explicit_sort_order),
-                        );
-                        // Mark this as an EXPLICIT index sort (vs the
-                        // @timestamp auto-heuristic) so the search path can
-                        // map a lone `_doc` sort onto the index-sort field.
-                        o.insert("__xy_index_sort_explicit".to_string(), json!(true));
-                    }
-                } else if declared_timestamp_date {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
-                        o.insert("__xy_index_sort_order".to_string(), json!("desc"));
-                    }
-                }
+            if let Some(s) = display_settings {
                 state.engine.index_settings.insert(index.clone(), s);
-            } else if let Some(f) = explicit_sort_field.as_ref() {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": f,
-                        "__xy_index_sort_order": explicit_sort_order,
-                        "__xy_index_sort_explicit": true,
-                    }),
-                );
-            } else if declared_timestamp_date {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": "@timestamp",
-                        "__xy_index_sort_order": "desc",
-                    }),
-                );
             }
             if !mappings_val.is_null() {
                 // Persists es_mapping.json into the index dir (atomic) so
@@ -1213,16 +1660,13 @@ pub async fn create_index(
                     return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                 }
             }
-            if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
+            if let Some(resolved_aliases) = resolved_aliases {
                 // Alias keys can also contain date math
                 // (`<logs_{now/d}>` → `logs_2026-04-19`). Resolve each
                 // before storing / registering. The meta map keys use the
                 // resolved name so GET /_alias round-trips correctly.
-                let mut resolved_aliases = serde_json::Map::new();
-                for (alias, opts) in aliases {
-                    let resolved = resolve_date_math_index(alias);
-                    resolved_aliases.insert(resolved.clone(), opts.clone());
-                    if let Err(error) = state.engine.add_alias(&resolved, &index) {
+                for alias in resolved_aliases.keys() {
+                    if let Err(error) = state.engine.add_alias(alias, &index) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
                 }
@@ -1244,11 +1688,191 @@ pub async fn create_index(
                 let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
             }
 
-            let resp = EsIndexResponse::ok(&index);
+            let mut resp = EsIndexResponse::ok(&index);
+            resp.warnings = embedder_warnings(&state, &body);
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
+}
+
+/// A 400 in Elasticsearch's error shape, for refusals whose `type` (or
+/// `caused_by`) a caller matches on and that no `XerjError` variant renders.
+fn es_bad_request(error_type: &str, reason: &str, caused_by: Option<(&str, &str)>) -> Response {
+    let mut error = json!({
+        "root_cause": [{ "type": error_type, "reason": reason }],
+        "type": error_type,
+        "reason": reason,
+    });
+    if let Some((cause_type, cause_reason)) = caused_by {
+        error["caused_by"] = json!({ "type": cause_type, "reason": cause_reason });
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": error, "status": 400 })),
+    )
+        .into_response()
+}
+
+/// ES refuses a mapping that declares a field with an empty name
+/// (`mapper_parsing_exception` caused by `illegal_argument_exception`
+/// `field name cannot be an empty string`); XERJ accepted it. Checked through
+/// `properties` and multi-field `fields` at every depth.
+fn empty_field_name_refusal(props: &serde_json::Map<String, Value>) -> Option<Response> {
+    fn has_empty(props: &serde_json::Map<String, Value>) -> bool {
+        props.iter().any(|(name, spec)| {
+            name.is_empty()
+                || ["properties", "fields"].iter().any(|k| {
+                    spec.get(*k)
+                        .and_then(Value::as_object)
+                        .is_some_and(has_empty)
+                })
+        })
+    }
+    has_empty(props).then(|| {
+        es_bad_request(
+            "mapper_parsing_exception",
+            "Failed to parse mapping: field name cannot be an empty string",
+            Some((
+                "illegal_argument_exception",
+                "field name cannot be an empty string",
+            )),
+        )
+    })
+}
+
+/// One index setting from a create-index `settings` object, in any of the
+/// spellings ES accepts: `{"index.a.b": v}`, `{"a.b": v}`,
+/// `{"index": {"a": {"b": v}}}`, `{"a": {"b": v}}` or `{"index": {"a.b": v}}`.
+fn create_setting<'a>(settings: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let dotted = path.join(".");
+    let nested = |root: &'a Value| {
+        path.iter()
+            .try_fold(root, |v, key| v.get(*key))
+            .or_else(|| root.get(&dotted))
+    };
+    settings
+        .get(format!("index.{dotted}"))
+        .or_else(|| settings.get("index").and_then(nested))
+        .or_else(|| nested(settings))
+}
+
+/// Request-shape and setting checks ES applies to a create-index body before
+/// anything is created (`indices.create/10_basic.yml`,
+/// `search/550_ignore_above_invalid.yml`). Each was previously accepted with
+/// a 200. Run before the index exists, so a refusal leaves nothing behind.
+fn create_index_body_refusal(index: &str, body: &Value) -> Option<Response> {
+    for section in ["mappings", "settings", "aliases"] {
+        if let Some(v) = body.get(section) {
+            if !v.is_object() && !v.is_null() {
+                return Some(es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "Malformed [{section}] section for index [{index}], should include an \
+                         inner object describing the {section}"
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    if let Some(props) = body.pointer("/mappings/properties") {
+        if !props.is_object() {
+            return Some(es_bad_request(
+                "mapper_parsing_exception",
+                "Failed to parse mapping: [properties] must be a map type",
+                None,
+            ));
+        }
+    }
+    if let Some(settings) = body.get("settings") {
+        if create_setting(settings, &["soft_deletes", "enabled"])
+            .is_some_and(|v| v == &json!(false) || v == &json!("false"))
+        {
+            return Some(es_bad_request(
+                "illegal_argument_exception",
+                "Creating indices with soft-deletes disabled is no longer supported. Please do \
+                 not specify a value for setting [index.soft_deletes.enabled].",
+                None,
+            ));
+        }
+        if create_setting(settings, &["mode"]).and_then(Value::as_str) == Some("lookup") {
+            let shards = create_setting(settings, &["number_of_shards"]).and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            });
+            if let Some(n) = shards.filter(|n| *n != 1) {
+                return Some(es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "index with [lookup] mode must have [index.number_of_shards] set to 1 \
+                         or unset; provided {n}"
+                    ),
+                    None,
+                ));
+            }
+        }
+        let ignore_above = create_setting(settings, &["mapping", "ignore_above"]).and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        });
+        if let Some(n) = ignore_above.filter(|n| *n < 0) {
+            return Some(es_bad_request(
+                "illegal_argument_exception",
+                &format!(
+                    "Failed to parse value [{n}] for setting [index.mapping.ignore_above] must be \
+                     >= 0"
+                ),
+                None,
+            ));
+        }
+    }
+    if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
+        for (alias, spec) in aliases {
+            if let Some(reason) = alias_value_type_error(alias, spec) {
+                return Some(es_bad_request("illegal_argument_exception", &reason, None));
+            }
+        }
+    }
+    None
+}
+
+/// The Java type name ES's alias parser reports for a JSON value.
+fn alias_value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "String",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "Number",
+        Value::Array(_) => "Array",
+        Value::Object(_) => "Object",
+        Value::Null => "null",
+    }
+}
+
+/// ES's `Unsupported <Type> type value [v] for field [f] in alias [a]`: the
+/// flag fields take booleans, the routing fields strings or numbers.
+fn alias_value_type_error(alias: &str, spec: &Value) -> Option<String> {
+    let spec = spec.as_object()?;
+    for (field, v) in spec {
+        let ok = match field.as_str() {
+            "is_write_index" | "is_hidden" => v.is_boolean() || v.is_null(),
+            "routing" | "index_routing" | "search_routing" => {
+                v.is_string() || v.is_number() || v.is_null()
+            }
+            _ => true,
+        };
+        if !ok {
+            let shown = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            return Some(format!(
+                "Unsupported {} type value [{shown}] for field [{field}] in alias [{alias}]",
+                alias_value_type_name(v)
+            ));
+        }
+    }
+    None
 }
 
 /// ES mapper_parsing_exception emits for unsupported field types. Accept
@@ -1272,7 +1896,36 @@ fn validate_properties(props: &serde_json::Map<String, Value>) -> Result<(), Str
             // as a multi-field would otherwise still be accepted, echoed back
             // by `GET /_mapping`, and dropped on the floor. One shared
             // resolver means one accepted set and one error message.
+            if matches!(t, "keyword" | "flattened" | "wildcard") {
+                if let Some(n) = obj.get("ignore_above").and_then(Value::as_i64) {
+                    if n < 0 {
+                        return Err(format!(
+                            "Failed to parse mapping: [ignore_above] must be positive, got [{n}]"
+                        ));
+                    }
+                }
+            }
             if t == "dense_vector" {
+                if let Some(opts) = obj.get("index_options") {
+                    if obj.get("index").and_then(Value::as_bool) == Some(false) {
+                        return Err(
+                            "Failed to parse mapping: Field [index_options] requires field \
+                             [index] to be configured and set to true"
+                                .to_string(),
+                        );
+                    }
+                    let element = obj
+                        .get("element_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("float");
+                    let kind = opts.get("type").and_then(Value::as_str).unwrap_or("");
+                    if kind.starts_with("bbq") && matches!(element, "byte" | "bit") {
+                        return Err(format!(
+                            "Failed to parse mapping: [index_options] of type [{kind}] is not \
+                             supported for element_type [{element}]"
+                        ));
+                    }
+                }
                 resolve_vector_quantization(name, spec)?;
             }
         }
@@ -1722,12 +2375,147 @@ mod runtime_field_type_tests {
     }
 
     #[tokio::test]
+    async fn create_index_warns_when_semantic_text_asks_for_another_embedder() {
+        let router = crate::router::build_es_compat_router(test_state());
+        let response = router
+            .oneshot(
+                Request::put("/embed-warn")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {
+                            "body": {"type": "semantic_text", "inference_id": ".elser_model_2"}
+                        }}})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        let warning = body["warnings"][0].as_str().unwrap_or("");
+        assert!(warning.contains("does not switch the embedder"), "{body}");
+        assert!(warning.contains("re-index"), "{body}");
+        assert!(warning.contains(".elser_model_2"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn put_mapping_without_an_embedder_request_has_no_warnings_key() {
+        let state = test_state();
+        let router = crate::router::build_es_compat_router(state.clone());
+        let created = router
+            .clone()
+            .oneshot(
+                Request::put("/embed-quiet")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"mappings": {"properties": {"body": {"type": "text"}}}}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create");
+        assert!(created.status().is_success());
+        let created_bytes = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_body: Value = serde_json::from_slice(&created_bytes).unwrap();
+        assert!(
+            created_body.get("warnings").is_none(),
+            "no mismatch must leave the create JSON unchanged: {created_body}"
+        );
+        let mapped = router
+            .oneshot(
+                Request::put("/embed-quiet/_mapping")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"properties": {
+                            "note": {"type": "semantic_text", "inference_id": "lexical"}
+                        }})
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("mapping");
+        let status = mapped.status();
+        let bytes = to_bytes(mapped.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert!(status.is_success(), "{status} {body}");
+        assert!(
+            body.get("warnings").is_none(),
+            "a matching inference_id must not add warnings: {body}"
+        );
+        assert_eq!(body["acknowledged"], true, "{body}");
+    }
+
+    #[tokio::test]
     async fn create_index_accepts_a_lookup_runtime_field_over_http() {
         let (status, body) = create_index_with_runtime_type("lookup").await;
         assert!(
             status.is_success(),
             "lookup is a legal ES runtime field type; got {status} {body}"
         );
+    }
+
+    async fn put_index(path: &str) -> (StatusCode, Value) {
+        let response = crate::router::build_es_compat_router(test_state())
+            .oneshot(
+                Request::put(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `PUT /BadName` used to come back as `mapper_parsing_exception` because
+    /// every name rule was an `InvalidMapping`. ES answers a bad name with
+    /// `invalid_index_name_exception` before it looks at the mapping. A real
+    /// mapping error stays `mapper_parsing_exception` (the runtime-field test
+    /// above).
+    #[tokio::test]
+    async fn create_index_rejects_a_bad_name_as_invalid_index_name_exception() {
+        for (path, needle) in [
+            (
+                "/Bad",
+                "index name must start with a lowercase letter or '.', got 'B'",
+            ),
+            (
+                "/_secret",
+                "Invalid index name [_secret]: must not start with '_', '-', or '+'",
+            ),
+            ("/bad!name", "index name contains invalid character '!'"),
+        ] {
+            let (status, body) = put_index(path).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+            assert_eq!(
+                body["error"]["type"], "invalid_index_name_exception",
+                "{path}: {body}"
+            );
+            assert_eq!(body["status"], 400, "{path}");
+            let reason = body["error"]["reason"].as_str().unwrap_or("");
+            assert!(reason.contains(needle), "{path}: {reason}");
+            assert_eq!(body["error"]["index_uuid"], "_na_", "{path}: {body}");
+            assert_eq!(
+                body["error"]["index"],
+                path.trim_start_matches('/'),
+                "{path}: {body}"
+            );
+            assert_eq!(
+                body["error"]["root_cause"][0]["type"], "invalid_index_name_exception",
+                "{path}"
+            );
+        }
     }
 }
 
@@ -1743,11 +2531,73 @@ pub struct DeleteIndexParams {
     pub allow_no_indices: Option<String>,
 }
 
+/// ES 8 `action.destructive_requires_name`. Absent means true: a `DELETE`
+/// whose selector is `*`, `_all`, or any wildcard is refused. `false` (bool
+/// or the string `"false"`) is the opt-out the ES-YAML suite and the failed-
+/// index recovery tests set explicitly. Transient overrides persistent.
+/// Closing an index stays stricter: [`close_index`] refuses wildcards even
+/// when this setting is false.
+fn destructive_requires_name_enabled(settings: &Value) -> bool {
+    fn as_bool(value: &Value) -> Option<bool> {
+        match value {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let transient = settings
+        .get("transient")
+        .and_then(|s| s.get("action.destructive_requires_name"));
+    let persistent = settings
+        .get("persistent")
+        .and_then(|s| s.get("action.destructive_requires_name"));
+    transient.or(persistent).and_then(as_bool).unwrap_or(true)
+}
+
+/// True when any comma-separated selector is `_all`, `*`, or contains `*` or `?`.
+fn selector_is_destructive(index: &str) -> bool {
+    index
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| part == "_all" || part == "*" || part.contains('*') || part.contains('?'))
+}
+
+fn destructive_delete_refused() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{
+                    "type": "illegal_argument_exception",
+                    "reason": "Wildcard expressions or all indices are not allowed"
+                }],
+                "type": "illegal_argument_exception",
+                "reason": "Wildcard expressions or all indices are not allowed"
+            },
+            "status": 400
+        })),
+    )
+        .into_response()
+}
+
 pub async fn delete_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<DeleteIndexParams>,
 ) -> impl IntoResponse {
+    // Checked before expansion. A wildcard that matches nothing must still
+    // be a 400, and the settings lock is dropped before any delete.
+    {
+        let settings = state.engine.cluster_settings.read().await;
+        if destructive_requires_name_enabled(&settings) && selector_is_destructive(&index) {
+            return destructive_delete_refused();
+        }
+    }
     let ignore_unavailable = params.ignore_unavailable.as_deref() == Some("true");
     let allow_no_indices = params
         .allow_no_indices
@@ -1850,6 +2700,37 @@ pub async fn delete_index(
     Json(EsDeleteIndexResponse::ok()).into_response()
 }
 
+#[cfg(test)]
+mod destructive_requires_name_tests {
+    use super::*;
+
+    #[test]
+    fn the_setting_defaults_to_requiring_a_name() {
+        let empty = json!({"persistent": {}, "transient": {}});
+        assert!(destructive_requires_name_enabled(&empty));
+        let persistent_false = json!({"persistent": {"action.destructive_requires_name": false}});
+        assert!(!destructive_requires_name_enabled(&persistent_false));
+        let persistent_string =
+            json!({"persistent": {"action.destructive_requires_name": "false"}});
+        assert!(!destructive_requires_name_enabled(&persistent_string));
+        let transient_wins = json!({
+            "persistent": {"action.destructive_requires_name": false},
+            "transient": {"action.destructive_requires_name": true}
+        });
+        assert!(destructive_requires_name_enabled(&transient_wins));
+    }
+
+    #[test]
+    fn a_wildcard_or_all_selector_is_destructive_and_a_name_is_not() {
+        for selector in ["_all", "*", "ax-*", "a?", "kept,ax-*", "foo,_all"] {
+            assert!(selector_is_destructive(selector), "{selector}");
+        }
+        for selector in ["ax-docs", "ax-docs,ax-code", ""] {
+            assert!(!selector_is_destructive(selector), "{selector}");
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /{index}
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1883,6 +2764,20 @@ async fn get_index_inner(
     index: String,
     params: GetIndexParams,
 ) -> axum::response::Response {
+    // A name that starts with `_` (other than `_all`) can never be an index:
+    // ES answers 400 `invalid_index_name_exception`, not a 404. (A leading
+    // `-` in a list is an exclusion, so only `_` is checked.)
+    if let Some(bad) = index
+        .split(',')
+        .map(str::trim)
+        .find(|p| p.starts_with('_') && *p != "_all")
+    {
+        return es_bad_request(
+            "invalid_index_name_exception",
+            &format!("Invalid index name [{bad}], must not start with '_', '-', or '+'"),
+            None,
+        );
+    }
     let ignore_unavailable = params.ignore_unavailable.as_deref() == Some("true");
     // ES default: wildcard / `_all` selectors default `allow_no_indices=true`
     // (a pattern that matches nothing returns `{}` rather than 404). Explicit
@@ -2056,9 +2951,8 @@ async fn get_index_inner(
         };
 
         // Settings: replay what was written (normalized to strings), merged
-        // with engine defaults; `analysis` is the block in force (#1092).
-        // Creation timestamps are synthesized because we don't persist them
-        // yet (TODO).
+        // with engine defaults; `analysis` is the block in force (#1092) and
+        // `creation_date` is the persisted creation time (#1573).
         let settings_inner = index_settings_response(&state, name, idx.as_ref(), human).await;
 
         let mut index_obj = serde_json::Map::new();
@@ -2081,10 +2975,11 @@ async fn get_index_inner(
 ///
 /// Two fixes over replaying the display map alone (#1092):
 ///
-/// * The display map (`engine.index_settings`) lives in memory only, so after a
-///   restart it is empty and every create-time setting vanished from the
-///   response. A live index with no display entry falls back to its persisted
-///   `settings.json` copy — what the index was created with.
+/// * The display map (`engine.index_settings`) is rebuilt from each index's
+///   `settings.json` when that index is opened (#2294). A live index whose
+///   display entry is still missing falls back to the same file — what the
+///   index was created with — so `GET /_settings` and `default_pipeline_for`
+///   agree.
 /// * `analysis` is reported from the engine, not echoed: whatever spelling the
 ///   caller used (`settings.analysis` beside an `index` block was dropped
 ///   outright), the response carries `index.analysis` = the block the index's
@@ -2110,7 +3005,12 @@ async fn index_settings_response(
             stored = i.get_settings().await;
         }
     }
-    let mut settings = merge_settings_defaults(&stored, name, human);
+    // Creation timestamps: the real persisted value (#1573), not a fresh
+    // `Utc::now()` per request. `index_created_at` is recorded at create and
+    // loaded from `created_at.json` on boot; the fallback only covers an
+    // index that has no recorded time (e.g. a failed create).
+    let created_at_ms = state.engine.index_created_at.get(name).map(|v| *v);
+    let mut settings = merge_settings_defaults(&stored, name, human, created_at_ms);
     if let Some(i) = idx {
         let in_force = i.analysis_in_force().await;
         if let Some(inner) = settings.get_mut("index").and_then(Value::as_object_mut) {
@@ -2128,7 +3028,12 @@ async fn index_settings_response(
 /// ES always wraps user settings under `{ "index": { ... } }` and coerces
 /// all simple values to strings. Missing fields fall through to engine
 /// defaults (single shard, zero replicas).
-fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bool) -> Value {
+fn merge_settings_defaults(
+    user_settings: &Value,
+    provided_name: &str,
+    human: bool,
+    created_at_ms: Option<i64>,
+) -> Value {
     // Pull the inner `index` block if the user used `{ "index": { ... } }`
     // syntax; otherwise treat the whole blob as the inner block.
     let raw_inner = user_settings
@@ -2161,11 +3066,14 @@ fn merge_settings_defaults(user_settings: &Value, provided_name: &str, human: bo
         }
     }
 
-    // Synthesize required fields if absent.
-    let now_ms = Utc::now().timestamp_millis();
+    // Synthesize required fields if absent. `creation_date` prefers the
+    // persisted creation time: a client comparing two `GET /{index}` calls
+    // must see one stable value (index age, ILM-style tooling). The `now`
+    // fallback is only for an index with no recorded time.
+    let created_ms = created_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
     inner
         .entry("creation_date".to_string())
-        .or_insert_with(|| Value::String(now_ms.to_string()));
+        .or_insert_with(|| Value::String(created_ms.to_string()));
     // Emit the stable, deterministic index uuid — the SAME value
     // _cat/indices reports — rather than a fresh random one per request.
     inner.insert(
@@ -2276,6 +3184,9 @@ pub async fn put_mapping(
 
     // Validate any `properties` field types once, up front.
     if let Some(props) = body.get("properties").and_then(Value::as_object) {
+        if let Some(refusal) = empty_field_name_refusal(props) {
+            return refusal;
+        }
         if let Err(reason) = validate_properties(props) {
             let e = xerj_common::XerjError::invalid_mapping(reason);
             return ApiError::new(e).into_response();
@@ -2459,6 +3370,24 @@ pub async fn put_mapping(
         plans.push((idx_name.clone(), idx, existing, additions));
     }
 
+    if state.engine.has_cluster() {
+        for (idx_name, _, existing, additions) in plans {
+            if let Err(error) = state
+                .engine
+                .replicate_mapping(&idx_name, &existing, &additions)
+                .await
+            {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
+        }
+        let warnings = embedder_warnings(&state, &body);
+        let mut payload = json!({ "acknowledged": true });
+        if !warnings.is_empty() {
+            payload["warnings"] = json!(warnings);
+        }
+        return Json(payload).into_response();
+    }
+
     // Publication begins only after every deterministic candidate has passed.
     // `add_fields` repeats engine-side validation defensively. Concurrent
     // schema evolution and filesystem failures still require a broader
@@ -2479,7 +3408,30 @@ pub async fn put_mapping(
         }
     }
 
-    Json(json!({ "acknowledged": true })).into_response()
+    let warnings = embedder_warnings(&state, &body);
+    let mut payload = json!({ "acknowledged": true });
+    if !warnings.is_empty() {
+        payload["warnings"] = json!(warnings);
+    }
+    Json(payload).into_response()
+}
+
+/// The server embedder a mapping's `inference_id` is compared with. Identity
+/// failure yields no warning rather than a failed create: the mapping still
+/// does not switch the embedder, and the index-open guard remains the hard
+/// check.
+fn embedder_warnings(state: &AppState, body: &Value) -> Vec<String> {
+    let Ok(identity) = state.engine.embedding_execution_identity() else {
+        return Vec::new();
+    };
+    let embedding = &state.engine.config().embedding;
+    let resolved = crate::embed_warning::ResolvedEmbedder {
+        backend: identity.backend,
+        neural_model: embedding.neural_model.clone(),
+        proxy_model: embedding.default_model.clone(),
+        proxy_endpoint: embedding.default_endpoint.clone(),
+    };
+    crate::embed_warning::semantic_embedder_warnings(body, &resolved)
 }
 
 fn semantic_mapping_contract(
@@ -2683,10 +3635,39 @@ pub async fn get_settings_all(State(state): State<AppState>) -> impl IntoRespons
     get_settings(State(state), Path("_all".to_string())).await
 }
 
+/// ES `indices.get_mapping`: a concrete name that is not an index or an
+/// alias is `404 index_not_found_exception`. A wildcard (including one that
+/// matches nothing) is not this case — that stays the empty-target path,
+/// same split `_cat/indices` already documents.
+pub(crate) fn first_missing_concrete_name(
+    spec: &str,
+    known: impl Fn(&str) -> bool,
+) -> Option<&str> {
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "_all" || part == "*" || part.contains('*') {
+            continue;
+        }
+        if !known(part) {
+            return Some(part);
+        }
+    }
+    None
+}
+
 pub async fn get_mapping(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
+    let names = state.engine.index_name_list();
+    let failed = state.engine.list_failed_indices();
+    if let Some(missing) = first_missing_concrete_name(&index, |part| {
+        names.iter().any(|n| n == part)
+            || failed.iter().any(|f| f.name == part)
+            || state.engine.aliases.contains_key(part)
+    }) {
+        let e = xerj_common::XerjError::index_not_found(missing);
+        return ApiError::new(e).into_response();
+    }
     let targets = resolve_index_selector(&state, &index).await;
     if targets.is_empty() {
         let e = xerj_common::XerjError::index_not_found(&index);
@@ -2807,6 +3788,101 @@ fn inject_bbq_rescore_defaults(node: &mut Value) {
     }
 }
 
+#[cfg(test)]
+mod get_mapping_missing_index {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::{
+        config::{Config, WalSync},
+        metrics::Metrics,
+    };
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn a_concrete_missing_name_is_reported_and_a_wildcard_is_not() {
+        let known = |p: &str| p == "logs" || p == "metrics";
+        assert_eq!(first_missing_concrete_name("nope", known), Some("nope"));
+        assert_eq!(first_missing_concrete_name("logs", known), None);
+        assert_eq!(
+            first_missing_concrete_name("logs,nope", known),
+            Some("nope")
+        );
+        // A wildcard that matches nothing is not a concrete miss. The empty
+        // result stays on the existing path so the YAML suite's wildcard
+        // cases are unchanged.
+        assert_eq!(first_missing_concrete_name("nope*", known), None);
+        assert_eq!(first_missing_concrete_name("_all", known), None);
+        assert_eq!(first_missing_concrete_name("*", known), None);
+        assert_eq!(first_missing_concrete_name("logs*", known), None);
+    }
+
+    /// ES `indices.get_mapping`: `GET /nope/_mapping` is 404, not 200 `{}`.
+    /// A name that exists still returns its mapping. A wildcard is not this
+    /// check — `nope*` stays on the empty-target path.
+    #[tokio::test]
+    async fn get_mapping_404s_a_concrete_missing_name_and_returns_a_real_one() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("body", FieldType::Text));
+        state.engine.create_index("logs", schema).unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let missing = router
+            .clone()
+            .oneshot(Request::get("/nope/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(missing.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "index_not_found_exception");
+        assert_eq!(json["error"]["reason"], "no such index [nope]");
+
+        let mixed = router
+            .clone()
+            .oneshot(
+                Request::get("/logs,nope/_mapping")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.status(), StatusCode::NOT_FOUND);
+
+        let found = router
+            .clone()
+            .oneshot(Request::get("/logs/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let bytes = to_bytes(found.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("logs").is_some(), "{json}");
+
+        // Wildcard miss is not rewritten by the concrete check. Empty targets
+        // already 404; this pins that the new branch did not turn it into 200.
+        let wild = router
+            .oneshot(Request::get("/nope*/_mapping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wild.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /{index}/_settings
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2865,26 +3941,67 @@ fn resolve_effective_pipeline(
     }
 }
 
+/// Parse one indexed document from raw bytes.
+///
+/// The size check runs before `serde_json`. `PUT /{index}/_doc/{id}` used
+/// to take `Json<Value>`, which builds the DOM inside axum before the
+/// handler runs. A body between the 8 MiB document ceiling and
+/// `limits.max_body_bytes` (100 MiB) was parsed, then refused, and the
+/// parse itself is what aborted the node under a memory cap (#1122).
+/// Bytes that are not valid JSON and are also over the ceiling report the
+/// size refusal, not a parse error — that is how a test can see the check
+/// ran first.
+pub(crate) fn parse_indexed_document_body(body: &[u8]) -> Result<Value, xerj_common::XerjError> {
+    if xerj_common::document_limit::indexed_document_too_large(body.len()) {
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::indexed_document_refusal(body.len()),
+        ));
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| xerj_common::XerjError::invalid_query(format!("invalid JSON body: {e}")))
+}
+
+/// Serialize a document the in-process callers already hold as a [`Value`]
+/// into the raw body [`index_doc`] parses. Those callers (brain edges,
+/// agent memory) are small; the HTTP routes pass the request bytes through
+/// unchanged.
+pub(crate) fn document_body(doc: &Value) -> bytes::Bytes {
+    bytes::Bytes::from(serde_json::to_vec(doc).unwrap_or_else(|_| Vec::from(&b"{}"[..])))
+}
+
 /// Fast path for `POST /{index}/_doc`: receives raw bytes to skip the axum
 /// JSON extractor's extra validation pass and parse directly with simd_json /
 /// serde_json.  No schema validation is performed here; the engine layer handles
 /// all type coercion.  This shaves ~15–30 µs of extractor overhead per doc.
+/// Resolve an alias to the concrete index a document write must land in.
+/// A concrete name (or a name that will be auto-created) is returned
+/// unchanged; an ambiguous alias becomes ES's 400
+/// `illegal_argument_exception` instead of silently using the first backing
+/// index (`GET /{index}` does resolve aliases that way, but a write may not).
+fn write_target_or_refusal(
+    state: &AppState,
+    index: &str,
+) -> std::result::Result<String, axum::response::Response> {
+    match state.engine.write_target(index) {
+        Ok(Some(target)) => Ok(target),
+        Ok(None) => Ok(index.to_string()),
+        Err(reason) => Err(es_bad_request("illegal_argument_exception", &reason, None)),
+    }
+}
+
 pub async fn index_doc_auto(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<IndexDocAutoParams>,
     body: bytes::Bytes,
 ) -> impl IntoResponse {
-    // Parse the raw body directly — avoids the axum Json extractor's extra
-    // content-type enforcement and serde_json::from_str double-pass.
-    let doc: Value = match serde_json::from_slice(&body) {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
+    let doc = match parse_indexed_document_body(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return ApiError::new(xerj_common::XerjError::invalid_query(format!(
-                "invalid JSON body: {e}"
-            )))
-            .into_response();
-        }
+        Err(e) => return ApiError::new(e).into_response(),
     };
 
     let doc = apply_ignore_malformed(&state, &index, doc);
@@ -2958,12 +4075,36 @@ pub async fn index_doc_auto(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    // Cluster mode picks the id before routing so the shard owner is a
+    // function of the id that will be stored. Single-node keeps the engine's
+    // auto-id.
+    let preset_id = if state.engine.has_cluster() {
+        let id = uuid::Uuid::new_v4().to_string();
+        match crate::cluster_shard::dispatch_index(
+            &state, &index, &id, &doc, "index", None, None, None, None,
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => Some(id),
+        }
+    } else {
+        None
     };
 
-    match idx.index_document(None, doc).await {
+    let idx = if preset_id.is_some() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    };
+
+    match idx.index_document(preset_id, doc).await {
         Ok(resp) => {
             state.metrics.record_doc_indexed(&index);
             let er = EsDocResponse::created(
@@ -3009,8 +4150,17 @@ pub async fn index_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<IndexDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
+    // Size check before the DOM exists. See [`parse_indexed_document_body`].
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Apply ignore_malformed validation — remove malformed values and add
     // field names to _ignored[] per the index mapping. No-op when the index
     // has no mapping yet.
@@ -3093,11 +4243,6 @@ pub async fn index_doc(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
-
     // op_type=create means fail if document already exists.
     let is_create_op = params.op_type.as_deref() == Some("create");
 
@@ -3106,6 +4251,37 @@ pub async fn index_doc(
     // (which runs on internal seqs), so a value read from GET/_search/_mget
     // or a previous write response round-trips correctly.
     let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
+
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_index(
+            &state,
+            &index,
+            &id,
+            &doc,
+            if is_create_op { "create" } else { "index" },
+            if_seq_no_internal,
+            params.if_primary_term,
+            params.version,
+            params.version_type.clone(),
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+
+    let idx = if state.engine.has_cluster() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    };
 
     if is_create_op {
         match idx.create_document(id.clone(), doc).await {
@@ -3189,8 +4365,16 @@ pub async fn create_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<CreateDocParams>,
-    Json(doc): Json<Value>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
+    let doc = match parse_indexed_document_body(&body) {
+        Ok(v) => v,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
     // Execute ingest pipeline if one is specified (explicit `?pipeline=`) or
     // resolved from the index's `index.default_pipeline` setting.
     let effective_pipeline = resolve_effective_pipeline(&state, &index, params.pipeline.as_deref());
@@ -3226,9 +4410,27 @@ pub async fn create_doc(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_index(
+            &state, &index, &id, &doc, "create", None, None, None, None,
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+
+    let idx = if state.engine.has_cluster() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
     };
 
     match idx.create_document(id.clone(), doc).await {
@@ -3243,6 +4445,207 @@ pub async fn create_doc(
             (StatusCode::CREATED, Json(er)).into_response()
         }
         Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod oversized_single_doc {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_INDEXED_DOCUMENT_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        let err = parse_indexed_document_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+            "{text}"
+        );
+        assert!(text.contains("not indexed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_indexed_document_body(br#"{"name":"ada"}"#).unwrap();
+        assert_eq!(small["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn put_and_create_refuse_an_oversized_body_and_a_small_put_indexes() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let body = vec![b'x'; MAX_INDEXED_DOCUMENT_BYTES + 1];
+        for path in ["/oversize/_doc/1", "/oversize/_create/1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::put(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(
+                text.contains(&MAX_INDEXED_DOCUMENT_BYTES.to_string()),
+                "{path}: {text}"
+            );
+            assert!(text.contains("not indexed"), "{path}: {text}");
+            assert!(
+                !text.contains("invalid JSON"),
+                "{path} parsed before the size check: {text}"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::put("/oversize/_doc/ok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+}
+
+#[cfg(test)]
+mod oversized_update {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xerj_common::config::{Config, WalSync};
+    use xerj_common::document_limit::MAX_UPDATE_BODY_BYTES;
+    use xerj_common::metrics::Metrics;
+    use xerj_engine::Engine;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.storage.wal_sync = WalSync::Async;
+        let metrics = Metrics::new().expect("metrics");
+        let engine = Engine::new(config.clone()).expect("engine");
+        AppState::new(config, engine, metrics)
+    }
+
+    #[test]
+    fn an_oversized_update_body_is_refused_before_it_is_parsed() {
+        let body = vec![b'x'; MAX_UPDATE_BODY_BYTES + 1];
+        let err = parse_update_body(&body).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "the size check must run before parse: {text}"
+        );
+        let small = parse_update_body(br#"{"doc":{"name":"ada"}}"#).unwrap();
+        assert_eq!(small.doc.unwrap()["name"], "ada");
+    }
+
+    #[tokio::test]
+    async fn post_update_refuses_an_oversized_body_and_a_small_update_applies() {
+        let app = crate::router::build_es_compat_router(test_state());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::put("/upd/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"ada","n":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // Valid JSON, over the envelope. A parse-first path would accept
+        // the syntax and answer with the document ceiling (or index it).
+        // The size refusal names the update limit and does not say the
+        // body was invalid JSON.
+        let mut big = Vec::new();
+        big.extend_from_slice(br#"{"doc":{"blob":""#);
+        big.extend(std::iter::repeat_n(b'a', MAX_UPDATE_BODY_BYTES));
+        big.extend_from_slice(br#""}}"#);
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(refused.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(&MAX_UPDATE_BODY_BYTES.to_string()), "{text}");
+        assert!(text.contains("not parsed"), "{text}");
+        assert!(text.contains("not changed"), "{text}");
+        assert!(
+            !text.contains("invalid JSON"),
+            "parsed before the size check: {text}"
+        );
+
+        let fetched = app
+            .clone()
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada"));
+        assert_eq!(doc["_source"]["n"], json!(1));
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::post("/upd/_update/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"doc":{"name":"ada2"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let fetched = app
+            .oneshot(Request::get("/upd/_doc/1").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let bytes = to_bytes(fetched.into_body(), usize::MAX).await.unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["_source"]["name"], json!("ada2"));
+        assert_eq!(
+            doc["_source"]["n"],
+            json!(1),
+            "fields the update did not name stay"
+        );
     }
 }
 
@@ -3268,10 +4671,20 @@ pub async fn get_doc(
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<GetDocParams>,
 ) -> impl IntoResponse {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
     // A closed index rejects read/search ops with ES index_closed_exception.
     // Strict membership only — frozen/open indices are unaffected.
     if state.engine.closed_indices.contains_key(&index) {
         return closed_index_error(&index);
+    }
+
+    if let crate::cluster_shard::Dispatch::Done(response) =
+        crate::cluster_shard::dispatch_get(&state, &index, &id, &params).await
+    {
+        return response;
     }
 
     let idx = match state.engine.get_index(&index) {
@@ -3324,7 +4737,7 @@ pub async fn get_doc(
 }
 
 /// Filter the _source of a GET _doc response based on query params.
-fn apply_get_doc_source_filter(source: Value, params: &GetDocParams) -> Value {
+pub(crate) fn apply_get_doc_source_filter(source: Value, params: &GetDocParams) -> Value {
     // _source=false → suppress everything.
     if params.source.as_deref() == Some("false") {
         return Value::Null;
@@ -3421,13 +4834,29 @@ pub async fn delete_doc(
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<DeleteDocParams>,
 ) -> impl IntoResponse {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
+    // Wire → internal seq translation, same convention as the index path.
+    let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
+
+    if let crate::cluster_shard::Dispatch::Done(response) = crate::cluster_shard::dispatch_delete(
+        &state,
+        &index,
+        &id,
+        if_seq_no_internal,
+        params.if_primary_term,
+    )
+    .await
+    {
+        return response;
+    }
+
     let idx = match state.engine.get_index(&index) {
         Ok(i) => i,
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
-
-    // Wire → internal seq translation, same convention as the index path.
-    let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
 
     match idx
         .delete_document_versioned(&id, if_seq_no_internal, params.if_primary_term)
@@ -3468,14 +4897,14 @@ pub async fn delete_doc(
 // Supports comma-separated multi-index: /index1,index2/_search
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EsSearchBody {
     #[serde(default)]
     pub query: Option<Value>,
     /// `null` / absent → default 10.  `0` means return aggregations only.
     #[serde(default = "default_size")]
     pub size: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_negative_from")]
     pub from: usize,
     #[serde(default)]
     pub sort: Option<Value>,
@@ -5956,6 +7385,52 @@ fn strip_internal_tracking(v: &mut Value) {
     }
 }
 
+/// `from` in a search body: ES refuses a negative value with
+/// `[from] parameter cannot be negative but was [-1]` (30_limits.yml) instead
+/// of a generic JSON type error.
+fn deserialize_non_negative_from<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct FromVisitor;
+    impl serde::de::Visitor<'_> for FromVisitor {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a non-negative integer")
+        }
+        fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<usize, E> {
+            usize::try_from(n).map_err(|_| E::custom(negative_from_reason(n)))
+        }
+        // A huge positive `from` (e.g. u64::MAX) must reach the result-window
+        // check rather than fail as a JSON type error.
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<usize, E> {
+            Ok(usize::try_from(n).unwrap_or(usize::MAX))
+        }
+    }
+    deserializer.deserialize_any(FromVisitor)
+}
+
+fn negative_from_reason(n: i64) -> String {
+    format!("[from] parameter cannot be negative but was [{n}]")
+}
+
+/// ES's `illegal_argument_exception` for `?from=-1`.
+fn negative_from_error(n: i64) -> Response {
+    let reason = negative_from_reason(n);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+                "type": "illegal_argument_exception",
+                "reason": reason,
+            },
+            "status": 400,
+        })),
+    )
+        .into_response()
+}
+
 fn default_size() -> usize {
     10
 }
@@ -6224,6 +7699,913 @@ fn find_invalid_agg_order_path(aggs: Option<&Value>) -> Option<String> {
     None
 }
 
+/// Request-time check of `composite` aggregation definitions.
+///
+/// Elasticsearch refuses these at parse time with a 400; XERJ's
+/// `run_composite` instead answered 200 with an empty bucket list (missing or
+/// empty `sources`), silently let a later source overwrite an earlier one of
+/// the same name, ignored a `missing_order` that can never apply, accepted a
+/// page `size` far above `search.max_buckets`, and ran under any parent.
+/// Messages are ES 8.13's, as pinned by `aggregations/composite.yml`:
+///
+/// * `sources` absent → `Required [sources]`; empty or not a list →
+///   `Composite [sources] cannot be null or empty`;
+/// * two sources with one name → `Composite source names must be unique,
+///   found duplicates: [..]`;
+/// * `missing_order` other than `default` without `missing_bucket: true` →
+///   `missingOrder can only be set if missingBucket is true`;
+/// * `size` above `search.max_buckets` → ES's too-many-buckets message;
+/// * a parent other than `nested`, `reverse_nested` or `filter` (through any
+///   chain of those) → `[composite] aggregation cannot be used with a parent
+///   aggregation of type: [..AggregatorFactory]`.
+fn find_invalid_composite_agg(aggs: Option<&Value>) -> Option<String> {
+    fn sub_aggs(def: &Value) -> Option<&Value> {
+        def.get("aggs").or_else(|| def.get("aggregations"))
+    }
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    /// ES names the blocking parent by its factory class:
+    /// `terms` → `TermsAggregatorFactory`, `date_histogram` →
+    /// `DateHistogramAggregatorFactory`.
+    fn factory_name(kind: &str) -> String {
+        let camel: String = kind
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|c| c.to_ascii_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect();
+        format!("{camel}AggregatorFactory")
+    }
+    fn check(params: &Value, blocking_parent: Option<&str>) -> Option<String> {
+        let sources = match params.get("sources") {
+            None => return Some("Required [sources]".to_string()),
+            Some(Value::Array(a)) if !a.is_empty() => a,
+            Some(_) => return Some("Composite [sources] cannot be null or empty".to_string()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for source in sources {
+            let Some(obj) = source.as_object() else {
+                continue;
+            };
+            for (name, def) in obj {
+                if !seen.insert(name.as_str()) && !duplicates.contains(name) {
+                    duplicates.push(name.clone());
+                }
+                // `{name: {terms|histogram|...: {..., missing_order}}}`
+                let inner = def.as_object().and_then(|d| d.values().next());
+                if let Some(inner) = inner {
+                    let order = inner.get("missing_order").and_then(Value::as_str);
+                    let bucket = inner
+                        .get("missing_bucket")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if matches!(order, Some(o) if o != "default") && !bucket {
+                        return Some(
+                            "missingOrder can only be set if missingBucket is true".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        if !duplicates.is_empty() {
+            return Some(format!(
+                "Composite source names must be unique, found duplicates: [{}]",
+                duplicates.join(", ")
+            ));
+        }
+        let cap = xerj_engine::aggs::max_buckets() as u64;
+        if let Some(size) = params.get("size").and_then(Value::as_u64) {
+            if size > cap {
+                return Some(format!(
+                    "Trying to create too many buckets. Must be less than or equal to: [{cap}] \
+                     but was [{size}]. This limit can be set by changing the \
+                     [search.max_buckets] cluster level setting."
+                ));
+            }
+        }
+        if let Some(parent) = blocking_parent {
+            return Some(format!(
+                "[composite] aggregation cannot be used with a parent aggregation of type: [{}]",
+                factory_name(parent)
+            ));
+        }
+        None
+    }
+    fn walk(
+        level: &serde_json::Map<String, Value>,
+        blocking_parent: Option<&str>,
+    ) -> Option<String> {
+        for def in level.values() {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if kind == "composite" {
+                if let Some(reason) = check(params, blocking_parent) {
+                    return Some(reason);
+                }
+            }
+            // ES lets a composite sit under nested / reverse_nested / filter
+            // (any chain of them); any other parent blocks it.
+            let below = if matches!(kind, "nested" | "reverse_nested" | "filter") {
+                blocking_parent
+            } else {
+                Some(kind)
+            };
+            if let Some(subs) = sub_aggs(def).and_then(Value::as_object) {
+                if let Some(reason) = walk(subs, below) {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+    walk(aggs?.as_object()?, None)
+}
+
+#[cfg(test)]
+mod composite_agg_validation_tests {
+    use super::find_invalid_composite_agg;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_composite_agg(Some(&aggs))
+    }
+
+    /// Shapes `aggregations/composite.yml` already passes with must stay
+    /// valid: top level, under nested / reverse_nested / filter chains, with
+    /// `missing_bucket: true` and an order, and with a sane `size`.
+    #[test]
+    fn valid_composites_pass() {
+        for aggs in [
+            json!({"c": {"composite": {"size": 10, "sources": [
+                {"kw": {"terms": {"field": "keyword"}}},
+                {"long": {"terms": {"field": "long", "missing_bucket": true,
+                                    "missing_order": "last"}}},
+                {"d": {"terms": {"field": "date", "missing_order": "default"}}}]}}}),
+            json!({"n": {"nested": {"path": "nested"},
+                         "aggs": {"f": {"filter": {"term": {"x": 1}},
+                                        "aggs": {"r": {"reverse_nested": {},
+                                                       "aggs": {"c": {"composite": {"sources": [
+                                                           {"kw": {"terms": {"field": "keyword"}}}]}}}}}}}}}),
+            // A composite with sub-aggregations, and an unrelated terms
+            // whose child is NOT a composite.
+            json!({"c": {"composite": {"sources": [{"kw": {"terms": {"field": "keyword"}}}]},
+                         "aggs": {"t": {"terms": {"field": "x"}}}},
+                   "t": {"terms": {"field": "y"}, "aggs": {"m": {"max": {"field": "z"}}}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn invalid_composites_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"c": {"composite": {"size": 1}}}), "Required [sources]"),
+            (json!({"c": {"composite": {"sources": []}}}),
+             "Composite [sources] cannot be null or empty"),
+            (json!({"c": {"composite": {"sources": [
+                {"keyword": {"terms": {"field": "keyword"}}},
+                {"keyword": {"terms": {"field": "long"}}}]}}}),
+             "Composite source names must be unique, found duplicates: [keyword]"),
+            (json!({"c": {"composite": {"sources": [
+                {"kw": {"terms": {"field": "keyword", "missing_order": "first"}}}]}}}),
+             "missingOrder can only be set if missingBucket is true"),
+            (json!({"c": {"composite": {"size": 1_000_000_000u64, "sources": [
+                {"kw": {"terms": {"field": "keyword"}}}]}}}),
+             "Trying to create too many buckets"),
+            (json!({"t": {"terms": {"field": "long"},
+                          "aggs": {"c": {"composite": {"sources": [
+                              {"kw": {"terms": {"field": "keyword"}}}]}}}}}),
+             "[composite] aggregation cannot be used with a parent aggregation of type: [TermsAggregatorFactory]"),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
+/// Request-time check of aggregation parameters and structure that
+/// Elasticsearch rejects at parse time with a 400, where XERJ answered 200
+/// (ignoring the bad value, or returning an empty/defaulted result). Messages
+/// are ES 8.13's, as pinned by the ES-YAML suite:
+///
+/// * `meta` that is not an object;
+/// * `cardinality`: negative `precision_threshold`, unknown `execution_hint`;
+/// * `filters` with no filters;
+/// * `ip_prefix`: `prefix_length` outside `[0, 32]` (`[0, 128]` for IPv6);
+/// * `median_absolute_deviation`: `compression` ≤ 0, unknown `execution_hint`;
+/// * `percentiles` / `percentile_ranks`: negative `tdigest.compression`,
+///   unknown `tdigest.execution_hint`, and `percentile_ranks` without usable
+///   `values`;
+/// * `terms` with neither `field` nor `script`;
+/// * `random_sampler`: `probability` outside `(0, 0.5]` ∪ `{1.0}`, no
+///   sub-aggregations, a parent, or a sampler / time_series below it;
+/// * `time_series` under `global`, or in a request that also uses an
+///   aggregation incompatible with time-series execution (`composite`,
+///   `auto_date_histogram`, `variable_width_histogram`, `rare_terms`).
+///
+/// Checks that need the field's mapped type (e.g. `avg` on a keyword field)
+/// are not made here.
+fn find_invalid_agg_params(aggs: Option<&Value>) -> Option<String> {
+    const TDIGEST_HINTS: &[&str] = &["default", "high_accuracy"];
+    const CARDINALITY_HINTS: &[&str] = &[
+        "global_ordinals",
+        "segment_ordinals",
+        "direct",
+        "save_memory_heuristic",
+        "save_time_heuristic",
+    ];
+    const TIME_SERIES_INCOMPATIBLE: &[&str] = &[
+        "composite",
+        "auto_date_histogram",
+        "variable_width_histogram",
+        "rare_terms",
+    ];
+    fn sub_aggs(def: &Value) -> Option<&serde_json::Map<String, Value>> {
+        def.get("aggs")
+            .or_else(|| def.get("aggregations"))
+            .and_then(Value::as_object)
+    }
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    /// The parser token ES names for a JSON value.
+    fn token(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "VALUE_NULL",
+            Value::Bool(_) => "VALUE_BOOLEAN",
+            Value::Number(_) => "VALUE_NUMBER",
+            Value::String(_) => "VALUE_STRING",
+            Value::Array(_) => "START_ARRAY",
+            Value::Object(_) => "START_OBJECT",
+        }
+    }
+    fn hint_error(hint: &str) -> String {
+        format!("Invalid execution_hint [{hint}], valid values are [default, high_accuracy]")
+    }
+    /// `tdigest` options shared by `percentiles` and `percentile_ranks`.
+    fn check_tdigest(params: &Value) -> Option<String> {
+        let tdigest = params.get("tdigest")?;
+        if let Some(c) = tdigest.get("compression").and_then(Value::as_f64) {
+            if c < 0.0 {
+                return Some(format!(
+                    "[compression] must be greater than or equal to 0. Found [{c:?}]"
+                ));
+            }
+        }
+        match tdigest.get("execution_hint").and_then(Value::as_str) {
+            Some(h) if !TDIGEST_HINTS.contains(&h) => Some(hint_error(h)),
+            _ => None,
+        }
+    }
+    /// Every descendant definition below `def`, as `(type, name)`.
+    fn descendants<'a>(def: &'a Value, out: &mut Vec<(&'a str, &'a str)>) {
+        for (name, child) in sub_aggs(def).into_iter().flatten() {
+            if let Some((kind, _)) = kind_of(child) {
+                out.push((kind, name.as_str()));
+            }
+            descendants(child, out);
+        }
+    }
+    fn has_kind(level: &serde_json::Map<String, Value>, kind: &str) -> bool {
+        level.values().any(|def| {
+            kind_of(def).is_some_and(|(k, _)| k == kind)
+                || sub_aggs(def).is_some_and(|subs| has_kind(subs, kind))
+        })
+    }
+    fn check_def(
+        name: &str,
+        def: &Value,
+        kind: &str,
+        params: &Value,
+        ancestors: &[&str],
+        time_series_request: bool,
+    ) -> Option<String> {
+        if let Some(meta) = def.get("meta") {
+            if !meta.is_object() {
+                return Some(format!(
+                    "Expected [START_OBJECT] under [meta], but got a [{}] in [{name}]",
+                    token(meta)
+                ));
+            }
+        }
+        match kind {
+            "cardinality" => {
+                if let Some(p) = params.get("precision_threshold").and_then(Value::as_i64) {
+                    if p < 0 {
+                        return Some(format!(
+                            "[precisionThreshold] must be greater than or equal to 0. \
+                             Found [{p}] in [{name}]"
+                        ));
+                    }
+                }
+                if let Some(h) = params.get("execution_hint").and_then(Value::as_str) {
+                    if !CARDINALITY_HINTS.contains(&h) {
+                        return Some(format!(
+                            "Invalid execution mode for cardinality aggregation. Got [{h}]\
+                             expected one of [{}]",
+                            CARDINALITY_HINTS.join(", ")
+                        ));
+                    }
+                }
+            }
+            "filters" => {
+                let empty = match params.get("filters") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Array(a)) => a.is_empty(),
+                    Some(Value::Object(o)) => o.is_empty(),
+                    Some(_) => false,
+                };
+                if empty {
+                    return Some("[filters] cannot be empty.".to_string());
+                }
+            }
+            "ip_prefix" => {
+                let max = if params.get("is_ipv6").and_then(Value::as_bool) == Some(true) {
+                    128
+                } else {
+                    32
+                };
+                if let Some(len) = params.get("prefix_length").and_then(Value::as_i64) {
+                    if !(0..=max).contains(&len) {
+                        return Some(format!(
+                            "[prefix_length] must be in range [0, {max}] while value is [{len}]"
+                        ));
+                    }
+                }
+            }
+            "median_absolute_deviation" => {
+                if let Some(c) = params.get("compression").and_then(Value::as_f64) {
+                    if c <= 0.0 {
+                        return Some(format!(
+                            "[compression] must be greater than 0. Found [{c:?}] in [{name}]"
+                        ));
+                    }
+                }
+                if let Some(h) = params.get("execution_hint").and_then(Value::as_str) {
+                    if !TDIGEST_HINTS.contains(&h) {
+                        return Some(hint_error(h));
+                    }
+                }
+            }
+            "percentiles" => return check_tdigest(params),
+            "percentile_ranks" => {
+                if let Some(e) = check_tdigest(params) {
+                    return Some(e);
+                }
+                match params.get("values") {
+                    None | Some(Value::Null) => {
+                        return Some(format!("[values] must not be null: [{name}]"))
+                    }
+                    Some(Value::Array(a)) if a.is_empty() => {
+                        return Some(format!("[values] must not be an empty array: [{name}]"))
+                    }
+                    Some(Value::Array(a)) if !a.iter().all(Value::is_number) => {
+                        return Some(format!("[values] must be numbers: [{name}]"))
+                    }
+                    _ => {}
+                }
+            }
+            "terms" => {
+                if params.get("field").is_none() && params.get("script").is_none() {
+                    return Some(
+                        "Required one of fields [field, script], but none were specified."
+                            .to_string(),
+                    );
+                }
+            }
+            "random_sampler" => {
+                if let Some(p) = params.get("probability").and_then(Value::as_f64) {
+                    if p <= 0.0 {
+                        return Some(format!(
+                            "[probability] must be greater than 0.0, was [{p:?}]"
+                        ));
+                    }
+                    if p > 0.5 && p != 1.0 {
+                        return Some(format!(
+                            "[probability] must be between 0.0 and 0.5 or exactly 1.0, \
+                             was [{p:?}]"
+                        ));
+                    }
+                }
+                if !ancestors.is_empty() {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] cannot have a parent aggregation"
+                    ));
+                }
+                if sub_aggs(def).is_none_or(serde_json::Map::is_empty) {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] must have sub-aggregations"
+                    ));
+                }
+                let mut below = Vec::new();
+                descendants(def, &mut below);
+                if let Some((k, n)) = below.iter().find(|(k, _)| {
+                    matches!(
+                        *k,
+                        "sampler" | "diversified_sampler" | "random_sampler" | "time_series"
+                    )
+                }) {
+                    return Some(format!(
+                        "[random_sampler] aggregation [{name}] does not support sampling \
+                         [{k}] aggregation [{n}]"
+                    ));
+                }
+            }
+            "time_series" if ancestors.contains(&"global") => {
+                return Some(
+                    "Time series aggregations cannot be used inside global aggregation."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        if time_series_request && TIME_SERIES_INCOMPATIBLE.contains(&kind) {
+            let shown = if kind == "composite" {
+                "composite"
+            } else {
+                name
+            };
+            return Some(format!(
+                "[{shown}] aggregation is incompatible with time series execution mode"
+            ));
+        }
+        None
+    }
+    fn walk<'a>(
+        level: &'a serde_json::Map<String, Value>,
+        ancestors: &mut Vec<&'a str>,
+        time_series_request: bool,
+    ) -> Option<String> {
+        for (name, def) in level {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if let Some(reason) = check_def(name, def, kind, params, ancestors, time_series_request)
+            {
+                return Some(reason);
+            }
+            if let Some(subs) = sub_aggs(def) {
+                ancestors.push(kind);
+                let found = walk(subs, ancestors, time_series_request);
+                ancestors.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+        None
+    }
+    let level = aggs?.as_object()?;
+    let time_series_request = has_kind(level, "time_series");
+    walk(level, &mut Vec::new(), time_series_request)
+}
+
+#[cfg(test)]
+mod agg_param_validation_tests {
+    use super::find_invalid_agg_params;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_agg_params(Some(&aggs))
+    }
+
+    /// Valid shapes the suite already passes with must never be refused.
+    #[test]
+    fn valid_aggregations_pass() {
+        for aggs in [
+            json!({"c": {"cardinality": {"field": "f", "precision_threshold": 0,
+                                         "execution_hint": "save_memory_heuristic"}}}),
+            json!({"m": {"median_absolute_deviation": {"field": "f", "compression": 500,
+                                                       "execution_hint": "high_accuracy"}}}),
+            json!({"p": {"percentiles": {"field": "f", "tdigest": {"compression": 200,
+                                                                   "execution_hint": "default"}}}}),
+            json!({"r": {"percentile_ranks": {"field": "f", "values": [50, 99],
+                                              "hdr": {"number_of_significant_value_digits": 3}}}}),
+            json!({"i": {"ip_prefix": {"field": "ip", "is_ipv6": true, "prefix_length": 64}}}),
+            json!({"t": {"terms": {"script": {"source": "doc['f'].value"}}}}),
+            json!({"f": {"meta": {"k": "v"},
+                         "filters": {"filters": {"a": {"match": {"x": 1}}}}}}),
+            json!({"s": {"random_sampler": {"probability": 0.1},
+                         "aggs": {"m": {"avg": {"field": "v"}}}}}),
+            json!({"s": {"random_sampler": {"probability": 1.0},
+                         "aggs": {"m": {"avg": {"field": "v"}}}}}),
+            json!({"ts": {"time_series": {"keyed": false},
+                          "aggs": {"d": {"date_histogram": {"field": "@timestamp",
+                                                            "fixed_interval": "1h"}}}}}),
+            // An incompatible type is fine when the request has no time_series.
+            json!({"c": {"composite": {"sources": [{"k": {"terms": {"field": "k"}}}]}},
+                   "r": {"rare_terms": {"field": "k"}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn invalid_parameters_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"distinct_int": {"cardinality": {"field": "f", "precision_threshold": -1}}}),
+             "[precisionThreshold] must be greater than or equal to 0. Found [-1] in [distinct_int]"),
+            (json!({"c": {"cardinality": {"field": "f", "execution_hint": "bogus"}}}),
+             "Invalid execution mode for cardinality aggregation"),
+            (json!({"the_filter": {"filters": {}}}), "[filters] cannot be empty"),
+            (json!({"the_filter": {"meta": null, "filters": {"filters": {"a": {"match_all": {}}}}}}),
+             "Expected [START_OBJECT] under [meta], but got a [VALUE_NULL] in [the_filter]"),
+            (json!({"i": {"ip_prefix": {"field": "ip", "is_ipv6": false, "prefix_length": 44}}}),
+             "[prefix_length] must be in range [0, 32] while value is [44]"),
+            (json!({"mad": {"median_absolute_deviation": {"field": "f", "compression": 0}}}),
+             "[compression] must be greater than 0. Found [0.0] in [mad]"),
+            (json!({"p": {"percentiles": {"field": "f", "tdigest": {"execution_hint": "no_such_hint"}}}}),
+             "Invalid execution_hint [no_such_hint], valid values are [default, high_accuracy]"),
+            (json!({"r": {"percentile_ranks": {"field": "f", "values": []}}}),
+             "[values] must not be an empty array: [r]"),
+            (json!({"t": {"terms": {"size": 1}}}),
+             "Required one of fields [field, script], but none were specified"),
+            (json!({"sampled": {"random_sampler": {"probability": 1.5},
+                                "aggs": {"m": {"avg": {"field": "v"}}}}}),
+             "[probability] must be between 0.0 and 0.5 or exactly 1.0, was [1.5]"),
+            (json!({"terms": {"terms": {"field": "p"},
+                              "aggs": {"sampled": {"random_sampler": {"probability": 0.1},
+                                                   "aggs": {"m": {"max": {"field": "v"}}}}}}}),
+             "[random_sampler] aggregation [sampled] cannot have a parent aggregation"),
+            (json!({"global": {"global": {}, "aggs": {"ts": {"time_series": {}}}}}),
+             "Time series aggregations cannot be used inside global aggregation."),
+            (json!({"by_time": {"auto_date_histogram": {"field": "@timestamp"},
+                                "aggs": {"ts": {"time_series": {}}}}}),
+             "[by_time] aggregation is incompatible with time series execution mode"),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
+/// Request-time check of pipeline-aggregation placement and `buckets_path`s.
+///
+/// Elasticsearch rejects these with a 400 before running the search; XERJ
+/// answered 200 with a `null` (or silently skipped) pipeline value, so a
+/// misplaced pipeline or a typo in its path looked like "no data". Messages
+/// and rules are ES 8.13's, as pinned by the ES-YAML suite (the cases this
+/// removes from `catch-lenient.txt`):
+///
+/// * `derivative` / `cumulative_sum` / `serial_diff` / `moving_fn` /
+///   `cumulative_cardinality` / `moving_percentiles` need a `histogram`,
+///   `date_histogram` or `auto_date_histogram` parent;
+/// * `bucket_script` / `bucket_selector` / `bucket_sort` must be declared
+///   inside another aggregation, and that parent must be multi-bucket;
+/// * `bucket_sort` must have something to do (`sort`, `size` or `from`);
+/// * `moving_fn`'s `window` must be positive;
+/// * every `buckets_path` (and every `bucket_sort` sort key) must name
+///   aggregations that exist, resolved from the level the pipeline is
+///   declared at — ES's `No aggregation found for path [p]` /
+///   `No aggregation [x] found for path [p]` validation failures.
+///
+/// Path checking is deliberately one-sided: it reports a path only when no
+/// reading of it can name an existing aggregation. Value keys (`p.99`,
+/// `p[99.9]`, `stats.avg`), dotted aggregation names (`v.v`) and anything
+/// past a metric aggregation are left to the executor, as before.
+///
+/// Checked on the request, like [`find_invalid_agg_order_path`], so the
+/// answer does not depend on which executor (fast or general) would run it.
+fn find_invalid_pipeline_agg(aggs: Option<&Value>) -> Option<String> {
+    const SEQUENTIAL: &[&str] = &[
+        "derivative",
+        "cumulative_sum",
+        "serial_diff",
+        "moving_fn",
+        "cumulative_cardinality",
+        "moving_percentiles",
+    ];
+    const SEQUENTIAL_PARENTS: &[&str] = &["histogram", "date_histogram", "auto_date_histogram"];
+    const MULTI_BUCKET_PIPELINES: &[&str] = &["bucket_script", "bucket_selector", "bucket_sort"];
+    const SIBLING: &[&str] = &[
+        "avg_bucket",
+        "max_bucket",
+        "min_bucket",
+        "sum_bucket",
+        "stats_bucket",
+        "extended_stats_bucket",
+        "percentiles_bucket",
+    ];
+    /// Aggregations whose result has no sub-aggregations to walk into: a
+    /// path that reaches one stops being checked (what follows is a value
+    /// key, the executor's business).
+    const LEAF: &[&str] = &[
+        "avg",
+        "sum",
+        "min",
+        "max",
+        "value_count",
+        "cardinality",
+        "stats",
+        "extended_stats",
+        "percentiles",
+        "percentile_ranks",
+        "top_hits",
+        "top_metrics",
+        "weighted_avg",
+        "median_absolute_deviation",
+        "scripted_metric",
+        "matrix_stats",
+        "string_stats",
+        "boxplot",
+        "t_test",
+        "rate",
+        "geo_bounds",
+        "geo_centroid",
+        "geo_line",
+    ];
+    /// ES names a single-bucket parent by its internal result class.
+    fn single_bucket_class(kind: &str) -> Option<&'static str> {
+        Some(match kind {
+            "filter" => "InternalFilter",
+            "global" => "InternalGlobal",
+            "nested" => "InternalNested",
+            "reverse_nested" => "InternalReverseNested",
+            "sampler" | "diversified_sampler" => "InternalSampler",
+            "random_sampler" => "InternalRandomSampler",
+            "missing" => "InternalMissing",
+            _ => return None,
+        })
+    }
+    fn sub_aggs(def: &Value) -> Option<&Value> {
+        def.get("aggs").or_else(|| def.get("aggregations"))
+    }
+    /// The aggregation type key of one definition (`{"avg": {...}, "aggs": ...}`).
+    fn kind_of(def: &Value) -> Option<(&str, &Value)> {
+        def.as_object()?
+            .iter()
+            .find(|(k, _)| !matches!(k.as_str(), "aggs" | "aggregations" | "meta"))
+            .map(|(k, v)| (k.as_str(), v))
+    }
+    fn is_pipeline(kind: &str) -> bool {
+        SEQUENTIAL.contains(&kind)
+            || MULTI_BUCKET_PIPELINES.contains(&kind)
+            || SIBLING.contains(&kind)
+    }
+    /// One path element as an aggregation name at `level`: the whole element
+    /// (minus a `[key]` suffix), or failing that a prefix before a `.` (a
+    /// dotted value key such as `the_percentiles.99`). Returns the matched
+    /// definition and whether a value key followed the name.
+    fn resolve<'a>(
+        level: &'a serde_json::Map<String, Value>,
+        element: &str,
+    ) -> Option<(&'a Value, bool)> {
+        let bracketless = element.find('[').map_or(element, |at| &element[..at]);
+        if let Some(def) = level.get(bracketless) {
+            return Some((def, bracketless.len() != element.len()));
+        }
+        bracketless
+            .rmatch_indices('.')
+            .find_map(|(at, _)| level.get(&bracketless[..at]))
+            .map(|def| (def, true))
+    }
+    /// ES's `No aggregation ... found for path [...]`, or `None` when some
+    /// reading of `path` names existing aggregations from `level`.
+    fn check_path(path: &str, level: Option<&serde_json::Map<String, Value>>) -> Option<String> {
+        let elements: Vec<&str> = path.split('>').collect();
+        let mut level = level;
+        for (i, element) in elements.iter().enumerate() {
+            let last = i + 1 == elements.len();
+            if last && matches!(*element, "_count" | "_key" | "_bucket_count") {
+                return None;
+            }
+            let found = level.and_then(|defs| resolve(defs, element));
+            let Some((def, value_key)) = found else {
+                return Some(if i == 0 {
+                    format!("No aggregation found for path [{path}]")
+                } else {
+                    format!("No aggregation [{element}] found for path [{path}]")
+                });
+            };
+            let kind = kind_of(def).map(|(k, _)| k).unwrap_or("");
+            if value_key || LEAF.contains(&kind) || is_pipeline(kind) {
+                return None;
+            }
+            level = sub_aggs(def).and_then(Value::as_object);
+        }
+        None
+    }
+    /// Every `buckets_path` string of a pipeline: a string, the values of an
+    /// `{alias: path}` object, or the entries of an array.
+    fn buckets_paths(params: &Value) -> Vec<&str> {
+        match params.get("buckets_path") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Object(o)) => o.values().filter_map(Value::as_str).collect(),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+    /// `bucket_sort`'s sort keys that name aggregations (not `_key`/`_count`).
+    fn sort_paths(params: &Value) -> Vec<&str> {
+        let keys: Vec<&str> = match params.get("sort") {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Object(o)) => o.keys().map(String::as_str).collect(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .flat_map(|e| match e {
+                    Value::String(s) => vec![s.as_str()],
+                    Value::Object(o) => o.keys().map(String::as_str).collect(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        keys.into_iter()
+            .filter(|k| !matches!(*k, "_key" | "_count"))
+            .collect()
+    }
+    fn walk(
+        level: &serde_json::Map<String, Value>,
+        parent: Option<&str>,
+        errors: &mut Vec<String>,
+    ) {
+        for (name, def) in level {
+            let Some((kind, params)) = kind_of(def) else {
+                continue;
+            };
+            if SEQUENTIAL.contains(&kind) {
+                match parent {
+                    None => errors.push(format!(
+                        "{kind} aggregation [{name}] must have a histogram, date_histogram or \
+                         auto_date_histogram as parent but doesn't have a parent"
+                    )),
+                    Some(p) if !SEQUENTIAL_PARENTS.contains(&p) => errors.push(format!(
+                        "{kind} aggregation [{name}] must have a histogram, date_histogram or \
+                         auto_date_histogram as parent"
+                    )),
+                    Some(_) => {}
+                }
+            }
+            if MULTI_BUCKET_PIPELINES.contains(&kind) {
+                match parent.map(|p| (p, single_bucket_class(p))) {
+                    None => errors.push(format!(
+                        "{kind} aggregation [{name}] must be declared inside of another aggregation"
+                    )),
+                    Some((_, Some(class))) => errors.push(format!(
+                        "Expected a multi bucket aggregation but got [{class}] for aggregation [{name}]"
+                    )),
+                    Some((_, None)) => {}
+                }
+            }
+            if kind == "bucket_sort" {
+                let has_sort = match params.get("sort") {
+                    Some(Value::Array(a)) => !a.is_empty(),
+                    Some(Value::Null) | None => false,
+                    Some(_) => true,
+                };
+                let from = params.get("from").and_then(Value::as_u64).unwrap_or(0);
+                if !has_sort && params.get("size").is_none() && from == 0 {
+                    errors.push(format!(
+                        "[{name}] is configured to perform nothing. Please set either of \
+                         [sort, size, from] to use bucket_sort"
+                    ));
+                }
+            }
+            if kind == "moving_fn" {
+                if let Some(w) = params.get("window").and_then(Value::as_i64) {
+                    if w <= 0 {
+                        errors.push("[window] must be a positive, non-zero integer.".to_string());
+                    }
+                }
+            }
+            if is_pipeline(kind) {
+                let paths = if kind == "bucket_sort" {
+                    sort_paths(params)
+                } else {
+                    buckets_paths(params)
+                };
+                for path in paths {
+                    if let Some(e) = check_path(path, Some(level)) {
+                        errors.push(e);
+                    }
+                }
+            }
+            if let Some(subs) = sub_aggs(def).and_then(Value::as_object) {
+                walk(subs, Some(kind), errors);
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    walk(aggs?.as_object()?, None, &mut errors);
+    if errors.is_empty() {
+        return None;
+    }
+    let numbered: String = errors
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{}: {e};", i + 1))
+        .collect();
+    Some(format!("Validation Failed: {numbered}"))
+}
+
+#[cfg(test)]
+mod pipeline_agg_validation_tests {
+    use super::find_invalid_pipeline_agg;
+    use serde_json::json;
+
+    fn check(aggs: serde_json::Value) -> Option<String> {
+        find_invalid_pipeline_agg(Some(&aggs))
+    }
+
+    /// Shapes the executor already answers correctly must never be refused:
+    /// a false positive here turns a working query into a 400.
+    #[test]
+    fn valid_pipelines_pass() {
+        for aggs in [
+            // derivative / cumulative_sum / moving_fn under date_histogram,
+            // including a pipeline that reads another pipeline.
+            json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1d"},
+                         "aggs": {"v": {"avg": {"field": "x"}},
+                                  "d": {"derivative": {"buckets_path": "v"}},
+                                  "dd": {"derivative": {"buckets_path": "d"}},
+                                  "c": {"cumulative_sum": {"buckets_path": "_count"}},
+                                  "m": {"moving_fn": {"buckets_path": "v", "window": 2,
+                                                      "script": "MovingFunctions.min(values)"}}}}}),
+            // sibling pipelines: value keys, bracket keys, _count, a dotted
+            // agg name (`v.v`), a pipeline on a terms parent.
+            json!({"t": {"terms": {"field": "k"},
+                         "aggs": {"p": {"percentiles": {"field": "x"}},
+                                  "s": {"stats": {"field": "x"}},
+                                  "v.v": {"avg": {"field": "x"}}}},
+                   "a": {"avg_bucket": {"buckets_path": "t>p.99"}},
+                   "b": {"max_bucket": {"buckets_path": "t>p[99.9]"}},
+                   "c": {"sum_bucket": {"buckets_path": "t>_count"}},
+                   "d": {"min_bucket": {"buckets_path": "t>s.avg"}},
+                   "e": {"avg_bucket": {"buckets_path": "t>v.v.value"}}}),
+            // bucket_script / bucket_selector / bucket_sort under a
+            // multi-bucket parent, with object paths and `_key` sort.
+            json!({"h": {"histogram": {"field": "x", "interval": 1},
+                         "aggs": {"b": {"sum": {"field": "y"}},
+                                  "s": {"bucket_script": {"buckets_path": {"x": "b", "n": "_count"},
+                                                          "script": "params.x / params.n"}},
+                                  "f": {"bucket_selector": {"buckets_path": {"x": "b"},
+                                                            "script": "params.x > 0"}},
+                                  "o": {"bucket_sort": {"sort": [{"b": {"order": "desc"}}, "_key"],
+                                                        "size": 3}}}}}),
+            // bucket_sort with only `size` or `from` does something.
+            json!({"h": {"terms": {"field": "k"},
+                         "aggs": {"o": {"bucket_sort": {"from": 2}}}}}),
+        ] {
+            assert_eq!(check(aggs.clone()), None, "{aggs}");
+        }
+    }
+
+    #[test]
+    fn misplaced_and_mispathed_pipelines_are_refused_with_es_messages() {
+        let cases = [
+            (json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1h"}},
+                    "d": {"avg_bucket": {"buckets_path": "h>v"}}}),
+             "Validation Failed: 1: No aggregation [v] found for path [h>v];"),
+            (json!({"h": {"date_histogram": {"field": "t", "fixed_interval": "1h"},
+                          "aggs": {"d": {"derivative": {"buckets_path": "missing"}}}}}),
+             "Validation Failed: 1: No aggregation found for path [missing];"),
+            (json!({"a": {"filter": {"term": {"a": 1}},
+                          "aggs": {"b": {"sum": {"field": "b"}},
+                                   "d": {"cumulative_sum": {"buckets_path": "b"}}}}}),
+             "cumulative_sum aggregation [d] must have a histogram, date_histogram or auto_date_histogram as parent"),
+            (json!({"x": {"avg": {"field": "v"}},
+                    "d": {"derivative": {"buckets_path": "x"}}}),
+             "derivative aggregation [d] must have a histogram, date_histogram or auto_date_histogram as parent but doesn't have a parent"),
+            (json!({"a": {"filter": {"term": {"a": 1}},
+                          "aggs": {"b": {"sum": {"field": "b"}},
+                                   "d": {"bucket_selector": {"buckets_path": {"b": "b"},
+                                                             "script": "params.b > 0"}}}}}),
+             "Expected a multi bucket aggregation but got [InternalFilter] for aggregation [d]"),
+            (json!({"b": {"sum": {"field": "b"}},
+                    "d": {"bucket_script": {"buckets_path": {"b": "b"}, "script": "params.b"}}}),
+             "bucket_script aggregation [d] must be declared inside of another aggregation"),
+            (json!({"h": {"terms": {"field": "k"}, "aggs": {"bad": {"bucket_sort": {}}}}}),
+             "[bad] is configured to perform nothing. Please set either of [sort, size, from] to use bucket_sort"),
+            (json!({"h": {"terms": {"field": "k"},
+                          "aggs": {"bad": {"bucket_sort": {"sort": ["garbage"]}}}}}),
+             "No aggregation found for path [garbage]"),
+            (json!({"h": {"histogram": {"field": "x", "interval": 1},
+                          "aggs": {"m": {"moving_fn": {"buckets_path": "_count", "window": -1,
+                                                       "script": "MovingFunctions.min(values)"}}}}}),
+             "[window] must be a positive, non-zero integer."),
+        ];
+        for (aggs, want) in cases {
+            let got = check(aggs.clone()).unwrap_or_else(|| panic!("not refused: {aggs}"));
+            assert!(got.contains(want), "{aggs}\n got: {got}\nwant: {want}");
+        }
+    }
+}
+
 /// Parse an ES time-units string to milliseconds: `"500ms"`, `"30s"`,
 /// `"2m"`, `"1h"`, `"1d"`, `"5micros"`, `"100nanos"`, bare number =
 /// millis. Sub-millisecond values round up to 1 ms so `timeout=100nanos`
@@ -6294,6 +8676,12 @@ fn value_bearing_field_names(body: &EsSearchBody, fields: &[String]) -> Vec<Stri
         _ => names.extend(fields.iter().cloned()),
     }
     push_names(body.docvalue_fields.as_ref(), &mut names);
+    // `_passage` is computed by the engine into `hit.passage`, never read
+    // out of `_source`, so it cannot be dropped by a source filter. Counting
+    // it made every `fields: ["_passage"]` request with `_source` includes
+    // (the `xerj search` body) re-ask the engine for the whole document
+    // (#2422/#2423).
+    names.retain(|name| name != xerj_query::executor::PASSAGE_RESPONSE_FIELD);
     names
 }
 
@@ -6366,7 +8754,11 @@ fn build_search_request(
     if let Some(msg) = find_search_body_script_limit_violation(body, aggs_value.as_ref()) {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
-    if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref()) {
+    if let Some(msg) = find_invalid_agg_order_path(aggs_value.as_ref())
+        .or_else(|| find_invalid_composite_agg(aggs_value.as_ref()))
+        .or_else(|| find_invalid_agg_params(aggs_value.as_ref()))
+        .or_else(|| find_invalid_pipeline_agg(aggs_value.as_ref()))
+    {
         return Err(xerj_common::XerjError::invalid_query(msg));
     }
 
@@ -6982,7 +9374,18 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
     use xerj_query::ast::{HighlightFieldOptions, HighlightRequest};
 
     let obj = hl_val.as_object()?;
-    let fields_val = obj.get("fields")?.as_object()?;
+    // `fields` is an object, or ES's ordered form: an array of single-field
+    // objects (`[{"title": {}}, {"body": {}}]`). The array used to fail
+    // `as_object()` and drop highlighting with no error (#1946).
+    let field_entries: Vec<(&String, &Value)> = match obj.get("fields")? {
+        Value::Object(m) => m.iter().collect(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(|m| m.iter())
+            .collect(),
+        _ => return None,
+    };
 
     fn pull_tag(
         obj: &serde_json::Map<String, Value>,
@@ -6998,7 +9401,7 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
     }
 
     let mut fields = std::collections::HashMap::new();
-    for (field_name, field_opts) in fields_val {
+    for (field_name, field_opts) in field_entries {
         let opts = if let Some(o) = field_opts.as_object() {
             HighlightFieldOptions {
                 pre_tag: pull_tag(o, "pre_tags", "pre_tag"),
@@ -7011,6 +9414,8 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
                     .get("number_of_fragments")
                     .and_then(Value::as_u64)
                     .map(|n| n as usize),
+                highlighter_type: o.get("type").and_then(Value::as_str).map(str::to_string),
+                order: o.get("order").and_then(Value::as_str).map(str::to_string),
             }
         } else {
             HighlightFieldOptions::default()
@@ -7031,6 +9436,8 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
             .and_then(Value::as_u64)
             .map(|n| n as usize),
         require_field_match: obj.get("require_field_match").and_then(Value::as_bool),
+        highlighter_type: obj.get("type").and_then(Value::as_str).map(str::to_string),
+        order: obj.get("order").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -7038,7 +9445,7 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
 ///
 /// These are common params used by simple ES clients and curl one-liners.
 /// Most are accepted and ignored (preference, routing, etc.) to avoid 400 errors.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EsSearchQueryParams {
     /// Simple query string — `?q=title:rust`.
     pub q: Option<String>,
@@ -7698,7 +10105,15 @@ fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Hint for a query that names a field the index does not have.
+/// Hint for a query that names a field none of the matched indices map.
+///
+/// A prefix pattern (`proj-*`, the target `xerj search --prefix` and
+/// `xerj_search` both use) resolves to every dataset under it. Code datasets
+/// map `body` / `defs` / `code`; a JSON or CSV dataset often maps none of
+/// them. The field is unknown only when no resolved schema maps it (#2121) —
+/// the same rule as [`field_known_in_any`]. Reading the first index alone
+/// reported those code fields as missing whenever a data index was first in
+/// the resolved list, on a response that had already returned the code hits.
 ///
 /// Fires regardless of hit count: a bogus field inside a `multi_match` that
 /// also names a real one still returns results, so a zero-hit-only check would
@@ -7713,8 +10128,11 @@ fn referenced_query_fields(q: &Value, out: &mut Vec<String>) {
 fn unknown_field_hint(
     index: &str,
     body: &EsSearchBody,
-    schema: &xerj_common::types::Schema,
+    schemas: &[&xerj_common::types::Schema],
 ) -> Option<Value> {
+    if schemas.is_empty() {
+        return None;
+    }
     let query = body.query.as_ref()?;
     let mut referenced = Vec::new();
     referenced_query_fields(query, &mut referenced);
@@ -7722,19 +10140,9 @@ fn unknown_field_hint(
         return None;
     }
 
-    let known = |name: &str| -> bool {
-        // Accept the field itself, a subfield of a real field, and the ES
-        // metadata fields a query may legitimately target.
-        schema.field(name).is_some()
-            || name.starts_with('_')
-            || name
-                .split_once('.')
-                .is_some_and(|(parent, _)| schema.field(parent).is_some())
-    };
-
     let unknown: Vec<String> = referenced
         .iter()
-        .filter(|f| !known(f))
+        .filter(|f| !field_known_in_any(f, schemas))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -7744,8 +10152,9 @@ fn unknown_field_hint(
     }
 
     // Text-ish fields are what a full-text query actually wants; listing every
-    // keyword and numeric column would bury the answer.
-    let searchable = searchable_text_fields(schema);
+    // keyword and numeric column would bury the answer. Union across the
+    // pattern so the suggestion names a field some matched index actually maps.
+    let searchable = searchable_text_fields_across(schemas);
 
     let primary = searchable
         .iter()
@@ -7791,6 +10200,20 @@ fn searchable_text_fields(schema: &xerj_common::types::Schema) -> Vec<String> {
         })
         .map(|f| f.name.clone())
         .collect()
+}
+
+/// Searchable text fields across every matched index, first-seen order.
+/// A single schema keeps [`searchable_text_fields`]'s order.
+fn searchable_text_fields_across(schemas: &[&xerj_common::types::Schema]) -> Vec<String> {
+    let mut out = Vec::new();
+    for schema in schemas {
+        for name in searchable_text_fields(schema) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 /// The #1093 refusal reason for a search, or `None` when the query's lookup
@@ -7987,6 +10410,22 @@ fn referenced_or_recurse(v: &Value, out: &mut Vec<(String, String)>) {
 /// reasonable guess — and got a silent zero, because this corpus classifies
 /// Markdown as `txt-prose`/`txt-lines`. Discovering that cost the agent two
 /// round trips and a terms aggregation it had to think to write.
+/// Whether a response qualifies for the zero-hit `unknown_value` sample
+/// (#2451). Only a request that asked for hits (`size > 0`) and whose whole
+/// match set is empty: an empty page with a non-zero tracked total is a page
+/// past the end, not a wrong value, and a `size: 0` count/existence probe must
+/// stay as cheap as its own query — the sample is a 256-row full-source read.
+/// With `track_total_hits: false` the total is not authoritative, so the
+/// empty page (with `size > 0`) is the only signal, as before.
+fn zero_hit_value_sample_applies(
+    size: usize,
+    page_empty: bool,
+    total_count: u64,
+    track_total_disabled: bool,
+) -> bool {
+    size > 0 && page_empty && (track_total_disabled || total_count == 0)
+}
+
 fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String]) -> Value {
     json!({
         "hints": [{
@@ -8467,11 +10906,23 @@ fn search_response_hint(index: &str, body: &EsSearchBody, hits: &[EsHit]) -> Opt
 /// that already enumerates valid field names for an unknown one. Prefers
 /// names that share a prefix with, or contain/are contained by, what the
 /// caller typed (the common case: a half-remembered or typo'd dataset
-/// slug); falls back to whatever indices exist at all so the hint is never
+/// slug); falls back to the user indices that exist so the hint is never
 /// empty just because nothing looked textually similar.
+///
+/// Dot-prefixed names (`.xerj_*`, `.xerj-memory-*`) sort first and used to
+/// win that fallback, so a typo suggested the console's own indices. They
+/// stay out of the pool unless the missing name itself is dot-prefixed.
 fn nearby_index_names(missing: &str, available: &[String], limit: usize) -> Vec<String> {
+    let pool: Vec<&String> = if missing.starts_with('.') {
+        available.iter().collect()
+    } else {
+        available
+            .iter()
+            .filter(|name| !name.starts_with('.'))
+            .collect()
+    };
     let missing_lower = missing.to_ascii_lowercase();
-    let mut scored: Vec<(usize, &String)> = available
+    let mut scored: Vec<(usize, &String)> = pool
         .iter()
         .map(|name| {
             let name_lower = name.to_ascii_lowercase();
@@ -8486,12 +10937,12 @@ fn nearby_index_names(missing: &str, available: &[String], limit: usize) -> Vec<
                 } else {
                     0
                 };
-            (common_prefix + substring_bonus, name)
+            (common_prefix + substring_bonus, *name)
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     if scored.first().is_none_or(|(score, _)| *score == 0) {
-        let mut all: Vec<String> = available.to_vec();
+        let mut all: Vec<String> = pool.iter().map(|n| (*n).clone()).collect();
         all.sort();
         all.truncate(limit);
         return all;
@@ -8503,11 +10954,55 @@ fn nearby_index_names(missing: &str, available: &[String], limit: usize) -> Vec<
         .collect()
 }
 
+/// Where to point an agent after a missing index. `ax-*` is the default
+/// autoindex prefix, so it is the right guess on an empty cluster and on a
+/// cluster that actually has `ax-*` indices. It is the wrong guess when the
+/// node only has other prefixes — name those instead.
+fn index_not_found_guidance(available: &[String]) -> String {
+    let cat = "`GET /_cat/indices?v` lists every index that actually exists.";
+    let ax_sentence = "Data indexed by `xerj autoindex` lives under indices named `ax-*` — \
+         `GET /ax-*/_search` (or any `ax-*` pattern) searches all of it without needing \
+         the exact name, and `GET /_cat/indices?v` lists every index that actually exists.";
+    let user: Vec<&str> = available
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    if user.is_empty() {
+        return ax_sentence.to_string();
+    }
+    let mut prefixes: Vec<String> = Vec::new();
+    for name in &user {
+        if let Some((pre, rest)) = name.split_once('-') {
+            if !pre.is_empty() && !rest.is_empty() {
+                let pattern = format!("{pre}-*");
+                if !prefixes.contains(&pattern) {
+                    prefixes.push(pattern);
+                }
+            }
+        }
+    }
+    prefixes.sort();
+    if prefixes.is_empty() {
+        return cat.to_string();
+    }
+    if prefixes.len() == 1 && prefixes[0] == "ax-*" {
+        return ax_sentence.to_string();
+    }
+    let listed = prefixes.join(", ");
+    let ax_note = if prefixes.iter().any(|p| p == "ax-*") {
+        " `GET /ax-*/_search` searches the autoindex prefix."
+    } else {
+        ""
+    };
+    format!("Indices on this node use these prefixes: {listed}.{ax_note} {cat}")
+}
+
 /// Build the additive `_xerj.hints` hint for a `404 index_not_found_exception`
 /// on `_search`. The ES-parity `reason` ("no such index [name]") is fixed
 /// byte-for-byte by conformance tests and untouched here — this only rides
 /// alongside it with something an agent can actually act on: nearby index
-/// names, and the `ax-*` wildcard `xerj autoindex` manages its data under.
+/// names, and the prefix those indices actually use.
 fn index_not_found_hint(missing: &str, available: &[String]) -> Value {
     let candidates = nearby_index_names(missing, available, 5);
     let candidates_line = if candidates.is_empty() {
@@ -8521,10 +11016,8 @@ fn index_not_found_hint(missing: &str, available: &[String]) -> Value {
     json!({
         "hints": [{
             "reason": format!(
-                "no index matches [{missing}]. {candidates_line}Data indexed by `xerj \
-                 autoindex` lives under indices named `ax-*` — `GET /ax-*/_search` (or any \
-                 `ax-*` pattern) searches all of it without needing the exact name, and \
-                 `GET /_cat/indices?v` lists every index that actually exists.",
+                "no index matches [{missing}]. {candidates_line}{}",
+                index_not_found_guidance(available),
             ),
             "candidates": candidates,
         }],
@@ -8590,6 +11083,69 @@ mod search_response_hint_tests {
         let text = String::from_utf8(bytes.to_vec()).expect("utf8 response body");
         let json: Value = serde_json::from_str(&text).expect("valid JSON response body");
         (json, text)
+    }
+
+    fn has_unknown_value_hint(json: &Value) -> bool {
+        json["_xerj"]["hints"].as_array().is_some_and(|hints| {
+            hints
+                .iter()
+                .any(|h| h["code"].as_str() == Some("unknown_value"))
+        })
+    }
+
+    #[test]
+    fn zero_hit_value_sample_gates_on_the_match_set_not_the_page() {
+        // #2451: a `size: 0` probe never samples, hit or miss.
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 7, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, true));
+        // A page past the end of a non-empty match set is not a wrong value.
+        assert!(!super::zero_hit_value_sample_applies(10, true, 7, false));
+        // The case the hint exists for, tracked total or not.
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, false));
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, true));
+        assert!(!super::zero_hit_value_sample_applies(10, false, 3, false));
+    }
+
+    #[tokio::test]
+    async fn size_zero_term_probe_skips_the_unknown_value_sample() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("kind", FieldType::Keyword));
+        state.engine.create_index("hint-probe", schema).unwrap();
+        let idx = state.engine.get_index("hint-probe").unwrap();
+        for (id, kind) in [("1", "alpha"), ("2", "beta")] {
+            idx.index_document(Some(id.into()), json!({ "kind": kind }))
+                .await
+                .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        // A search that asked for hits and matched nothing keeps the hint.
+        let (json, _) = run_search(
+            &router,
+            "hint-probe",
+            json!({"size": 10, "query": {"term": {"kind": "gamma"}}}),
+        )
+        .await;
+        assert!(has_unknown_value_hint(&json), "hint expected: {json}");
+
+        // The autoindex existence-probe shape, miss and hit: an exact total,
+        // no sample (#2451).
+        for (value, total) in [("gamma", 0), ("alpha", 1)] {
+            let (json, _) = run_search(
+                &router,
+                "hint-probe",
+                json!({"size": 0, "track_total_hits": true,
+                       "query": {"term": {"kind": value}}}),
+            )
+            .await;
+            assert_eq!(json["hits"]["total"]["value"], total, "{json}");
+            assert!(!has_unknown_value_hint(&json), "no hint for size 0: {json}");
+        }
     }
 
     #[tokio::test]
@@ -8783,6 +11339,48 @@ mod search_response_hint_tests {
             .expect("hints array present");
         assert_eq!(hints[0]["candidates"], json!([]));
         assert!(hints[0]["reason"].as_str().unwrap().contains("ax-*"));
+    }
+
+    /// Score-0 fallback used to sort every name and keep the first five.
+    /// `.` sorts before letters, so `.xerj_users` won over `logs-app` and the
+    /// reason still claimed the data lived under `ax-*`.
+    #[tokio::test]
+    async fn index_not_found_hint_skips_system_indices_and_names_the_real_prefix() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("content", FieldType::Text));
+        state
+            .engine
+            .create_index(".xerj_users", schema.clone())
+            .unwrap();
+        state.engine.create_index("logs-app", schema).unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        let response = router
+            .oneshot(
+                Request::post("/qqqq/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"query": {"match_all": {}}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "index_not_found_exception");
+        assert_eq!(json["error"]["reason"], "no such index [qqqq]");
+        let hints = json["_xerj"]["hints"].as_array().expect("hints");
+        assert_eq!(hints[0]["candidates"], json!(["logs-app"]));
+        let reason = hints[0]["reason"].as_str().unwrap();
+        assert!(reason.contains("logs-*"), "{reason}");
+        assert!(reason.contains("_cat/indices"), "{reason}");
+        assert!(
+            !reason.contains("ax-*"),
+            "must not claim an ax-* corpus that is not on this node: {reason}"
+        );
     }
 }
 
@@ -9741,6 +12339,170 @@ mod unknown_field_refusal_tests {
             "the sibling item ran: {json}"
         );
     }
+
+    /// #2121: `xerj search` and MCP `xerj_search` send one plain-string
+    /// definition-first body at the prefix pattern (`proj-*`). That pattern
+    /// spans a code index and a JSON/CSV index that maps none of
+    /// `body`/`defs`/`code`/`name`. Those fields exist on the code index, so
+    /// the search must return that hit and must not attach an `unknown_field`
+    /// hint. The hint stays when no matched index maps the field.
+    ///
+    /// The comma target lists the CSV index first. Resolution preserves that
+    /// order, which is the case a first-schema check gets wrong. `proj-*` is
+    /// the pattern `xerj search --prefix proj` sends.
+    #[tokio::test]
+    async fn mixed_pattern_does_not_hint_a_field_some_index_maps() {
+        let state = test_state();
+        let strict_settings = json!({
+            "settings": {"index": {"query": {"strict_unknown_fields": true}}},
+        });
+        let mut code_create = strict_settings.clone();
+        code_create["mappings"] = json!({"properties": {
+            "name": {"type": "keyword"},
+            "code": {"type": "text"},
+            "body": {"type": "text"},
+            "defs": {"type": "text"},
+            "title": {"type": "text"},
+            "ax_path": {"type": "keyword"},
+            "line": {"type": "long"},
+        }});
+        let mut csv_create = strict_settings;
+        csv_create["mappings"] = json!({"properties": {
+            "sku": {"type": "keyword"},
+            "qty": {"type": "long"},
+            "note": {"type": "text"},
+        }});
+        for (index, body) in [("proj-code", code_create), ("proj-csv", csv_create)] {
+            let (status, resp) = request_json(&state, "PUT", &format!("/{index}"), body).await;
+            assert_eq!(status, StatusCode::OK, "{index}: {resp}");
+        }
+
+        let (status, resp) = request_json(
+            &state,
+            "PUT",
+            "/proj-code/_doc/sign",
+            json!({
+                "name": "SignWithSM2",
+                "code": "func SignWithSM2(digest []byte)",
+                "body": "func SignWithSM2(digest []byte) signature",
+                "defs": "func SignWithSM2",
+                "title": "sm2_dsa.go",
+                "ax_path": "sm2/sm2_dsa.go",
+                "line": 126,
+            }),
+        )
+        .await;
+        assert!(status.is_success(), "{resp}");
+        let (status, resp) = request_json(
+            &state,
+            "PUT",
+            "/proj-csv/_doc/row1",
+            json!({"sku": "A1", "qty": 3, "note": "crate of bolts"}),
+        )
+        .await;
+        assert!(status.is_success(), "{resp}");
+        for index in ["proj-code", "proj-csv"] {
+            state
+                .engine
+                .get_index(index)
+                .expect(index)
+                .refresh()
+                .await
+                .expect("refresh");
+        }
+
+        // The body both plain-string clients send. `mapped_property_names`
+        // is the union `xerj search` and `xerj_search` read from
+        // `GET /{pattern}/_mapping`; one code index is enough to keep
+        // `defs` / `name` even though the CSV index maps neither.
+        let mapping = json!({
+            "proj-csv": {"mappings": {"properties": {
+                "sku": {"type": "keyword"},
+                "qty": {"type": "long"},
+                "note": {"type": "text"},
+            }}},
+            "proj-code": {"mappings": {"properties": {
+                "name": {"type": "keyword"},
+                "code": {"type": "text"},
+                "body": {"type": "text"},
+                "defs": {"type": "text"},
+                "title": {"type": "text"},
+                "ax_path": {"type": "keyword"},
+                "line": {"type": "long"},
+            }}},
+        });
+        let mapped = xerj_common::code_query::mapped_property_names(&mapping)
+            .expect("heterogeneous mapping");
+        let numeric = xerj_common::code_query::numeric_property_names(&mapping);
+        let query = xerj_common::code_query::search_query_body_for_mapping(
+            "SignWithSM2",
+            10,
+            Some(&mapped),
+            Some(&numeric),
+        );
+        let rendered = query["query"].to_string();
+        assert!(
+            rendered.contains("\"defs\"") && rendered.contains("\"name\""),
+            "plain-string body must keep a field any matched index maps: {query}"
+        );
+        for path in ["/proj-csv,proj-code/_search", "/proj-*/_search"] {
+            let (status, json) = request_json(&state, "POST", path, query.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {json}");
+            let hits = json["hits"]["hits"].as_array().expect("hits");
+            assert!(
+                hits.iter().any(|h| {
+                    h["_index"] == "proj-code" && h["_source"]["ax_path"] == "sm2/sm2_dsa.go"
+                }),
+                "{path} must return the code hit: {json}"
+            );
+            let codes = json["_xerj"]["hints"]
+                .as_array()
+                .map(|h| {
+                    h.iter()
+                        .filter_map(|x| x["code"].as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assert!(
+                !codes.contains(&"unknown_field"),
+                "{path} hinted a field another matched index maps: {codes:?} / {json}"
+            );
+        }
+
+        // No matched index maps `phantom`. Lenient mode still explains it;
+        // strict mode (already on these indices, the autoindex default)
+        // still refuses it.
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/proj-csv,proj-code/_search?strict_unknown_fields=false",
+            json!({"query": {"term": {"phantom": "x"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let reason = json["_xerj"]["hints"]
+            .as_array()
+            .and_then(|h| h.iter().find(|x| x["code"] == "unknown_field"))
+            .and_then(|h| h["reason"].as_str())
+            .unwrap_or("");
+        assert!(
+            reason.contains("phantom"),
+            "a field on no matched index must still hint: {json}"
+        );
+
+        let (status, json) = request_json(
+            &state,
+            "POST",
+            "/proj-*/_search",
+            json!({"query": {"term": {"phantom": "x"}}}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "strict still refuses a field no index maps: {json}"
+        );
+    }
 }
 
 /// `POST /{index}/_search`.
@@ -9771,7 +12533,7 @@ pub async fn search(
     // `memory_api`'s recall test, which calls this handler directly, overflows
     // its stack on the extra copy. Boxing keeps the wrapper pointer-sized.
     let (response, fault) = xerj_engine::painless::with_script_fault_capture(Box::pin(
-        search_impl(state, index, params, principal, body),
+        search_dispatch(state, index, params, principal, body),
     ))
     .await;
     match fault {
@@ -10205,6 +12967,504 @@ fn search_actor_class(size: usize, index: &str) -> &'static str {
     }
 }
 
+/// How a search the node issues to ITSELF differs from one that arrived over
+/// HTTP. Only [`crate::hub_api`]'s in-process caller sets it, around the one
+/// internal request it makes; a request off the wire cannot carry it, because it
+/// is a task-local and not a header, a parameter or a body field.
+///
+/// Both effects exist because the hosted hub's routes are public and a pack's
+/// contents are not the operator's: neither may be a lever on the node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InProcessSearch {
+    /// Do not append this search to the audit ring. The ring is a bounded piece
+    /// of operator evidence shared by the whole node (4,096 entries); a public
+    /// route that appended one entry per request would let a crowd of strangers
+    /// age every earlier entry out of it. The HTTP access log still records the
+    /// request.
+    pub skip_audit: bool,
+    /// A fan-out over several indices skips an index whose search fails — it
+    /// is counted in `_shards.failed` and logged — instead of failing the whole
+    /// request. One pack with an unusable mapping must not take `search` down
+    /// for every other pack. When EVERY index fails the first failure is still
+    /// returned, so an outage never reads as "no results".
+    pub skip_failed_indices: bool,
+}
+
+tokio::task_local! {
+    static IN_PROCESS_SEARCH: InProcessSearch;
+}
+
+/// Run `fut` — the whole internal request, handler included — with `mode`
+/// installed. Same shape as `xerj_engine::index_guard::scoped`, and for the same
+/// reason: the handler reads it on the task that drives `fut`.
+pub(crate) async fn scoped_in_process_search<F>(mode: InProcessSearch, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    IN_PROCESS_SEARCH.scope(mode, fut).await
+}
+
+/// The mode the current request runs under; the default (a request off the
+/// wire, or engine-internal work) changes nothing.
+fn in_process_search() -> InProcessSearch {
+    IN_PROCESS_SEARCH.try_with(|m| *m).unwrap_or_default()
+}
+
+/// Bookkeeping for [`InProcessSearch::skip_failed_indices`]: how many indices a
+/// fan-out tried, how many failed, and the first failure to report if all did.
+#[derive(Default)]
+struct SkippedIndices {
+    searched: u32,
+    failed: u32,
+    first_failure: Option<Response>,
+}
+
+impl SkippedIndices {
+    /// One more index was attempted.
+    fn attempt(&mut self) {
+        self.searched += 1;
+    }
+
+    /// An attempted index failed with `why`; keep the first such response.
+    fn skip(&mut self, why: impl FnOnce() -> Response) {
+        self.failed += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(why());
+        }
+    }
+
+    /// The failure to answer with when nothing at all could be searched.
+    fn all_failed(self) -> Option<Response> {
+        if self.failed > 0 && self.failed == self.searched {
+            self.first_failure
+        } else {
+            None
+        }
+    }
+}
+
+/// #2305: indices a wildcard, `_all`/`*`, or alias expansion included that
+/// have no `semantic_text` field for the queried name. They cannot answer
+/// and must not 400 the indices that can. An explicitly named index is not
+/// recorded here (#530 still fails that request).
+#[derive(Default)]
+struct ExpandedSemanticSkips {
+    attempted: u32,
+    skipped: u32,
+    first_reason: Option<String>,
+    failures: Vec<Value>,
+}
+
+impl ExpandedSemanticSkips {
+    fn note_attempt(&mut self) {
+        self.attempted += 1;
+    }
+
+    /// `Ok(())` — `index_name` was expanded and lacks the field; the miss is
+    /// recorded and the caller continues. `Err(err)` — the caller must fail
+    /// the request with `err` (explicit index, or a different error).
+    fn take_skippable(
+        &mut self,
+        selector: &str,
+        index_name: &str,
+        node: &str,
+        err: xerj_common::XerjError,
+    ) -> Result<(), xerj_common::XerjError> {
+        let Some(reason) = absent_semantic_field_reason(&err) else {
+            return Err(err);
+        };
+        if selector_names_index_explicitly(selector, index_name) {
+            return Err(err);
+        }
+        let reason = reason.to_string();
+        tracing::warn!(
+            index = %index_name,
+            error = %reason.chars().take(300).collect::<String>(),
+            "semantic search: expanded index has no semantic_text field; skipping it"
+        );
+        self.failures
+            .push(semantic_field_shard_failure(index_name, node, &reason));
+        self.skipped += 1;
+        if self.first_reason.is_none() {
+            self.first_reason = Some(reason);
+        }
+        Ok(())
+    }
+
+    /// When every index that was searched lacked the field, there is nothing
+    /// to answer from. A wrong field name on a wildcard must stay a 400
+    /// rather than an empty 200.
+    fn failure_if_every_index_skipped(&self) -> Option<xerj_common::XerjError> {
+        if self.attempted > 0 && self.skipped == self.attempted {
+            self.first_reason
+                .clone()
+                .map(xerj_common::XerjError::invalid_query)
+        } else {
+            None
+        }
+    }
+}
+
+/// The engine's refusal for a `semantic` query against a field that is not
+/// `semantic_text` (lexical embedder, no comparable stored vector). The
+/// clause is the contract the coordinator matches; the rest of the sentence
+/// is the operator hint and may be reworded.
+fn absent_semantic_field_reason(err: &xerj_common::XerjError) -> Option<&str> {
+    match err {
+        xerj_common::XerjError::InvalidQuery { reason }
+            if reason.contains("it is not a `semantic_text` field") =>
+        {
+            Some(reason.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// True when `index_name` is a concrete token of `selector` (comma-separated,
+/// date math already resolved the way the search path resolves it). A
+/// wildcard, `_all`/`*`, or an alias token is not the concrete index name, so
+/// members reached only through that expansion are not explicitly named.
+fn selector_names_index_explicitly(selector: &str, index_name: &str) -> bool {
+    selector.split(',').any(|token| {
+        let token = resolve_date_math_index(token.trim());
+        token == index_name
+    })
+}
+
+fn semantic_field_shard_failure(index: &str, node: &str, reason: &str) -> Value {
+    json!({
+        "shard": 0,
+        "index": index,
+        "node": node,
+        "reason": {
+            "type": "illegal_argument_exception",
+            "reason": reason
+        }
+    })
+}
+
+#[cfg(test)]
+mod expanded_semantic_selector_tests {
+    use super::selector_names_index_explicitly;
+
+    #[test]
+    fn a_concrete_token_is_explicit_and_a_pattern_is_not() {
+        assert!(selector_names_index_explicitly("proj-notes", "proj-notes"));
+        assert!(selector_names_index_explicitly(
+            "proj-notes,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-notes"));
+        assert!(!selector_names_index_explicitly("proj-*", "proj-tags"));
+        assert!(!selector_names_index_explicitly("_all", "proj-notes"));
+        assert!(!selector_names_index_explicitly("*", "proj-notes"));
+        // An alias token is not the concrete member name.
+        assert!(!selector_names_index_explicitly("proj", "proj-notes"));
+        // A concrete name beside a pattern is still explicit.
+        assert!(selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-tags"
+        ));
+        assert!(!selector_names_index_explicitly(
+            "proj-*,proj-tags",
+            "proj-notes"
+        ));
+    }
+}
+
+async fn search_dispatch(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchJson,
+) -> Response {
+    // #2400: `post_filter` narrows the hits, never the aggregations.
+    if let Some(split) = split_post_filter(&params, &body) {
+        return search_with_post_filter(state, index, params, principal, split).await;
+    }
+    search_routed(state, index, params, principal, body).await
+}
+
+/// One search through the cluster fan-out when it applies, else on this node.
+async fn search_routed(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchJson,
+) -> Response {
+    if let Some(response) =
+        crate::cluster_shard::fanout_search(&state, &index, &params, &principal, &body).await
+    {
+        return response;
+    }
+    search_impl(state, index, params, principal, body).await
+}
+
+/// The searches a request with `post_filter` becomes (#2400). Elasticsearch
+/// applies `post_filter` to the hits after the aggregations are computed, so
+/// a faceted UI can show a facet's other values while one is selected.
+///
+/// - `hits`: the query wrapped as `bool{must: [query], filter: [post_filter]}`,
+///   without aggregations. A filter clause does not score, so the hits, their
+///   scores and `hits.total` are what Elasticsearch returns.
+/// - `aggs`: when the request aggregates, the original request without
+///   `post_filter` and with `size: 0`, so the aggregations are exactly what
+///   they were before.
+struct PostFilterSplit {
+    hits: EsSearchBody,
+    aggs: Option<(EsSearchQueryParams, EsSearchBody)>,
+}
+
+/// `None` leaves the request as it is: no `post_filter`; a hybrid query, which
+/// `build_search_request` rejects beside `post_filter` (#943); or a `?q=`
+/// query, which replaces the body query this wraps.
+fn split_post_filter(params: &EsSearchQueryParams, body: &EsSearchJson) -> Option<PostFilterSplit> {
+    let original = body.0.as_ref()?;
+    let filter = original.post_filter.clone()?;
+    if params.q.is_some() {
+        return None;
+    }
+    let query = original
+        .query
+        .clone()
+        .unwrap_or_else(|| json!({ "match_all": {} }));
+    let hybrid = parse_request(&json!({ "query": query }))
+        .map(|req| req.query.contains_hybrid())
+        .unwrap_or(false);
+    if hybrid {
+        return None;
+    }
+
+    let mut hits = original.clone();
+    hits.post_filter = None;
+    hits.query = Some(json!({ "bool": { "must": [query], "filter": [filter] } }));
+    let had_aggs = hits.aggs.take().is_some();
+    let had_aggregations = hits.aggregations.take().is_some();
+
+    let aggs = (had_aggs || had_aggregations).then(|| {
+        let mut body = original.clone();
+        body.post_filter = None;
+        body.size = 0;
+        body.from = 0;
+        let mut params = params.clone();
+        // Query-string paging overrides the body, and a second scroll context
+        // would leak: this search only reads the aggregations.
+        params.size = Some("0".to_string());
+        params.from = None;
+        params.scroll = None;
+        (params, body)
+    });
+    Some(PostFilterSplit { hits, aggs })
+}
+
+/// Run the split searches and answer with the hits of one and the
+/// aggregations of the other. An error from either is returned as it is.
+async fn search_with_post_filter(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    split: PostFilterSplit,
+) -> Response {
+    let hits_search = search_routed(
+        state.clone(),
+        index.clone(),
+        params,
+        principal.clone(),
+        EsSearchJson(Some(split.hits)),
+    );
+    let Some((aggs_params, aggs_body)) = split.aggs else {
+        return hits_search.await;
+    };
+    let aggs_search = search_routed(
+        state,
+        index,
+        aggs_params,
+        principal,
+        EsSearchJson(Some(aggs_body)),
+    );
+    let (hits_response, aggs_response) = tokio::join!(Box::pin(hits_search), Box::pin(aggs_search));
+    if !hits_response.status().is_success() {
+        return hits_response;
+    }
+    if !aggs_response.status().is_success() {
+        return aggs_response;
+    }
+
+    let (mut parts, hits_body) = hits_response.into_parts();
+    let read = |body: axum::body::Body| async move {
+        axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    let (Some(mut merged), Some(aggs_value)) =
+        (read(hits_body).await, read(aggs_response.into_body()).await)
+    else {
+        return ApiError::new(xerj_common::XerjError::internal(
+            "post_filter: could not read the search responses to merge them",
+        ))
+        .into_response();
+    };
+    if let (Some(obj), Some(aggregations)) =
+        (merged.as_object_mut(), aggs_value.get("aggregations"))
+    {
+        obj.insert("aggregations".to_string(), aggregations.clone());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(merged.to_string()))
+}
+
+#[cfg(test)]
+mod post_filter_split_tests {
+    use super::*;
+
+    fn body(v: Value) -> EsSearchJson {
+        EsSearchJson(Some(serde_json::from_value(v).expect("search body")))
+    }
+
+    #[test]
+    fn no_post_filter_is_left_alone() {
+        let params = EsSearchQueryParams::default();
+        assert!(split_post_filter(&params, &body(json!({"query": {"match_all": {}}}))).is_none());
+        assert!(split_post_filter(&params, &EsSearchJson(None)).is_none());
+    }
+
+    #[test]
+    fn hits_search_wraps_the_query_and_drops_aggregations() {
+        let params = EsSearchQueryParams::default();
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match": {"body": "alpha"}},
+                "post_filter": {"term": {"provenance": "draft"}},
+            })),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query,
+            Some(json!({"bool": {
+                "must": [{"match": {"body": "alpha"}}],
+                "filter": [{"term": {"provenance": "draft"}}],
+            }}))
+        );
+        assert!(split.hits.post_filter.is_none());
+        assert!(split.aggs.is_none(), "no aggregations, no second search");
+    }
+
+    #[test]
+    fn a_missing_query_is_match_all() {
+        let split = split_post_filter(
+            &EsSearchQueryParams::default(),
+            &body(json!({"post_filter": {"term": {"provenance": "draft"}}})),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query.unwrap()["bool"]["must"][0],
+            json!({"match_all": {}})
+        );
+    }
+
+    #[test]
+    fn aggregations_come_from_the_unfiltered_request_with_no_hits_and_no_scroll() {
+        let params = EsSearchQueryParams {
+            size: Some("25".into()),
+            from: Some("5".into()),
+            scroll: Some("1m".into()),
+            ..Default::default()
+        };
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match_all": {}},
+                "size": 25,
+                "post_filter": {"term": {"provenance": "draft"}},
+                "aggs": {"p": {"terms": {"field": "provenance"}}},
+            })),
+        )
+        .expect("split");
+        assert!(split.hits.aggs.is_none() && split.hits.aggregations.is_none());
+        let (aggs_params, aggs_body) = split.aggs.expect("an aggregation search");
+        assert!(aggs_body.post_filter.is_none());
+        assert_eq!(aggs_body.query, Some(json!({"match_all": {}})));
+        assert_eq!((aggs_body.size, aggs_body.from), (0, 0));
+        assert!(aggs_body.aggs.is_some());
+        assert_eq!(aggs_params.size.as_deref(), Some("0"));
+        assert!(aggs_params.from.is_none() && aggs_params.scroll.is_none());
+    }
+
+    #[test]
+    fn hybrid_and_query_string_requests_are_not_split() {
+        let hybrid = body(json!({
+            "query": {"hybrid": {"queries": [
+                {"query": {"match": {"body": "alpha"}}},
+                {"query": {"match": {"body": "beta"}}},
+            ]}},
+            "post_filter": {"term": {"provenance": "draft"}},
+        }));
+        assert!(split_post_filter(&EsSearchQueryParams::default(), &hybrid).is_none());
+        let q_param = EsSearchQueryParams {
+            q: Some("body:alpha".into()),
+            ..Default::default()
+        };
+        let with_filter = body(json!({"post_filter": {"term": {"provenance": "draft"}}}));
+        assert!(split_post_filter(&q_param, &with_filter).is_none());
+    }
+}
+
+/// One shard's search, used by the cluster fan-out. Does not fan out again.
+///
+/// `Box::pin` keeps this future pointer-sized. `search_impl`'s state is
+/// enormous, and a fan-out that awaited it by value would embed a second
+/// copy inside the coordinator's already-boxed search future.
+pub(crate) async fn search_shard_local(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchBody,
+) -> Response {
+    Box::pin(search_impl(
+        state,
+        index,
+        params,
+        principal,
+        EsSearchJson(Some(body)),
+    ))
+    .await
+}
+
+/// Heap-allocate the publish future before it is polled.
+///
+/// `publish_memtables_if_budget_engaged` awaits `Index::flush`. That future
+/// is large enough that building it inside `search_impl` overflows the worker
+/// stack (#2321). A sync function creates it here, on the task that is about
+/// to poll it, and only the box escapes.
+#[inline(never)]
+fn boxed_memtable_publish(
+    engine: std::sync::Arc<xerj_engine::Engine>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send>> {
+    Box::pin(async move { engine.publish_memtables_if_budget_engaged().await })
+}
+
+/// Publish memtables that are holding the process budget, on a fresh task.
+///
+/// A no-op — and no spawn — when the memtable breaker is off, so an ordinary
+/// search does not flush. The spawn keeps `Index::flush`'s frame off
+/// `search_impl`'s stack.
+async fn publish_engaged_memtables(engine: std::sync::Arc<xerj_engine::Engine>) {
+    if !xerj_engine::governor::global().is_some_and(|governor| governor.memtable_breaker_engaged())
+    {
+        return;
+    }
+    let _ = tokio::spawn(async move {
+        let _published = boxed_memtable_publish(engine).await;
+    })
+    .await;
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -10213,6 +13473,13 @@ async fn search_impl(
     body: EsSearchJson,
 ) -> Response {
     let started = Instant::now();
+    // Read once, before the first `.await`: what the in-process hub caller asked
+    // of this search. A request off the wire gets the default and is unaffected.
+    let in_process = in_process_search();
+    // #2321: a memtable sitting on the process budget is what a `{prefix}-*`
+    // search scans. Publish it before this request walks it. No-op unless
+    // that breaker is engaged. Read `in_process` first — it is task-local.
+    publish_engaged_memtables(std::sync::Arc::clone(&state.engine)).await;
     // Closed-index handling is deferred to after index resolution below so
     // `ignore_unavailable` / `expand_wildcards` are honored per ES semantics.
 
@@ -10323,7 +13590,10 @@ async fn search_impl(
     if let Some(ref from_s) = params.from {
         match from_s.parse::<usize>() {
             Ok(n) => body.from = n,
-            Err(_) => return int_param_parse_error("from", from_s),
+            Err(_) => match from_s.parse::<i64>() {
+                Ok(n) if n < 0 => return negative_from_error(n),
+                _ => return int_param_parse_error("from", from_s),
+            },
         }
     }
     // URL-level `seq_no_primary_term=true` / `version=true` promote the
@@ -10357,6 +13627,9 @@ async fn search_impl(
     // this size after building the response.
     let is_scroll_request = params.scroll.is_some();
     let scroll_page_size = body.size;
+    // The caller's `from`, before the scroll snapshot below rewrites it; the
+    // per-index window checks (`find_index_request_limit_violation`) need it.
+    let requested_from = body.from;
     if is_scroll_request {
         // RC4 blocker 11: enforce the open-scroll cap BEFORE running the
         // search — each context pins a fully-hydrated Vec<Hit>, so an
@@ -12250,6 +15523,22 @@ async fn search_impl(
         }
     }
 
+    // Per-index request limits ES enforces before executing a search
+    // (`search/30_limits.yml`): result window / scroll batch size, rescore
+    // window, docvalue_fields count, regex and prefix length.
+    for ix in &participating_indices {
+        if let Some(reason) = find_index_request_limit_violation(
+            &state,
+            ix,
+            &body,
+            requested_from,
+            scroll_page_size,
+            is_scroll_request,
+        ) {
+            return ApiError::new(xerj_common::XerjError::invalid_query(reason)).into_response();
+        }
+    }
+
     // Request-cache tracking: ES's shard request cache is on by
     // default for cache-eligible searches (size:0 + aggs), so we
     // record hit/miss counters per participating index unless the
@@ -12545,12 +15834,30 @@ async fn search_impl(
     // and excess searches queue on that semaphore deadline-aware exactly as
     // they did when this loop issued them one at a time.
     let mut spawned_searches = Vec::with_capacity(index_names.len());
+    // Only used when an in-process caller asked to have failing indices skipped.
+    let mut skipped = SkippedIndices::default();
+    // #2305: wildcard / `_all` / alias members with no `semantic_text` field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
             Ok(i) => i,
             Err(e) => {
                 if search_ignore_unavailable || search_allow_no_indices {
                     // Silently skip; behaves like an empty index.
+                    continue;
+                }
+                if in_process.skip_failed_indices {
+                    // An index that is listed but cannot be opened is one bad
+                    // index, not a reason to refuse the rest.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index unavailable, skipping it"
+                    );
+                    skipped.attempt();
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
                     continue;
                 }
                 let mut api_err = ApiError::new(xerj_common::XerjError::from(e));
@@ -12644,6 +15951,7 @@ async fn search_impl(
             }
             idx.search(&req_clone).await
         }));
+        skipped.attempt();
         spawned_searches.push((idx_name, search_task));
     }
 
@@ -12653,12 +15961,43 @@ async fn search_impl(
     // handles, aborting their still-running searches.
     for (idx_name, mut search_task) in spawned_searches {
         let search_result = (&mut search_task.0).await;
+        semantic_skips.note_attempt();
 
         match search_result {
             Err(join_err) => {
+                if in_process.skip_failed_indices {
+                    tracing::warn!(index = %idx_name, "in-process search: index search panicked, skipping it");
+                    skipped.skip(|| search_task_panic_response(join_err, idx_name));
+                    shards_failed_count += 1;
+                    continue;
+                }
                 return search_task_panic_response(join_err, idx_name);
             }
-            Ok(Err(e)) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Ok(Err(e)) => {
+                if in_process.skip_failed_indices {
+                    // The engine's own words can quote the query; bound and
+                    // escape them before they reach the log.
+                    tracing::warn!(
+                        index = %idx_name,
+                        error = ?e.to_string().chars().take(300).collect::<String>(),
+                        "in-process search: index search failed, skipping it"
+                    );
+                    skipped.skip(|| ApiError::new(xerj_common::XerjError::from(e)).into_response());
+                    shards_failed_count += 1;
+                    continue;
+                }
+                // #2305: a wildcard, `_all`, or alias member with no
+                // `semantic_text` field for this query contributes no hits.
+                // A concrete name in the selector still fails the request.
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => {
+                        shards_failed_count += 1;
+                        continue;
+                    }
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
             Ok(Ok(result)) => {
                 // A Painless resource limit tripped somewhere in scoring or
                 // aggregation. Those paths have no error channel, so they
@@ -12741,6 +16080,20 @@ async fn search_impl(
                 }
             }
         }
+    }
+
+    // Skipping a bad index is isolation, not a way to hide an outage: when every
+    // index that was tried failed there is nothing to answer from, and the first
+    // failure is the answer.
+    if let Some(failure) = skipped.all_failed() {
+        return failure;
+    }
+    // #2305: a pattern that matched only indices without the semantic field
+    // is the same 400 an explicit index would return — an empty 200 would
+    // hide a wrong field name. A mix (some indices have the field) falls
+    // through and answers from those.
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     // ── Post-merge `auto_date_histogram` re-coordination ────────────────────
@@ -13298,39 +16651,44 @@ async fn search_impl(
         started.elapsed(),
         merged_hits.len() as u64,
         if body.aggs.is_some() { "with-aggs" } else { "" },
-        &body
-            .query
-            .as_ref()
-            .map(|q| q.to_string())
-            .unwrap_or_default(),
+        // An omitted `query` (match_all) or a top-level `knn` with no query
+        // clause used to log `query=` empty. `logged_search_query` records
+        // the clause the engine actually ran.
+        &xerj_engine::slow_query::logged_search_query(body.query.as_ref(), body.knn.as_ref()),
     );
     // v0.9 9-P4: append to the audit log. The subject was the literal
     // "anonymous" until issue #329 — the API-key operations had been passing a
     // real `principal.label()` since #201, so the plumbing existed and this one
     // site simply did not use it.
-    state.engine.audit.append_as(
-        // #1109: the machine/user split is decided HERE, server-side, from
-        // what the request itself is — never from anything a client can set
-        // (the spoofable `X-Xerj-Internal` header was considered and
-        // rejected during #1107, and that decision stands). See
-        // `search_actor_class` for exactly which requests are machine.
-        search_actor_class(body.size, index.as_str()),
-        "search",
-        principal.label(),
-        index.as_str(),
-        "ok",
-        // `size=` is the requested page size. A `size:0` search asks for no
-        // hits — it is a counting probe (autoindex's verification reads back
-        // exact group counts that way), not someone looking for documents,
-        // and `xerj gain` needs exactly that distinction to report a hit
-        // rate that is about people (#1105).
-        &format!(
-            "took={}ms hits={} size={}",
-            took_ms,
-            merged_hits.len(),
-            body.size
-        ),
-    );
+    //
+    // Not for a search the hosted hub issues to itself (`InProcessSearch`): that
+    // is a public read, and one audit entry per request would let anyone age the
+    // operator's evidence out of the ring.
+    if !in_process.skip_audit {
+        state.engine.audit.append_as(
+            // #1109: the machine/user split is decided HERE, server-side, from
+            // what the request itself is — never from anything a client can set
+            // (the spoofable `X-Xerj-Internal` header was considered and
+            // rejected during #1107, and that decision stands). See
+            // `search_actor_class` for exactly which requests are machine.
+            search_actor_class(body.size, index.as_str()),
+            "search",
+            principal.label(),
+            index.as_str(),
+            "ok",
+            // `size=` is the requested page size. A `size:0` search asks for no
+            // hits — it is a counting probe (autoindex's verification reads back
+            // exact group counts that way), not someone looking for documents,
+            // and `xerj gain` needs exactly that distinction to report a hit
+            // rate that is about people (#1105).
+            &format!(
+                "took={}ms hits={} size={}",
+                took_ms,
+                merged_hits.len(),
+                body.size
+            ),
+        );
+    }
 
     // ES semantics: when the sort has any non-score key, `max_score` is null
     // (scores aren't tracked during field-sorted execution unless
@@ -14561,6 +17919,11 @@ async fn search_impl(
                         } else {
                             raw
                         };
+                        // #1940 stores the embedding as one `xerj:f32:` string.
+                        // `fields` reports the vector the caller named, which
+                        // is the number array — including `"_source": false`,
+                        // where the engine keeps the packed source on purpose.
+                        let raw = raw.map(expand_packed_embedding_value);
                         let arr_raw: Vec<Value> = match raw {
                             Some(Value::Array(a)) => a,
                             Some(Value::Null) | None => continue,
@@ -15032,6 +18395,7 @@ async fn search_impl(
                             other => {
                                 if is_stored(other) {
                                     if let Some(raw) = get_source_value_by_path(&h.source, other) {
+                                        let raw = expand_packed_embedding_value(raw);
                                         let arr = match raw {
                                             Value::Array(a) => a,
                                             Value::Null => continue,
@@ -15078,6 +18442,7 @@ async fn search_impl(
                             .or_else(|| target_via_alias.and_then(|t| get_source_value_by_path(&h.source, t)))
                             .or_else(|| get_source_value_by_path(&h.source, &response_key));
                         if let Some(raw) = raw {
+                            let raw = expand_packed_embedding_value(raw);
                             let arr = match raw {
                                 Value::Array(a) => a,
                                 Value::Null => vec![],
@@ -15669,21 +19034,54 @@ async fn search_impl(
     // shape of all — it returns plenty of results, silently searching fewer
     // fields than asked, so the caller has no signal at all.
     let mut all_hints: Vec<Value> = Vec::new();
+    // #2121: every matched index, not whichever name was resolved first.
+    // `xerj search` / `xerj_search` send one body at the whole prefix pattern;
+    // a field that any of those indices maps is a real target.
+    // A body with no query names no fields, so it skips the per-index reads.
+    let hint_schemas: Vec<xerj_common::types::Schema> = if body.query.is_none() {
+        Vec::new()
+    } else {
+        let mut out = Vec::with_capacity(index_names.len());
+        for name in &index_names {
+            if let Ok(idx) = state.engine.get_index(name) {
+                out.push(idx.schema().await);
+            }
+        }
+        out
+    };
+    if !hint_schemas.is_empty() {
+        let refs: Vec<&xerj_common::types::Schema> = hint_schemas.iter().collect();
+        if let Some(h) = unknown_field_hint(&index, &body, &refs) {
+            if let Some(Value::Array(items)) = h.get("hints") {
+                all_hints.extend(items.iter().cloned());
+            }
+        }
+    }
     if let Some(first) = index_names.first() {
         if let Ok(idx) = state.engine.get_index(first) {
             let schema = idx.schema().await;
-            if let Some(h) = unknown_field_hint(&index, &body, &schema) {
-                if let Some(Value::Array(items)) = h.get("hints") {
-                    all_hints.extend(items.iter().cloned());
-                }
-            }
             // A zero-hit exact filter on a real keyword field is nearly always
             // a wrong-value guess rather than a genuine absence, and the reply
             // gives no way to tell which. Sample a bounded slice of documents
             // and name the values that do exist. Only on zero hits, only for
             // exact clauses, and capped — this must never cost anything on a
             // query that worked.
-            if all_hints.is_empty() && hits.is_empty() {
+            //
+            // #2451: "zero hits" means the MATCH SET is empty, not the page. A
+            // `size: 0` request (a count or existence probe — autoindex's
+            // per-upsert `index_holds_content` is one) always has an empty
+            // page, so gating on `hits.is_empty()` alone ran the 256-row
+            // `match_all` sample — a full-source decode of ~356 rows, 1.4 s on
+            // a 234k-doc code index — after EVERY probe, hit or miss. The
+            // sample is for a caller who asked for hits and got none.
+            if all_hints.is_empty()
+                && zero_hit_value_sample_applies(
+                    body.size,
+                    hits.is_empty(),
+                    total_count,
+                    track_total_disabled,
+                )
+            {
                 let mut clauses = Vec::new();
                 if let Some(q) = body.query.as_ref() {
                     exact_term_clauses(q, &mut clauses);
@@ -15880,11 +19278,16 @@ async fn search_impl(
         }
     }
 
-    // Surface the synthesized `_shards.failures` array for an HDR-percentiles
-    // negative-value shard failure (the `failed`/`successful` counts were
-    // already adjusted via `shards_failed_count` above).
+    // Surface shard failures: an expanded index with no `semantic_text` field
+    // (#2305), and an HDR-percentiles negative-value shard (the
+    // `failed`/`successful` counts were already adjusted via
+    // `shards_failed_count` above).
     if let Some(failure) = hdr_shard_failure.take() {
-        response_body["_shards"]["failures"] = json!([failure]);
+        semantic_skips.failures.push(failure);
+    }
+    if !semantic_skips.failures.is_empty() {
+        response_body["_shards"]["failures"] =
+            Value::Array(std::mem::take(&mut semantic_skips.failures));
     }
 
     // (script_fields are evaluated per hit against the hit's source in the
@@ -17130,7 +20533,7 @@ pub struct ValidateQueryParams {
 }
 
 pub async fn validate_query(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<ValidateQueryParams>,
     body: OptionalJson<Value>,
@@ -17152,17 +20555,63 @@ pub async fn validate_query(
 
     match xerj_query::parse_request(&query_doc) {
         Ok(req) => {
+            // Parsing is only half the answer: `_search` also rewrites aliases,
+            // lowers keyword full-text to term, and rejects unsearchable fields
+            // and non-numeric values against numeric fields while it builds the
+            // query. Ask every resolved index the same question so this
+            // endpoint cannot report `valid: true` for a body `_search` refuses
+            // (the "GAP 5" this endpoint used to carry).
+            let targets = resolve_index_selector(&state, &index).await;
+            let mut successful = 0u64;
+            let mut first_error: Option<String> = None;
+            let mut explanations = Vec::new();
+            for name in &targets {
+                let outcome = match state.engine.get_index(name) {
+                    // A target the selector named but the engine does not hold
+                    // stays on the parse-only answer, as before.
+                    Ok(idx) => idx
+                        .validate_query(&req.query)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(_) => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        successful += 1;
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": true,
+                                "explanation": format!("{:?}", req.query),
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.clone());
+                        }
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": false,
+                                "error": error,
+                            }));
+                        }
+                    }
+                }
+            }
+            let total = targets.len() as u64;
+            let failed = total.saturating_sub(successful);
             let mut resp = json!({
-                "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                "valid": true,
+                "_shards": { "total": total, "successful": successful, "failed": failed },
+                "valid": failed == 0,
                 "_index": index,
             });
+            if let Some(error) = first_error {
+                resp["error"] = json!(error);
+            }
             if explain {
-                resp["explanations"] = json!([{
-                    "index": index,
-                    "valid": true,
-                    "explanation": format!("{:?}", req.query),
-                }]);
+                resp["explanations"] = json!(explanations);
             }
             Json(resp).into_response()
         }
@@ -17363,9 +20812,19 @@ async fn process_bulk_body(
         )
     });
 
-    let result =
-        xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
-            .await;
+    // Cluster mode routes each action to its shard primary and copies the
+    // stored document. No cluster handle: the local bulk pipeline, unchanged.
+    // `wire` is the primary's `_version` / `_seq_no`. The accepting node does
+    // not have the document, so the lookup below would report a fresh id.
+    let (result, wire) = if state.engine.has_cluster() {
+        crate::cluster_shard::bulk_on_primaries(state, default_index, text_ref, opts).await
+    } else {
+        (
+            xerj_engine::bulk::process_bulk_with_opts(&state.engine, default_index, text_ref, opts)
+                .await,
+            Vec::new(),
+        )
+    };
     let took_ms = result.took_ms;
     let errors = result.errors;
 
@@ -17390,15 +20849,13 @@ async fn process_bulk_body(
     let mut audited_index_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     let mut items: Vec<EsBulkItem> = Vec::with_capacity(result.items.len());
-    for item in result.items {
-        if item.error.is_some() || !(200..300).contains(&item.status) {
+    for (ordinal, item) in result.items.into_iter().enumerate() {
+        let failed = item.error.is_some() || !(200..300).contains(&item.status);
+        if failed {
             failed_items += 1;
         }
         audited_index_names.insert(item.index.clone());
-        if item.error.is_none()
-            && (200..300).contains(&item.status)
-            && matches!(item.action.as_str(), "index" | "create" | "update")
-        {
+        if !failed && matches!(item.action.as_str(), "index" | "create" | "update") {
             *docs_indexed_tally.entry(item.index.clone()).or_insert(0) += 1;
         }
         let get = item.get_source.clone().map(|s| {
@@ -17409,18 +20866,37 @@ async fn process_bulk_body(
         });
         // Real per-item `_seq_no` / `_version` — same resolvers `_mget` and
         // GET `_doc` use (were hardcoded `_version: 1` / a wall-clock
-        // timestamp masquerading as `_seq_no`).
-        let (version, seq_no) = state
-            .engine
-            .get_index(&item.index)
-            .ok()
-            .map(|idx| {
-                (
-                    idx.lookup_version(&item.id).unwrap_or(1),
-                    idx.lookup_seq_no(&item.id).unwrap_or(0),
-                )
-            })
-            .unwrap_or((1, 0));
+        // timestamp masquerading as `_seq_no`). A failed item omits them:
+        // looking up a previous document and printing its version next to
+        // `status: 400` reads as "this write landed".
+        let (version, seq_no, primary_term, shards) = if failed {
+            (None, None, None, None)
+        } else if let Some((version, seq_no)) = wire.get(ordinal).copied().flatten() {
+            (
+                Some(version),
+                Some(seq_no),
+                Some(1),
+                Some(crate::responses::EsShards::single_success()),
+            )
+        } else {
+            let (version, seq_no) = state
+                .engine
+                .get_index(&item.index)
+                .ok()
+                .map(|idx| {
+                    (
+                        idx.lookup_version(&item.id).unwrap_or(1),
+                        idx.lookup_seq_no(&item.id).unwrap_or(0),
+                    )
+                })
+                .unwrap_or((1, 0));
+            (
+                Some(version),
+                Some(seq_no),
+                Some(1),
+                Some(crate::responses::EsShards::single_success()),
+            )
+        };
         let item_result = EsBulkItemResult {
             index: item.index,
             id: item.id,
@@ -17428,42 +20904,18 @@ async fn process_bulk_body(
             // A successful action with no explicit result is a `delete`
             // (the only one that does not set one). A FAILED action has no
             // result at all — see `EsBulkItemResult::result`.
-            result: if item.error.is_some() {
+            result: if failed {
                 None
             } else {
                 Some(item.result.clone().unwrap_or_else(|| "deleted".to_string()))
             },
-            shards: crate::responses::EsShards::single_success(),
+            shards,
             seq_no,
-            primary_term: 1,
+            primary_term,
             status: item.status,
             get,
             error: item.error.map(|e| {
-                // Map common per-item error phrases to their ES exception
-                // type names so clients can match on `error.type`.
-                let error_type = if e.starts_with("if _id is specified")
-                    || e.contains("missing document body")
-                    || e.contains("unknown action type")
-                    || e.contains("no write index is defined")
-                    || e.starts_with("pipeline with id")
-                {
-                    "illegal_argument_exception"
-                } else if e.starts_with("version conflict") {
-                    "version_conflict_engine_exception"
-                } else if e.contains("index not found") || e.starts_with("no such index") {
-                    "index_not_found_exception"
-                } else if e.contains("dynamic template")
-                    || e.contains("failed to parse field")
-                    // Malformed doc-body JSON on a bulk item: ES 8.13
-                    // reports `document_parsing_exception` ("[1:1] failed
-                    // to parse: ..."), not illegal_argument.
-                    || e.contains("invalid document JSON")
-                {
-                    "document_parsing_exception"
-                } else {
-                    "engine_exception"
-                }
-                .to_string();
+                let error_type = bulk_item_error_type(&e).to_string();
                 BulkItemError {
                     error_type,
                     reason: e,
@@ -17610,6 +21062,73 @@ async fn process_bulk_body(
     r
 }
 
+/// Map a per-item `_bulk` error reason to its ES exception type name so
+/// clients can match on `error.type`.
+fn bulk_item_error_type(e: &str) -> &'static str {
+    if e.starts_with("if _id is specified")
+        || e.contains("missing document body")
+        || e.contains("unknown action type")
+        || e.contains("no write index is defined")
+        || e.contains("has more than one write index")
+        || e.starts_with("pipeline with id")
+    {
+        "illegal_argument_exception"
+    } else if e.starts_with("version conflict") {
+        "version_conflict_engine_exception"
+    } else if e.contains("index not found") || e.starts_with("no such index") {
+        "index_not_found_exception"
+    } else if e.contains("dynamic template")
+        || e.contains("failed to parse field")
+        // Malformed doc-body JSON on a bulk item: ES 8.13
+        // reports `document_parsing_exception` ("[1:1] failed
+        // to parse: ..."), not illegal_argument.
+        || e.contains("invalid document JSON")
+    {
+        "document_parsing_exception"
+    } else if e.contains("embedding backend returned") && e.contains("mapping requires") {
+        // #2191: the embedding backend's vector width contradicts the
+        // semantic_text mapping. Retrying cannot help, so it is reported as a
+        // mapping error, not a retryable `engine_exception`.
+        "mapper_parsing_exception"
+    } else {
+        "engine_exception"
+    }
+}
+
+#[cfg(test)]
+mod bulk_item_error_type_tests {
+    use super::bulk_item_error_type;
+
+    /// #2191: an embedding width that contradicts the mapping is a
+    /// `mapper_parsing_exception`, while a genuine backend fault stays an
+    /// `engine_exception`.
+    #[test]
+    fn an_embedding_width_mismatch_is_a_mapper_parsing_exception() {
+        assert_eq!(
+            bulk_item_error_type(
+                "invalid mapping: field [body]: embedding backend returned width 4, \
+                 mapping requires 8; the embedding backend's vector width is fixed"
+            ),
+            "mapper_parsing_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type(
+                "invalid mapping: field [body]: embedding backend returned 1 vectors with \
+                 widths {4} for 1 texts; mapping requires width 8"
+            ),
+            "mapper_parsing_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type("semantic_text batch embed failed: connection refused"),
+            "engine_exception"
+        );
+        assert_eq!(
+            bulk_item_error_type("failed to parse field [n]"),
+            "document_parsing_exception"
+        );
+    }
+}
+
 #[cfg(test)]
 mod malformed_bulk_route_tests {
     use super::*;
@@ -17662,9 +21181,24 @@ mod malformed_bulk_route_tests {
         assert_eq!(response["errors"], true);
         assert_eq!(response["items"][0]["index"]["status"], 201);
 
+        let ok_item = &response["items"][0]["index"];
+        assert!(
+            ok_item.get("_version").is_some()
+                && ok_item.get("_seq_no").is_some()
+                && ok_item.get("_primary_term").is_some()
+                && ok_item.get("_shards").is_some(),
+            "a successful bulk item keeps its versioning fields: {ok_item}"
+        );
+
         let failed = &response["items"][1]["index"];
         assert_eq!(failed["_id"], "broken-doc");
         assert_eq!(failed["status"], 400);
+        for absent in ["_version", "_seq_no", "_primary_term", "_shards", "result"] {
+            assert!(
+                failed.get(absent).is_none(),
+                "a failed bulk item must omit {absent}: {failed}"
+            );
+        }
         assert_eq!(
             failed["error"]["type"], "document_parsing_exception",
             "unexpected response: {response}"
@@ -18313,9 +21847,10 @@ fn es_properties_to_fields(properties: &Value) -> Result<Vec<FieldConfig>, Strin
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{field_name}_vector"));
-            // Allow a mapping to point at an external inference endpoint/model
-            // (`inference_id` mirrors ES 8.x semantic_text wiring); when absent
-            // the engine falls back to the zero-config built-in embedder.
+            // `inference_id` / `model_id` / `inference_endpoint` are stored so a
+            // mapping round-trips. Ingest does not read them: the server's
+            // `--embed-mode` embeds every document, and create/put mapping
+            // warns when these keys name a different embedder (#1612).
             let endpoint = field_def
                 .get("inference_endpoint")
                 .and_then(Value::as_str)
@@ -19902,7 +23437,7 @@ fn format_date(dt: chrono::DateTime<chrono::Utc>, fmt: &str) -> String {
 // POST /{index}/_update/{id}
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EsUpdateBody {
     /// Partial document fields to merge into existing source.
     pub doc: Option<Value>,
@@ -19922,7 +23457,7 @@ pub struct EsUpdateBody {
 }
 
 /// Query parameters for the `_update` endpoint.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpdateDocParams {
     /// `refresh=true|wait_for` — accepted without error; memtable is always visible.
     pub refresh: Option<String>,
@@ -19983,15 +23518,84 @@ async fn build_update_get_field(
     }
 }
 
+/// Parse an `_update` body from raw bytes.
+///
+/// The size check runs before `serde_json`. The route used to take
+/// `Json<EsUpdateBody>`, so axum built the DOM before the handler. A body
+/// between this envelope and `limits.max_body_bytes` (100 MiB) was parsed
+/// even when it could not be applied, and that parse is an infallible
+/// allocation (`panic = "abort"`, #1122). Bytes that are not JSON and are
+/// also over the limit report the size refusal, not a parse error.
+pub(crate) fn parse_update_body(body: &[u8]) -> Result<EsUpdateBody, xerj_common::XerjError> {
+    if xerj_common::document_limit::update_body_too_large(body.len()) {
+        let len = body.len();
+        tracing::warn!(
+            bytes = len,
+            limit = xerj_common::document_limit::MAX_UPDATE_BODY_BYTES,
+            "update body refused before parse; the existing document was not changed (#1122)"
+        );
+        return Err(xerj_common::XerjError::invalid_document_json(
+            xerj_common::document_limit::update_body_refusal(len),
+        ));
+    }
+    serde_json::from_slice(body).map_err(|e| {
+        xerj_common::XerjError::invalid_document_json(format!("invalid JSON body: {e}"))
+    })
+}
+
+pub(crate) struct LocalUpdate {
+    pub response: axum::response::Response,
+    /// The primary stored a new source. A cluster caller copies it. A noop,
+    /// a miss, and every error leave this false.
+    pub replicate: bool,
+}
+
 pub async fn update_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     Query(query_params): Query<UpdateDocParams>,
-    Json(body): Json<EsUpdateBody>,
+    body: bytes::Bytes,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_or_create_index(&index) {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
+    // Before `get_or_create_index`, so a refused body does not create an
+    // index and does not read or write the document.
+    let body = match parse_update_body(&body) {
+        Ok(body) => body,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_update(&state, &index, &id, &body, &query_params).await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+    apply_local_update(&state, &index, &id, body, &query_params)
+        .await
+        .response
+}
+
+pub(crate) async fn apply_local_update(
+    state: &AppState,
+    index: &str,
+    id: &str,
+    body: EsUpdateBody,
+    query_params: &UpdateDocParams,
+) -> LocalUpdate {
+    fn settled(response: impl IntoResponse, replicate: bool) -> LocalUpdate {
+        LocalUpdate {
+            response: response.into_response(),
+            replicate,
+        }
+    }
+    let idx = match state.engine.get_or_create_index(index) {
         Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => {
+            return settled(ApiError::new(xerj_common::XerjError::from(e)), false);
+        }
     };
 
     // ── Scripted update path ────────────────────────────────────────────────
@@ -20001,7 +23605,10 @@ pub async fn update_doc(
     if let Some(script_val) = body.script.as_ref() {
         let (src, params) = extract_update_script(script_val);
         if src.is_empty() {
-            return update_script_bad_request("script source is required".to_string());
+            return settled(
+                update_script_bad_request("script source is required".to_string()),
+                false,
+            );
         }
         let upsert_body = body.upsert.clone().or_else(|| {
             if body.doc_as_upsert {
@@ -20017,7 +23624,7 @@ pub async fn update_doc(
         let (transformed, fault) = xerj_engine::painless::with_script_fault_capture(
             xerj_engine::painless::with_script_deadline(
                 deadline,
-                idx.transform_document_serialized(&id, upsert_body, move |mut current| {
+                idx.transform_document_serialized(id, upsert_body, move |mut current| {
                     apply_painless_update(&mut current, &src, &params)?;
                     Ok::<_, String>(current)
                 }),
@@ -20025,65 +23632,66 @@ pub async fn update_doc(
         )
         .await;
         if let Some(reason) = fault {
-            return script_limit_response(&reason);
+            return settled(script_limit_response(&reason), false);
         }
         match transformed {
             Ok(Ok(Some(outcome))) => {
-                state.metrics.record_doc_indexed(&index);
+                state.metrics.record_doc_indexed(index);
                 let resp = outcome.response;
                 let mut er = if outcome.created {
                     crate::responses::EsDocResponse::created(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 } else {
                     crate::responses::EsDocResponse::updated(
-                        &index,
+                        index,
                         &resp.id,
                         resp.version,
                         resp.seq_no.saturating_sub(1),
                     )
                 };
-                if update_wants_get(&query_params) {
-                    er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+                if update_wants_get(query_params) {
+                    er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
                 }
-                return Json(er).into_response();
+                return settled(Json(er), true);
             }
             Ok(Ok(None)) => {
-                let e = xerj_common::XerjError::document_not_found(&id, &index);
-                return ApiError::new(e).into_response();
+                let e = xerj_common::XerjError::document_not_found(id, index);
+                return settled(ApiError::new(e), false);
             }
-            Ok(Err(error)) => return update_script_bad_request(error),
+            Ok(Err(error)) => return settled(update_script_bad_request(error), false),
             Err(error) => {
-                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+                return settled(ApiError::new(xerj_common::XerjError::from(error)), false);
             }
         }
     }
 
     match idx
-        .update_document_with_upsert(&id, body.doc, body.upsert, body.doc_as_upsert)
+        .update_document_with_upsert(id, body.doc, body.upsert, body.doc_as_upsert)
         .await
     {
         Ok(Some(resp)) => {
-            state.metrics.record_doc_indexed(&index);
+            let replicate = resp.result != "noop";
+            state.metrics.record_doc_indexed(index);
             let mut er = crate::responses::EsDocResponse::updated(
-                &index,
+                index,
                 &resp.id,
                 resp.version,
                 resp.seq_no.saturating_sub(1),
             );
-            if update_wants_get(&query_params) {
-                er.get = Some(build_update_get_field(&idx, &resp.id, &query_params).await);
+            if update_wants_get(query_params) {
+                er.get = Some(build_update_get_field(&idx, &resp.id, query_params).await);
             }
-            Json(er).into_response()
+            settled(Json(er), replicate)
         }
         Ok(None) => {
-            let e = xerj_common::XerjError::document_not_found(&id, &index);
-            ApiError::new(e).into_response()
+            let e = xerj_common::XerjError::document_not_found(id, index);
+            settled(ApiError::new(e), false)
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        Err(e) => settled(ApiError::new(xerj_common::XerjError::from(e)), false),
     }
 }
 
@@ -20387,6 +23995,41 @@ fn apply_one_update_stmt(source: &mut Value, stmt: &str, params: &Value) -> Resu
 // POST /{index}/_refresh
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One `_shards.failures` entry for `_refresh`, in selector order. The first
+/// failure's HTTP status becomes the response status (ES
+/// `BaseBroadcastResponse::getStatus`).
+fn record_refresh_failure(
+    failures: &mut Vec<Value>,
+    response_status: &mut StatusCode,
+    name: &str,
+    rendered: Value,
+) {
+    let status = rendered
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if failures.is_empty() {
+        *response_status = status;
+    }
+    let reason = rendered
+        .pointer("/error/root_cause/0")
+        .or_else(|| rendered.pointer("/error"))
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
+    let status_name = status
+        .canonical_reason()
+        .unwrap_or("Internal Server Error")
+        .to_ascii_uppercase()
+        .replace([' ', '-'], "_");
+    failures.push(json!({
+        "shard": 0,
+        "index": name,
+        "status": status_name,
+        "reason": reason,
+    }));
+}
+
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -20399,35 +24042,42 @@ pub async fn refresh_index(
     let mut successful = 0u64;
     let mut failures = Vec::new();
     let mut response_status = StatusCode::OK;
-    for (name, idx) in &handles {
-        match idx.flush().await {
+    // #2234: `_refresh` makes writes searchable. It is not `_flush`.
+    // `Index::flush` also runs verified WAL maintenance (snapshot fsync and
+    // prune). That work shares the disk with a background segment merge, and
+    // this handler used to await it one index at a time — a wildcard refresh
+    // sat behind the first busy index for the whole flush budget, which is
+    // what stalled autoindex finalize. `Index::refresh` publishes an
+    // unflushed memtable and returns immediately when that memtable is
+    // already empty (#1635 still bounds a memtable that does have to be
+    // published). The indices run together, so a healthy index is searchable
+    // while a busy one is still inside its own budget. Results are collected
+    // in selector order: the first failure still sets the HTTP status.
+    let mut tasks = Vec::with_capacity(handles.len());
+    for (name, idx) in handles {
+        let task_name = name.clone();
+        tasks.push((
+            name,
+            tokio::spawn(async move { (task_name, idx.refresh().await) }),
+        ));
+    }
+    for (name, task) in tasks {
+        let (name, result) = match task.await {
+            Ok(pair) => pair,
+            Err(error) => {
+                let rendered = ApiError::new(xerj_common::XerjError::internal(format!(
+                    "index [{name}] refresh task failed: {error}"
+                )))
+                .into_value();
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
+                continue;
+            }
+        };
+        match result {
             Ok(()) => successful += 1,
             Err(error) => {
                 let rendered = ApiError::new(xerj_common::XerjError::from(error)).into_value();
-                let status = rendered
-                    .get("status")
-                    .and_then(Value::as_u64)
-                    .and_then(|code| StatusCode::from_u16(code as u16).ok())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if failures.is_empty() {
-                    response_status = status;
-                }
-                let reason = rendered
-                    .pointer("/error/root_cause/0")
-                    .or_else(|| rendered.pointer("/error"))
-                    .cloned()
-                    .unwrap_or_else(|| json!({ "type": "exception", "reason": "refresh failed" }));
-                let status_name = status
-                    .canonical_reason()
-                    .unwrap_or("Internal Server Error")
-                    .to_ascii_uppercase()
-                    .replace([' ', '-'], "_");
-                failures.push(json!({
-                    "shard": 0,
-                    "index": name,
-                    "status": status_name,
-                    "reason": reason,
-                }));
+                record_refresh_failure(&mut failures, &mut response_status, &name, rendered);
             }
         }
     }
@@ -20469,6 +24119,32 @@ fn count_shard_failure(index: &str, rendered: &Value) -> Value {
     json!({ "shard": 0, "index": index, "reason": reason })
 }
 
+/// Locator of an autoindex file-card anchor. Must stay equal to
+/// `xerj_autoindex::detect::FILE_CARD_LOCATOR` (`"file"`). The card is a real
+/// document so graph edges can resolve it, and it is not a content record.
+const FILE_CARD_LOCATOR: &str = "file";
+
+/// `stats.doc_count` minus file-card anchors. A bare `_count` is what
+/// `xerj autoindex map` and agents read as the record count; one card per
+/// file was inflating it. An explicit query is left alone, so a caller who
+/// asks for `ax_locator: file` still gets those documents, and a term query
+/// that cannot run (the field is absent) leaves the stat count unchanged.
+async fn content_doc_count(idx: &xerj_engine::index::Index) -> u64 {
+    let total = idx.stats().await.doc_count;
+    let body = json!({
+        "query": {"term": {"ax_locator": FILE_CARD_LOCATOR}},
+        "size": 0,
+        "track_total_hits": true
+    });
+    let Ok(req) = xerj_query::parse_request(&body) else {
+        return total;
+    };
+    match idx.search(&req).await {
+        Ok(result) if result.script_failure.is_none() => total.saturating_sub(result.total.value),
+        _ => total,
+    }
+}
+
 pub async fn count_docs_global(
     State(state): State<AppState>,
     Query(params): Query<CountParams>,
@@ -20490,6 +24166,32 @@ pub async fn count_docs(
     Query(params): Query<CountParams>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // #193-style parity: ES's `_count` body accepts `min_score` and filters the
+    // counted set by it. The handler rebuilds a `size: 0` search body from the
+    // query alone, so this field used to be dropped and `_count` answered the
+    // unfiltered total while `_search` with the same body answered 0. A
+    // non-numeric value is the same 400 parse_exception `_search` gives.
+    let min_score = match body.as_ref().and_then(|b| b.get("min_score")) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(ms) => Some(ms),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "type": "parse_exception",
+                            "reason": format!(
+                                "malformed JSON in request body: invalid value for [min_score]: {value}"
+                            ),
+                            "status": 400,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     // Multi-index / all selector: sum counts from every participating index.
     //
     // An ALIAS belongs in this branch too. It used not to, so a multi-index
@@ -20559,6 +24261,7 @@ pub async fn count_docs(
             }
         }
         let has_query = !alias_filters.is_empty()
+            || min_score.is_some()
             || body
                 .as_ref()
                 .and_then(|b| b.get("query"))
@@ -20612,13 +24315,19 @@ pub async fn count_docs(
                 let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
                 // A body that does not parse is not per-index: it is the same
                 // 400 the single-index arm returns, for the same reason.
-                let req = match xerj_query::parse_request(&search_body) {
+                let mut req = match xerj_query::parse_request(&search_body) {
                     Ok(r) => r,
                     Err(e) => {
                         let ze = xerj_common::XerjError::invalid_query(e.to_string());
                         return ApiError::new(ze).into_response();
                     }
                 };
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
+                }
                 match idx.search(&req).await {
                     Ok(result) => {
                         // A script resource limit in the filter (terms_set's
@@ -20640,7 +24349,7 @@ pub async fn count_docs(
                     }
                 }
             } else {
-                total += idx.stats().await.doc_count;
+                total += content_doc_count(&idx).await;
                 successful += 1;
             }
         }
@@ -20681,12 +24390,15 @@ pub async fn count_docs(
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
-    // If no query or match_all, use the stored stats for speed.
-    let has_query = body
-        .as_ref()
-        .and_then(|b| b.get("query"))
-        .map(|q| !q.is_null())
-        .unwrap_or(false);
+    // If no query or match_all, use the stored stats for speed. A body that
+    // carries `min_score` still has to run the query: match_all scores 1.0, so
+    // a threshold above it counts zero.
+    let has_query = min_score.is_some()
+        || body
+            .as_ref()
+            .and_then(|b| b.get("query"))
+            .map(|q| !q.is_null())
+            .unwrap_or(false);
 
     let count = if has_query {
         // Run a search with size=0 to get the total.
@@ -20701,22 +24413,32 @@ pub async fn count_docs(
         resolve_terms_lookups(&mut query_val, &state).await;
         let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
         match xerj_query::parse_request(&search_body) {
-            Ok(req) => match idx.search(&req).await {
-                Ok(result) => {
-                    if let Some(reason) = &result.script_failure {
-                        return script_limit_response(reason);
-                    }
-                    result.total.value
+            Ok(mut req) => {
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
                 }
-                Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-            },
+                match idx.search(&req).await {
+                    Ok(result) => {
+                        if let Some(reason) = &result.script_failure {
+                            return script_limit_response(reason);
+                        }
+                        result.total.value
+                    }
+                    Err(e) => {
+                        return ApiError::new(xerj_common::XerjError::from(e)).into_response()
+                    }
+                }
+            }
             Err(e) => {
                 let ze = xerj_common::XerjError::invalid_query(e.to_string());
                 return ApiError::new(ze).into_response();
             }
         }
     } else {
-        idx.stats().await.doc_count
+        content_doc_count(&idx).await
     };
 
     let mut body_out = json!({
@@ -20740,6 +24462,10 @@ pub async fn head_doc(
     State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let index = match write_target_or_refusal(&state, &index) {
+        Ok(index) => index,
+        Err(resp) => return resp,
+    };
     let idx = match state.engine.get_index(&index) {
         Ok(i) => i,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -21747,6 +25473,7 @@ pub async fn index_stats(
     if targets.len() > 1 || index == "_all" || index.contains('*') {
         // Aggregate across multiple indices.
         let mut all_doc_count = 0u64;
+        let mut all_deleted_doc_count = 0u64;
         let mut all_store_bytes = 0u64;
         // Aggregated so `GET /_all/_stats` carries the same
         // `primaries.mappings.schema_persist_failures` the per-index form does.
@@ -21763,6 +25490,12 @@ pub async fn index_stats(
             };
             let doc_count = stats.doc_count;
             all_doc_count += doc_count;
+            let deleted_doc_count = state
+                .engine
+                .get_index(name)
+                .map(|idx| idx.deleted_doc_count())
+                .unwrap_or(0);
+            all_deleted_doc_count += deleted_doc_count;
             // Real on-disk footprint: recursive byte sum of the index's
             // data dir (WAL + segments + everything else it persists).
             let store_size_bytes = state
@@ -21796,7 +25529,7 @@ pub async fn index_stats(
                 .unwrap_or(0);
             all_schema_persist_failures += schema_persist_failures;
             let primaries = json!({
-                "docs": { "count": doc_count, "deleted": 0 },
+                "docs": { "count": doc_count, "deleted": deleted_doc_count },
                 "store": { "size_in_bytes": store_size_bytes },
                 "dense_vector": dv,
                 "hnsw": hnsw,
@@ -21862,7 +25595,7 @@ pub async fn index_stats(
             all_dv_value_count += dv.get("value_count").and_then(Value::as_u64).unwrap_or(0);
         }
         let all_primaries = json!({
-            "docs": { "count": all_doc_count, "deleted": 0 },
+            "docs": { "count": all_doc_count, "deleted": all_deleted_doc_count },
             "store": { "size_in_bytes": all_store_bytes },
             "mappings": { "schema_persist_failures": all_schema_persist_failures },
             "dense_vector": {
@@ -21891,6 +25624,14 @@ pub async fn index_stats(
     };
 
     let doc_count = stats.doc_count;
+    // #2140: `docs.deleted` is the pre-merge physical-minus-live count, not a
+    // hard-coded 0. It also has to agree with `_cat/indices` and the
+    // cluster/node rollups below.
+    let deleted_doc_count = state
+        .engine
+        .get_index(&index)
+        .map(|idx| idx.deleted_doc_count())
+        .unwrap_or(0);
     // Real on-disk footprint: recursive byte sum of the index's data dir
     // (WAL + segments + everything else it persists).
     let store_size_bytes = state
@@ -21961,7 +25702,7 @@ pub async fn index_stats(
         .map(|idx| idx.schema_persist_failures())
         .unwrap_or(0);
     let primaries = json!({
-        "docs": { "count": doc_count, "deleted": 0 },
+        "docs": { "count": doc_count, "deleted": deleted_doc_count },
         "store": { "size_in_bytes": store_size_bytes },
         "dense_vector": dense_vector_stats,
         "hnsw": hnsw_stats,
@@ -22085,6 +25826,98 @@ pub struct AliasAction {
 pub struct AliasActionParams {
     pub index: String,
     pub alias: String,
+    /// `POST /_aliases` carries the same per-alias metadata `PUT
+    /// /{index}/_alias/{name}` does. These used to be missing from this struct,
+    /// so serde silently discarded them and a filtered alias created through
+    /// the standard action API exposed every document.
+    #[serde(default)]
+    pub filter: Option<Value>,
+    #[serde(default)]
+    pub routing: Option<Value>,
+    #[serde(default)]
+    pub index_routing: Option<Value>,
+    #[serde(default)]
+    pub search_routing: Option<Value>,
+    #[serde(default)]
+    pub is_write_index: Option<bool>,
+    #[serde(default)]
+    pub is_hidden: Option<bool>,
+}
+
+/// The metadata object `PUT /{index}/_alias/{name}` and `POST /_aliases` both
+/// persist for an alias. Empty means "no metadata" (and clears any stale
+/// entry on a re-add).
+fn alias_action_meta(add: &AliasActionParams) -> Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = &add.filter {
+        obj.insert("filter".to_string(), v.clone());
+    }
+    if let Some(v) = &add.routing {
+        obj.insert("routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.index_routing {
+        obj.insert("index_routing".to_string(), v.clone());
+    }
+    if let Some(v) = &add.search_routing {
+        obj.insert("search_routing".to_string(), v.clone());
+    }
+    if let Some(v) = add.is_write_index {
+        obj.insert("is_write_index".to_string(), Value::Bool(v));
+    }
+    if let Some(v) = add.is_hidden {
+        obj.insert("is_hidden".to_string(), Value::Bool(v));
+    }
+    Value::Object(obj)
+}
+
+/// Replace (or clear, for empty metadata) one alias's metadata on one index
+/// and persist it. Clearing matters: re-adding an alias without a filter must
+/// not leave the previous filter enforced.
+fn store_alias_meta(state: &AppState, index: &str, alias: &str, meta: &Value) {
+    let mut existing = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+        .unwrap_or_else(|| json!({}));
+    if !existing.is_object() {
+        existing = json!({});
+    }
+    if let Some(obj) = existing.as_object_mut() {
+        if meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+            obj.remove(alias);
+        } else {
+            obj.insert(alias.to_string(), meta.clone());
+        }
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
+}
+
+/// Drop one alias's stored metadata after the alias itself was removed.
+fn clear_alias_meta(state: &AppState, index: &str, alias: &str) {
+    let Some(mut existing) = state
+        .engine
+        .index_alias_metadata
+        .get(index)
+        .map(|v| v.clone())
+    else {
+        return;
+    };
+    let Some(obj) = existing.as_object_mut() else {
+        return;
+    };
+    if obj.remove(alias).is_none() {
+        return;
+    }
+    state
+        .engine
+        .index_alias_metadata
+        .insert(index.to_string(), existing);
+    state.engine.flush_alias_metadata();
 }
 
 #[derive(Debug, Deserialize)]
@@ -22153,10 +25986,15 @@ pub async fn post_aliases(
     for step in &plan {
         match step {
             Resolved::Add(add, targets) => {
+                let meta = alias_action_meta(add);
+                if let Some(reason) = alias_value_type_error(&add.alias, &meta) {
+                    return es_bad_request("illegal_argument_exception", &reason, None);
+                }
                 for target in targets {
                     if let Err(error) = state.engine.add_alias(&add.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    store_alias_meta(&state, target, &add.alias, &meta);
                 }
             }
             Resolved::Remove(remove, targets) => {
@@ -22164,6 +26002,7 @@ pub async fn post_aliases(
                     if let Err(error) = state.engine.remove_alias(&remove.alias, target) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
+                    clear_alias_meta(&state, target, &remove.alias);
                 }
             }
         }
@@ -22384,6 +26223,67 @@ pub async fn put_alias(
     Path((index, alias)): Path<(String, String)>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // ES's alias-name and body checks (`indices.put_alias/10_basic.yml`),
+    // before anything is attached.
+    const ALIAS_FORBIDDEN: &[char] = &[' ', '"', '*', '\\', '<', '|', ',', '>', '/', '?'];
+    if alias.contains(ALIAS_FORBIDDEN) {
+        return es_bad_request(
+            "invalid_alias_name_exception",
+            &format!(
+                "Invalid alias name [{alias}]: must not contain the following characters \
+                 [ , \", *, \\, <, |, ,, >, /, ?]"
+            ),
+            None,
+        );
+    }
+    // A concrete index of that name (not this alias already existing —
+    // re-putting an alias to change its filter or routing stays allowed).
+    if !state.engine.aliases.contains_key(&alias) && state.engine.get_index(&alias).is_ok() {
+        return es_bad_request(
+            "invalid_alias_name_exception",
+            &format!(
+                "Invalid alias name [{alias}]: an index or data stream exists with the same name \
+                 as the alias"
+            ),
+            None,
+        );
+    }
+    if let Some(fields) = body.0.as_ref().and_then(Value::as_object) {
+        const ALIAS_FIELDS: &[&str] = &[
+            "filter",
+            "routing",
+            "index_routing",
+            "search_routing",
+            "is_write_index",
+            "is_hidden",
+        ];
+        for (field, v) in fields {
+            if !ALIAS_FIELDS.contains(&field.as_str()) {
+                return es_bad_request(
+                    "illegal_argument_exception",
+                    &format!("[{alias}] Unsupported field [{field}]"),
+                    None,
+                );
+            }
+            if field.ends_with("routing") && (v.is_array() || v.is_object()) {
+                let token = if v.is_array() {
+                    "START_ARRAY"
+                } else {
+                    "START_OBJECT"
+                };
+                return es_bad_request(
+                    "illegal_argument_exception",
+                    &format!(
+                        "[{alias}] failed to parse field [{field}]: Unexpected token [{token}]"
+                    ),
+                    None,
+                );
+            }
+        }
+        if let Some(reason) = alias_value_type_error(&alias, &Value::Object(fields.clone())) {
+            return es_bad_request("illegal_argument_exception", &reason, None);
+        }
+    }
     let targets = resolve_index_selector(&state, &index).await;
     let alias_meta: Value = body
         .0
@@ -22392,24 +26292,9 @@ pub async fn put_alias(
 
     let attach = |idx_name: &str| -> xerj_engine::Result<()> {
         state.engine.add_alias(&alias, idx_name)?;
-        if !alias_meta.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-            let mut existing = state
-                .engine
-                .index_alias_metadata
-                .get(idx_name)
-                .map(|v| v.clone())
-                .unwrap_or(json!({}));
-            if let Some(obj) = existing.as_object_mut() {
-                obj.insert(alias.clone(), alias_meta.clone());
-            } else {
-                existing = json!({ alias.clone(): alias_meta.clone() });
-            }
-            state
-                .engine
-                .index_alias_metadata
-                .insert(idx_name.to_string(), existing);
-            state.engine.flush_alias_metadata();
-        }
+        // Re-putting an alias replaces its definition: an empty body clears a
+        // previous filter instead of leaving it enforced.
+        store_alias_meta(&state, idx_name, &alias, &alias_meta);
         Ok(())
     };
 
@@ -22442,11 +26327,13 @@ pub async fn delete_alias(
         if let Err(error) = state.engine.remove_alias(&alias, &index) {
             return ApiError::new(xerj_common::XerjError::from(error)).into_response();
         }
+        clear_alias_meta(&state, &index, &alias);
     } else {
         for idx in &targets {
             if let Err(error) = state.engine.remove_alias(&alias, idx) {
                 return ApiError::new(xerj_common::XerjError::from(error)).into_response();
             }
+            clear_alias_meta(&state, idx, &alias);
         }
     }
     Json(json!({ "acknowledged": true })).into_response()
@@ -22585,12 +26472,172 @@ pub async fn delete_index_template(
 // DELETE /_search/scroll            — clear scroll
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// An integer `index.<key>` setting in any of the three spellings a settings
+/// document can carry it (see [`index_max_result_window`]).
+fn index_int_setting(state: &AppState, ix: &str, key: &str) -> Option<u64> {
+    let s = state.engine.index_settings.get(ix).map(|v| v.clone())?;
+    let as_int = |v: &Value| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    };
+    let dotted = format!("index.{key}");
+    s.pointer(&format!("/index/{key}"))
+        .and_then(as_int)
+        .or_else(|| s.get("index").and_then(|i| i.get(&dotted)).and_then(as_int))
+        .or_else(|| s.get(&dotted).and_then(as_int))
+}
+
+/// The per-index request limits Elasticsearch checks before running a search,
+/// with its messages (`search/30_limits.yml`). Each was previously either
+/// unchecked (an HTTP 200) or refused deeper with a different message:
+///
+/// * `from + size` over `index.max_result_window` (default 10 000), or for a
+///   scroll the batch `size` — ES's `Result window is too large` / `Batch size
+///   is too large`. The engine's own window check stays as a backstop.
+/// * a rescore `window_size` over `index.max_rescore_window` (defaults to the
+///   result window);
+/// * more `docvalue_fields` than `index.max_docvalue_fields_search` (100);
+/// * a `regexp`, `prefix` or `/regex/` `query_string` longer than
+///   `index.max_regex_length` (1000 characters).
+fn find_index_request_limit_violation(
+    state: &AppState,
+    ix: &str,
+    body: &EsSearchBody,
+    from: usize,
+    size: usize,
+    is_scroll: bool,
+) -> Option<String> {
+    let max_window = index_max_result_window(state, ix);
+    let window = from.saturating_add(size);
+    if window > max_window {
+        return Some(if is_scroll {
+            format!(
+                "Batch size is too large, size must be less than or equal to: [{max_window}] but \
+                 was [{window}]. Scroll batch sizes cost as much memory as result windows so \
+                 they are controlled by the [index.max_result_window] index level setting."
+            )
+        } else {
+            format!(
+                "Result window is too large, from + size must be less than or equal to: \
+                 [{max_window}] but was [{window}]. See the scroll api for a more efficient way \
+                 to request large data sets. This limit can be set by changing the \
+                 [index.max_result_window] index level setting."
+            )
+        });
+    }
+
+    let max_rescore = index_int_setting(state, ix, "max_rescore_window")
+        .map(|v| v as usize)
+        .unwrap_or(max_window);
+    let rescores: Vec<&Value> = match body.rescore.as_ref() {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(item @ Value::Object(_)) => vec![item],
+        _ => Vec::new(),
+    };
+    for rescore in rescores {
+        if let Some(w) = rescore.get("window_size").and_then(Value::as_u64) {
+            if w as usize > max_rescore {
+                return Some(format!(
+                    "Rescore window [{w}] is too large. It must be less than [{max_rescore}]. \
+                     This prevents allocating massive heaps for storing the results to be \
+                     rescored. This limit can be set by changing the [index.max_rescore_window] \
+                     index level setting."
+                ));
+            }
+        }
+    }
+
+    let max_dv = index_int_setting(state, ix, "max_docvalue_fields_search").unwrap_or(100);
+    if let Some(Value::Array(fields)) = body.docvalue_fields.as_ref() {
+        if fields.len() as u64 > max_dv {
+            return Some(format!(
+                "Trying to retrieve too many docvalue_fields. Must be less than or equal to: \
+                 [{max_dv}] but was [{}]. This limit can be set by changing the \
+                 [index.max_docvalue_fields_search] index level setting.",
+                fields.len()
+            ));
+        }
+    }
+
+    let max_regex = index_int_setting(state, ix, "max_regex_length").unwrap_or(1000) as usize;
+    body.query
+        .as_ref()
+        .and_then(|q| find_overlong_pattern(q, max_regex))
+}
+
+/// The first `regexp`, `prefix` or `/regex/` `query_string` in `query` whose
+/// pattern is longer than `max` characters, as ES's message.
+fn find_overlong_pattern(query: &Value, max: usize) -> Option<String> {
+    let too_long = |kind: &str, len: usize, query_name: &str| {
+        format!(
+            "The length of {kind} [{len}] used in the {query_name} Query request has exceeded the \
+             allowed maximum of [{max}]. This maximum can be set by changing the \
+             [index.max_regex_length] index level setting."
+        )
+    };
+    /// `{field: "pattern"}` or `{field: {"value": "pattern"}}`.
+    fn field_patterns(clause: &Value) -> Vec<&str> {
+        clause
+            .as_object()
+            .map(|o| {
+                o.values()
+                    .filter_map(|v| {
+                        v.as_str()
+                            .or_else(|| v.get("value").and_then(Value::as_str))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    match query {
+        Value::Object(o) => {
+            for (key, value) in o {
+                match key.as_str() {
+                    "regexp" => {
+                        for p in field_patterns(value) {
+                            let len = p.chars().count();
+                            if len > max {
+                                return Some(too_long("regex", len, "Regexp"));
+                            }
+                        }
+                    }
+                    "prefix" => {
+                        for p in field_patterns(value) {
+                            let len = p.chars().count();
+                            if len > max {
+                                return Some(too_long("prefix", len, "Prefix"));
+                            }
+                        }
+                    }
+                    "query_string" => {
+                        let text = value.get("query").and_then(Value::as_str).unwrap_or("");
+                        let t = text.trim();
+                        if t.len() >= 2 && t.starts_with('/') && t.ends_with('/') {
+                            let len = t[1..t.len() - 1].chars().count();
+                            if len > max {
+                                return Some(too_long("regex", len, "Regexp"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(reason) = find_overlong_pattern(value, max) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_overlong_pattern(v, max)),
+        _ => None,
+    }
+}
+
 /// An index's `index.max_result_window`, in any of the three spellings a
 /// settings document can carry it (nested `index.max_result_window`, a flat
 /// dotted key under `index`, or a top-level dotted key), defaulting to the
 /// node's `limits.max_result_window` (10,000 by default, the ES default) like
-/// the engine's own check. Shared by the `ids` clause check and the
-/// `rerank.window` check.
+/// the engine's own check. Shared by the `ids` clause check, the
+/// `rerank.window` check and [`find_index_request_limit_violation`].
 fn index_max_result_window(state: &AppState, ix: &str) -> usize {
     state
         .engine
@@ -22720,6 +26767,10 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
+    // #2305: alias expansion on this route (wildcards are not expanded here)
+    // must not 400 every member because one lacks the semantic field.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -22732,6 +26783,7 @@ pub async fn search_with_scroll(
         full_req.size = SCROLL_SNAPSHOT_MAX_HITS;
         full_req.from = 0;
 
+        semantic_skips.note_attempt();
         match idx.search(&full_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -22742,8 +26794,17 @@ pub async fn search_with_scroll(
                     all_hits.push((idx_name.clone(), hit));
                 }
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, idx_name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
 
     let took_ms = started.elapsed().as_millis() as u64;
@@ -25563,7 +29624,28 @@ async fn msearch_impl(
             search_body_val
                 .get("aggs")
                 .or_else(|| search_body_val.get("aggregations")),
-        ) {
+        )
+        .or_else(|| {
+            find_invalid_composite_agg(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+            .or_else(|| {
+                find_invalid_agg_params(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+                .or_else(|| {
+                    find_invalid_pipeline_agg(
+                        search_body_val
+                            .get("aggs")
+                            .or_else(|| search_body_val.get("aggregations")),
+                    )
+                })
+            })
+        }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
                 "status": 400
@@ -25725,7 +29807,7 @@ async fn msearch_impl(
         }
 
         // Parse search request.
-        let search_req = match xerj_query::parse_request(&effective_body)
+        let mut search_req = match xerj_query::parse_request(&effective_body)
             .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
         {
             Ok(r) => r,
@@ -25739,16 +29821,20 @@ async fn msearch_impl(
             }
         };
 
+        // `highlight` the way `_search` reads it (`pre_tags` arrays, the
+        // array form of `fields`), not `parse_request`'s serde shape (#1945).
+        search_req.highlight = effective_body.get("highlight").and_then(parse_highlight);
+
         // Resolve index names (comma-separated or "*" = all).
         let index_names: Vec<String> = if let Some(pit) = pit_context.as_ref() {
             pit.indices.clone()
-        } else if index_name == "*" || index_name == "_all" {
-            state.engine.index_name_list()
         } else {
-            index_name
-                .split(',')
-                .flat_map(|n| state.engine.resolve_alias(n.trim()))
-                .collect()
+            // #1932: expand wildcards and aliases through the same selector
+            // the other read endpoints use. `resolve_alias` knew aliases
+            // only, so `logs-*` reached `get_index` as a literal name and the
+            // item answered 404. A pattern that matches nothing is an empty
+            // result, and a missing concrete name still fails the item.
+            resolve_index_selector(&state, &index_name).await
         };
 
         let index_names: Vec<String> = if idx_constraints.is_empty() {
@@ -25766,6 +29852,11 @@ async fn msearch_impl(
         let mut merged_aggs: Option<Value> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
         let mut script_failure: Option<String> = None;
+        // #2305: same wildcard/alias isolation as `_search`. `_msearch` fans
+        // out on its own, so a `proj-*` item used to 400 when one match lacked
+        // the semantic field.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         for idx_name in &index_names {
             let idx = match state.engine.get_index(idx_name) {
@@ -25775,6 +29866,7 @@ async fn msearch_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     // A Painless resource limit tripped during scoring/aggs:
@@ -25799,8 +29891,19 @@ async fn msearch_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -25808,6 +29911,9 @@ async fn msearch_impl(
         if let Some(reason) = script_failure {
             responses.push(script_limit_error_value(&reason));
             continue;
+        }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
         }
 
         // The sub-response carries the SAME body the single-request `_search`
@@ -25847,12 +29953,18 @@ async fn msearch_impl(
                 } else {
                     Some(h.source.clone())
                 };
-                json!({
+                let mut hit = json!({
                     "_index": idx_name,
                     "_id": h.id,
                     "_score": h.score as f64,
                     "_source": source,
-                })
+                });
+                // The engine already built the fragments; this renderer used
+                // to drop them (#1945).
+                if let Some(hl) = h.highlight {
+                    hit["highlight"] = json!(hl);
+                }
+                hit
             })
             .collect();
 
@@ -25869,6 +29981,16 @@ async fn msearch_impl(
         });
         if let Some(aggs) = merged_aggs {
             resp["aggregations"] = aggs;
+        }
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            resp["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
         }
         // PIT sub-searches echo the pit_id first, exactly like `_search`
         // (ES 8.x msearch items carry it too — same search_after loop
@@ -27050,17 +31172,69 @@ fn es_aggregator_class_name_ctx(
     }
 }
 
+/// `*`-only glob over an index, alias or field name: `*` matches any run of
+/// characters (including none), anywhere in the pattern, any number of times.
+/// Every other character is literal, as in ES index patterns (`?` is not a
+/// wildcard there).
+///
+/// This used to handle one leading or one trailing `*` and fall back to
+/// string equality for anything else, so `logs-*-2026` (#1933) and
+/// `*-app-*` matched nothing and `_search` answered 0 hits with no error.
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let mut parts = pattern.split('*');
+    // `split` always yields at least one item; the first is anchored at the
+    // start of `name`, the last at its end, the middle ones float in order.
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let middle: Vec<&str> = parts.collect();
+    let Some((last, middle)) = middle.split_last() else {
         return true;
+    };
+    for part in middle {
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return name.starts_with(prefix);
+    rest.ends_with(last)
+}
+
+#[cfg(test)]
+mod glob_match_simple_tests {
+    use super::glob_match_simple;
+
+    #[test]
+    fn a_star_anywhere_in_an_index_pattern_matches() {
+        // #1933: a mid-name `*` used to fall through to string equality.
+        assert!(glob_match_simple("logs-*-2026", "logs-app-2026"));
+        assert!(glob_match_simple("logs-*-2026", "logs--2026"));
+        assert!(!glob_match_simple("logs-*-2026", "logs-app-2025"));
+        assert!(glob_match_simple("*-app-*", "logs-app-2026"));
+        assert!(glob_match_simple("l*s-*-20*6", "logs-app-2026"));
+        assert!(
+            !glob_match_simple("ab*ba", "aba"),
+            "anchors may not overlap"
+        );
+        assert!(glob_match_simple("a**b", "ab"));
+        // Unchanged shapes.
+        assert!(glob_match_simple("*", "anything"));
+        assert!(glob_match_simple("logs-*", "logs-app-2026"));
+        assert!(glob_match_simple("*-2026", "logs-app-2026"));
+        assert!(glob_match_simple("logs-app-2026", "logs-app-2026"));
+        assert!(!glob_match_simple("logs-app", "logs-app-2026"));
+        assert!(
+            !glob_match_simple("logs-?pp-2026", "logs-app-2026"),
+            "`?` is literal"
+        );
     }
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        return name.ends_with(suffix);
-    }
-    pattern == name
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27068,7 +31242,7 @@ fn glob_match_simple(pattern: &str, name: &str) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (_idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     // Live cumulative search + indexing counters, summed across all indices.
     let (query_total, query_time_ms, index_total, index_time_ms) =
         real_node_search_index_totals(&state).await;
@@ -27167,7 +31341,7 @@ pub async fn nodes_stats(State(state): State<AppState>) -> impl IntoResponse {
                     "bulk": { "threads": cpu_threads, "queue": 0, "active": 0, "rejected": 0 },
                 },
                 "indices": {
-                    "docs": { "count": total_docs, "deleted": 0 },
+                    "docs": { "count": total_docs, "deleted": total_deleted },
                     "store": { "size_in_bytes": store_bytes },
                     // Real cumulative counters summed across all indices
                     // (RC4 W4 item 1): previously hardcoded 0, so node-stats
@@ -27408,7 +31582,7 @@ fn read_rss_bytes() -> Option<u64> {
 
 pub async fn cluster_stats(State(state): State<AppState>) -> impl IntoResponse {
     let health = state.engine.health().await;
-    let (idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     let (mem_total, mem_avail) = read_meminfo().unwrap_or((rss_bytes * 4, rss_bytes * 3));
     let mem_used = mem_total.saturating_sub(mem_avail);
@@ -27429,7 +31603,7 @@ pub async fn cluster_stats(State(state): State<AppState>) -> impl IntoResponse {
         "indices": {
             "count": idx_count,
             "shards": { "total": idx_count, "primaries": idx_count, "replication": 0.0 },
-            "docs": { "count": total_docs, "deleted": 0 },
+            "docs": { "count": total_docs, "deleted": total_deleted },
             "store": { "size_in_bytes": store_bytes },
             "fielddata": { "memory_size_in_bytes": 0, "evictions": 0 },
             "query_cache": { "memory_size_in_bytes": 0, "total_count": 0, "hit_count": 0, "miss_count": 0 },
@@ -27657,7 +31831,10 @@ async fn resolve_by_query_targets(
     state: &AppState,
     spec: &str,
     user_query: Value,
-) -> std::result::Result<(Vec<std::sync::Arc<xerj_engine::Index>>, Value), xerj_common::XerjError> {
+) -> std::result::Result<
+    (Vec<std::sync::Arc<xerj_engine::Index>>, Vec<String>, Value),
+    xerj_common::XerjError,
+> {
     let member_names = resolve_index_selector(state, spec).await;
 
     // Alias filters are keyed on the name AS WRITTEN (the alias, not its
@@ -27689,7 +31866,7 @@ async fn resolve_by_query_targets(
                 .map_err(xerj_common::XerjError::from)?,
         );
     }
-    Ok((indices, effective_query))
+    Ok((indices, member_names, effective_query))
 }
 
 /// Combine the per-member results of a fanned-out by-query into one response.
@@ -27700,7 +31877,7 @@ async fn resolve_by_query_targets(
 /// concatenated; if any member produced an error body (it carries a `status`),
 /// that error is surfaced rather than a clean aggregate — a destructive
 /// by-query that partially failed must not report success.
-fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
+pub(crate) fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
     if results.len() == 1 {
         return results.pop().unwrap();
     }
@@ -27752,6 +31929,80 @@ fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value
     Value::Object(out)
 }
 
+/// Build the cluster fan-out off this handler's state machine.
+///
+/// `delete_by_query` is already large enough that a debug build's worker
+/// stack (2 MiB, the `#[tokio::test]` default) overflows once a second copy
+/// of the runner is inlined into the same future. `[cluster] enabled = false`
+/// never polls the fan-out, so the future is allocated here and only the
+/// pointer is stored on the handler. `inline(never)` keeps that allocation
+/// in this frame: inlining it back into `delete_by_query` puts the fan-out
+/// on the worker stack again.
+#[inline(never)]
+fn begin_cluster_delete_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::DeleteByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(cluster_delete_by_query(
+        state,
+        index_names,
+        parts,
+        wait_for_completion,
+        handle,
+    ))
+}
+
+async fn cluster_delete_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::DeleteByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> Response {
+    if !wait_for_completion {
+        let task_key = handle.key().to_string();
+        let spawned_key = task_key.clone();
+        let tasks = state.tasks.clone();
+        let names = index_names.clone();
+        // The fan-out calls `Engine::get_index` on the detached task, so
+        // the request's visibility rule has to come with it. See
+        // `xerj_engine::index_guard`.
+        let rule = xerj_engine::index_guard::current();
+        tokio::spawn(xerj_engine::index_guard::scoped_opt(rule, async move {
+            let mut results = Vec::with_capacity(names.len());
+            for name in &names {
+                results.push(
+                    crate::cluster_shard::pin_delete_by_query_on_primaries(
+                        state.clone(),
+                        name.clone(),
+                        parts.clone(),
+                    )
+                    .await,
+                );
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "deleted"));
+            drop(handle);
+        }));
+        return Json(json!({ "task": task_key })).into_response();
+    }
+    let mut results = Vec::with_capacity(index_names.len());
+    for name in &index_names {
+        results.push(
+            crate::cluster_shard::pin_delete_by_query_on_primaries(
+                state.clone(),
+                name.clone(),
+                parts.clone(),
+            )
+            .await,
+        );
+    }
+    drop(handle);
+    by_query_response(aggregate_by_query_results(results, "deleted"))
+}
+
 pub async fn delete_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -27760,7 +32011,7 @@ pub async fn delete_by_query(
 ) -> impl IntoResponse {
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) =
+    let (indices, index_names, effective_query) =
         match resolve_by_query_targets(&state, &index, body.query.clone()).await {
             Ok(t) => t,
             Err(e) => return ApiError::new(e).into_response(),
@@ -27791,6 +32042,22 @@ pub async fn delete_by_query(
         .unwrap_or(true);
     let handle = state.tasks.register("indices:data/write/delete/byquery");
 
+    if state.engine.has_cluster() {
+        let parts = crate::cluster_shard::DeleteByQueryParts {
+            query: effective_query,
+            max_docs: body.max_docs,
+            scroll_size,
+        };
+        return begin_cluster_delete_by_query(
+            state,
+            index_names,
+            parts,
+            wait_for_completion,
+            handle,
+        )
+        .await;
+    }
+
     if !wait_for_completion {
         let task_key = handle.key().to_string();
         let spawned_key = task_key.clone();
@@ -27804,9 +32071,11 @@ pub async fn delete_by_query(
         // `Engine::get_index` has to follow instead.
         tokio::spawn(async move {
             let mut results = Vec::with_capacity(indices.len());
-            for idx in &indices {
-                results
-                    .push(run_delete_by_query(idx, &task_query, task_max_docs, scroll_size).await);
+            for idx in indices {
+                results.push(
+                    pin_local_delete_by_query(idx, task_query.clone(), task_max_docs, scroll_size)
+                        .await,
+                );
             }
             tasks.complete(&spawned_key, aggregate_by_query_results(results, "deleted"));
             drop(handle);
@@ -27815,8 +32084,11 @@ pub async fn delete_by_query(
     }
 
     let mut results = Vec::with_capacity(indices.len());
-    for idx in &indices {
-        results.push(run_delete_by_query(idx, &effective_query, body.max_docs, scroll_size).await);
+    for idx in indices {
+        results.push(
+            pin_local_delete_by_query(idx, effective_query.clone(), body.max_docs, scroll_size)
+                .await,
+        );
     }
     drop(handle);
     by_query_response(aggregate_by_query_results(results, "deleted"))
@@ -27922,11 +32194,70 @@ async fn by_query_matches_anything(
     Ok(results.total.value > 0)
 }
 
+fn record_deleted(deleted_ids: &Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>, id: &str) {
+    let Some(ids) = deleted_ids else {
+        return;
+    };
+    ids.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(id.to_string());
+}
+
 async fn run_delete_by_query(
     idx: &std::sync::Arc<xerj_engine::Index>,
     query: &Value,
     max_docs: Option<u64>,
     scroll_size: usize,
+) -> Value {
+    run_delete_by_query_recorded(idx, query, max_docs, scroll_size, None).await
+}
+
+/// Box the single-node runner so `delete_by_query`'s future stays a pointer.
+///
+/// The cluster branch and this branch share one state machine. Leaving the
+/// runner inline makes that machine as large as the runner, and allocating
+/// it on a 2 MiB debug worker overflows before the cluster branch can
+/// forward. `inline(never)` builds the runner in this frame, then the box
+/// is what the handler stores. `[cluster] enabled = false` still runs this
+/// runner and no other.
+#[inline(never)]
+fn pin_local_delete_by_query(
+    idx: std::sync::Arc<xerj_engine::Index>,
+    query: Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move { run_delete_by_query(&idx, &query, max_docs, scroll_size).await })
+}
+
+/// Own the runner's arguments, then box it.
+///
+/// A primary's `_delete_by_query` is reached from the fan-out. Inlining the
+/// runner into that future puts the search state machine on the caller's
+/// stack and overflows a debug worker. The box is the same split
+/// [`run_update_by_query_recorded_boxed`] uses.
+#[inline(never)]
+pub(crate) fn run_delete_by_query_recorded_boxed(
+    idx: std::sync::Arc<xerj_engine::Index>,
+    query: Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    deleted_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move {
+        run_delete_by_query_recorded(&idx, &query, max_docs, scroll_size, deleted_ids).await
+    })
+}
+
+/// Same run as `run_delete_by_query`. When `deleted_ids` is set, every id
+/// this run removed is appended, including ids removed before a later page
+/// refuses the rest. The cluster primary copies that list onto its replicas.
+pub(crate) async fn run_delete_by_query_recorded(
+    idx: &std::sync::Arc<xerj_engine::Index>,
+    query: &Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    deleted_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> Value {
     let started = Instant::now();
 
@@ -28004,7 +32335,10 @@ async fn run_delete_by_query(
             for id in chunk {
                 processed += 1;
                 match idx.delete_document(id).await {
-                    Ok(_) => deleted += 1,
+                    Ok(_) => {
+                        deleted += 1;
+                        record_deleted(&deleted_ids, id);
+                    }
                     Err(e) => {
                         failures.push(json!({
                             "id": id,
@@ -28109,7 +32443,10 @@ async fn run_delete_by_query(
         for hit in results.hits {
             processed += 1;
             match idx.delete_document(&hit.id).await {
-                Ok(_) => deleted += 1,
+                Ok(_) => {
+                    deleted += 1;
+                    record_deleted(&deleted_ids, &hit.id);
+                }
                 Err(e) => {
                     failures.push(json!({
                         "id": hit.id,
@@ -28171,6 +32508,137 @@ pub struct UpdateByQueryBody {
     pub scroll_size: Option<u64>,
 }
 
+/// Why `pipeline` cannot run on this engine, in the same words the
+/// `_update_by_query?pipeline=` handler has always used.
+pub(crate) fn unrunnable_pipeline_reason(
+    engine: &xerj_engine::Engine,
+    pipeline: &str,
+) -> Option<String> {
+    if !engine.pipelines.contains_key(pipeline) {
+        Some(format!("pipeline with id [{pipeline}] does not exist"))
+    } else {
+        engine.unrunnable_pipelines.get(pipeline).map(|reason| {
+            format!(
+                "pipeline with id [{pipeline}] cannot be run: {}",
+                reason.value()
+            )
+        })
+    }
+}
+
+pub(crate) fn pipeline_rejected_body(reason: &str) -> Value {
+    json!({
+        "error": {
+            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
+            "type": "illegal_argument_exception",
+            "reason": reason,
+        },
+        "status": 400,
+    })
+}
+
+/// Build the cluster fan-out off this handler's state machine.
+///
+/// `update_by_query` is already large enough that a debug build's worker
+/// stack (2 MiB, the `#[tokio::test]` default) overflows once a second copy
+/// of the runner is inlined into the same future. `[cluster] enabled = false`
+/// never polls the fan-out, so the future is allocated here and only the
+/// pointer is stored on the handler. The server runtime is 4 MiB; this keeps
+/// the single-node path the size it was before the fan-out existed.
+fn begin_cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(cluster_update_by_query(
+        state,
+        index_names,
+        parts,
+        wait_for_completion,
+        handle,
+    ))
+}
+
+async fn cluster_update_by_query(
+    state: AppState,
+    index_names: Vec<String>,
+    parts: crate::cluster_shard::UpdateByQueryParts,
+    wait_for_completion: bool,
+    handle: crate::state::TaskHandle,
+) -> Response {
+    if !wait_for_completion {
+        let task_key = handle.key().to_string();
+        let spawned_key = task_key.clone();
+        let tasks = state.tasks.clone();
+        let names = index_names.clone();
+        // The fan-out calls `Engine::get_index` on the detached task, so
+        // the request's visibility rule has to come with it. See
+        // `xerj_engine::index_guard`.
+        let rule = xerj_engine::index_guard::current();
+        tokio::spawn(xerj_engine::index_guard::scoped_opt(rule, async move {
+            let mut results = Vec::with_capacity(names.len());
+            for name in &names {
+                results.push(
+                    crate::cluster_shard::pin_update_by_query_on_primaries(
+                        state.clone(),
+                        name.clone(),
+                        parts.clone(),
+                    )
+                    .await,
+                );
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "updated"));
+            drop(handle);
+        }));
+        return Json(json!({ "task": task_key })).into_response();
+    }
+    let mut results = Vec::with_capacity(index_names.len());
+    for name in &index_names {
+        results.push(
+            crate::cluster_shard::pin_update_by_query_on_primaries(
+                state.clone(),
+                name.clone(),
+                parts.clone(),
+            )
+            .await,
+        );
+    }
+    drop(handle);
+    by_query_response(aggregate_by_query_results(results, "updated"))
+}
+
+/// Own the runner's arguments, then box it.
+///
+/// A primary's `_update_by_query` runs on the coordinator's task when this
+/// node is that primary. Inlining the runner into the fan-out future puts
+/// two copies of it on the stack under `search_inner` and overflows a debug
+/// worker. The box is the same split `MemoryShardRpc` uses for a remote
+/// primary: the heavy future is not built on the caller's state machine.
+pub(crate) fn run_update_by_query_recorded_boxed(
+    idx: std::sync::Arc<xerj_engine::Index>,
+    query: Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> {
+    Box::pin(async move {
+        run_update_by_query_recorded(
+            &idx,
+            &query,
+            max_docs,
+            scroll_size,
+            script,
+            pipeline,
+            updated_ids,
+        )
+        .await
+    })
+}
+
 pub async fn update_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -28180,11 +32648,11 @@ pub async fn update_by_query(
     let query_val = body.query.clone().unwrap_or(json!({ "match_all": {} }));
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
-    let (indices, effective_query) = match resolve_by_query_targets(&state, &index, query_val).await
-    {
-        Ok(t) => t,
-        Err(e) => return ApiError::new(e).into_response(),
-    };
+    let (indices, index_names, effective_query) =
+        match resolve_by_query_targets(&state, &index, query_val).await {
+            Ok(t) => t,
+            Err(e) => return ApiError::new(e).into_response(),
+        };
 
     // Validate the (alias-filter-ANDed) query once, up front, so a malformed
     // body is an immediate 400 before a task is registered or any member is
@@ -28215,34 +32683,27 @@ pub async fn update_by_query(
     // rewritten every document EXACTLY as it was. Resolved and validated
     // before any document is touched: an unknown or unrunnable name fails the
     // whole request rather than half of it.
-    let pipeline = match params.get("pipeline").map(String::as_str) {
+    //
+    // With a cluster handle the pipeline runs on each primary, which is where
+    // the current source is. The check is that primary's, before it writes.
+    // Single-node mode still refuses here, on the node that accepted the call.
+    let pipeline_name = match params.get("pipeline").map(String::as_str) {
         None | Some("_none") => None,
-        Some(p) => {
-            let reason = if !state.engine.pipelines.contains_key(p) {
-                Some(format!("pipeline with id [{p}] does not exist"))
-            } else {
-                state
-                    .engine
-                    .unrunnable_pipelines
-                    .get(p)
-                    .map(|r| format!("pipeline with id [{p}] cannot be run: {}", r.value()))
-            };
-            if let Some(reason) = reason {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "root_cause": [{ "type": "illegal_argument_exception", "reason": reason }],
-                            "type": "illegal_argument_exception",
-                            "reason": reason,
-                        },
-                        "status": 400,
-                    })),
-                )
-                    .into_response();
-            }
-            Some((state.engine.clone(), p.to_string()))
+        Some(p) => Some(p.to_string()),
+    };
+    let pipeline = if state.engine.has_cluster() {
+        None
+    } else if let Some(p) = pipeline_name.as_deref() {
+        if let Some(reason) = unrunnable_pipeline_reason(&state.engine, p) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(pipeline_rejected_body(&reason)),
+            )
+                .into_response();
         }
+        Some((state.engine.clone(), p.to_string()))
+    } else {
+        None
     };
 
     // ES defaults `wait_for_completion` to true (synchronous); only an
@@ -28252,6 +32713,24 @@ pub async fn update_by_query(
         .map(|v| v != "false")
         .unwrap_or(true);
     let handle = state.tasks.register("indices:data/write/update/byquery");
+
+    if state.engine.has_cluster() {
+        let parts = crate::cluster_shard::UpdateByQueryParts {
+            query: effective_query,
+            script,
+            pipeline: pipeline_name,
+            max_docs: body.max_docs,
+            scroll_size,
+        };
+        return begin_cluster_update_by_query(
+            state,
+            index_names,
+            parts,
+            wait_for_completion,
+            handle,
+        )
+        .await;
+    }
 
     if !wait_for_completion {
         let task_key = handle.key().to_string();
@@ -28381,6 +32860,15 @@ fn apply_pipeline_or_fail(
 /// no-script write is blind — XERJ cannot produce a version conflict);
 /// `noops` stays 0 (the mini-painless tolerates `ctx.*` statements without
 /// skipping the write).
+fn record_updated(updated_ids: &Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>, id: &str) {
+    let Some(ids) = updated_ids else {
+        return;
+    };
+    ids.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(id.to_string());
+}
+
 async fn run_update_by_query(
     idx: &std::sync::Arc<xerj_engine::Index>,
     query: &Value,
@@ -28388,6 +32876,18 @@ async fn run_update_by_query(
     scroll_size: usize,
     script: Option<(String, Value)>,
     pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+) -> Value {
+    run_update_by_query_recorded(idx, query, max_docs, scroll_size, script, pipeline, None).await
+}
+
+pub(crate) async fn run_update_by_query_recorded(
+    idx: &std::sync::Arc<xerj_engine::Index>,
+    query: &Value,
+    max_docs: Option<u64>,
+    scroll_size: usize,
+    script: Option<(String, Value)>,
+    pipeline: Option<(std::sync::Arc<xerj_engine::Engine>, String)>,
+    updated_ids: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 ) -> Value {
     let started = Instant::now();
 
@@ -28498,7 +32998,10 @@ async fn run_update_by_query(
                                 processed += 1;
                                 if let Some(f) = transform_one(idx, id, &script, &pipeline).await {
                                     match f {
-                                        Ok(()) => updated += 1,
+                                        Ok(()) => {
+                                            updated += 1;
+                                            record_updated(&updated_ids, id);
+                                        }
                                         Err(reason) => failures.push(json!({
                                             "id": id,
                                             "cause": { "reason": reason },
@@ -28630,6 +33133,7 @@ async fn run_update_by_query(
                                     Ok(()) => {
                                         updated += 1;
                                         mutated_in_batch += 1;
+                                        record_updated(&updated_ids, &hit.id);
                                     }
                                     Err(reason) => failures.push(json!({
                                         "id": hit.id,
@@ -28664,6 +33168,7 @@ async fn run_update_by_query(
                                 Ok(_) => {
                                     updated += 1;
                                     mutated_in_batch += 1;
+                                    record_updated(&updated_ids, &hit.id);
                                 }
                                 Err(e) => {
                                     failures.push(json!({
@@ -28820,13 +33325,10 @@ mod scripted_update_publication_tests {
                     State(state),
                     Path(("script-counter".to_string(), "counter".to_string())),
                     Query(UpdateDocParams::default()),
-                    Json(EsUpdateBody {
-                        doc: None,
-                        doc_as_upsert: false,
-                        upsert: None,
-                        script: Some(json!("ctx._source.n += 1")),
-                        detect_noop: None,
-                    }),
+                    bytes::Bytes::from(
+                        serde_json::to_vec(&json!({"script": "ctx._source.n += 1"}))
+                            .expect("script update body"),
+                    ),
                 )
                 .await
                 .into_response()
@@ -29044,17 +33546,44 @@ pub async fn cat_aliases(
         }
     }
 
+    // `_cat/aliases` used to print a literal `-` for every metadata column, so
+    // a filtered alias created by `POST /_aliases` (or PUT …/_alias/…) looked
+    // unfiltered here even after the read paths honoured the filter. `*` is
+    // ES's text/JSON rendering for "this alias has a filter".
+    let cat_cell = |meta: &Value, key: &str| -> String {
+        match meta.get(key) {
+            None | Some(Value::Null) => "-".to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        }
+    };
+    let render = |alias: &str, index: &str| -> (String, String, String, String) {
+        let meta = alias_meta_for(&state, index, alias);
+        let filter = if meta.get("filter").is_some() {
+            "*".to_string()
+        } else {
+            "-".to_string()
+        };
+        (
+            filter,
+            cat_cell(&meta, "index_routing"),
+            cat_cell(&meta, "search_routing"),
+            cat_cell(&meta, "is_write_index"),
+        )
+    };
+
     if params.format.as_deref() == Some("json") {
         let arr: Vec<Value> = rows
             .iter()
             .map(|(alias, index)| {
+                let (filter, ri, rs, iw) = render(alias, index);
                 json!({
                     "alias": alias,
                     "index": index,
-                    "filter": "-",
-                    "routing.index": "-",
-                    "routing.search": "-",
-                    "is_write_index": "-",
+                    "filter": filter,
+                    "routing.index": ri,
+                    "routing.search": rs,
+                    "is_write_index": iw,
                 })
             })
             .collect();
@@ -29063,7 +33592,10 @@ pub async fn cat_aliases(
 
     let lines: Vec<String> = rows
         .iter()
-        .map(|(alias, index)| format!("{alias} {index} - - - -"))
+        .map(|(alias, index)| {
+            let (filter, ri, rs, iw) = render(alias, index);
+            format!("{alias} {index} {filter} {ri} {rs} {iw}")
+        })
         .collect();
     let body = if lines.is_empty() {
         String::new()
@@ -29191,13 +33723,20 @@ pub async fn cat_shards(
     let indices = state.engine.list_indices().await;
     let mut rows: Vec<(String, u64, u64)> = Vec::new();
     for info in &indices {
+        let idx = state.engine.get_index(&info.name).ok();
         // Real on-disk size: recursive byte sum of the index's data_dir.
-        let store_bytes = state
-            .engine
-            .get_index(&info.name)
+        let store_bytes = idx
+            .as_ref()
             .map(|idx| dir_size_bytes(idx.data_dir()))
             .unwrap_or(0);
-        rows.push((info.name.clone(), info.doc_count, store_bytes));
+        // #2140: the shard docs column has to add up to `_cat/indices`
+        // docs.count, which is a bare count (#1624), so omit file-card anchors
+        // here too rather than making the two cat endpoints disagree.
+        let docs = match idx.as_ref() {
+            Some(idx) => content_doc_count(idx).await,
+            None => info.doc_count,
+        };
+        rows.push((info.name.clone(), docs, store_bytes));
     }
     // `_cat/shards` is the call an operator makes straight after seeing a red
     // cluster, so an index whose primary could not be opened has to be in it.
@@ -29379,46 +33918,54 @@ pub async fn put_settings(
         return ApiError::new(e).into_response();
     }
 
-    for idx in &targets {
-        let mut existing = state
-            .engine
-            .index_settings
-            .get(idx)
-            .map(|v| v.clone())
-            .unwrap_or(json!({ "index": {} }));
-        let inner_slot = existing
-            .as_object_mut()
-            .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
-        match (inner_slot, inner.as_object()) {
-            (Some(existing_inner), Some(new_inner)) => {
-                for (k, v) in new_inner {
-                    existing_inner.insert(k.clone(), v.clone());
+    if state.engine.has_cluster() {
+        for idx in &targets {
+            if let Err(e) = state.engine.replicate_index_settings(idx, &body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+        }
+    } else {
+        for idx in &targets {
+            let mut existing = state
+                .engine
+                .index_settings
+                .get(idx)
+                .map(|v| v.clone())
+                .unwrap_or(json!({ "index": {} }));
+            let inner_slot = existing
+                .as_object_mut()
+                .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
+            match (inner_slot, inner.as_object()) {
+                (Some(existing_inner), Some(new_inner)) => {
+                    for (k, v) in new_inner {
+                        existing_inner.insert(k.clone(), v.clone());
+                    }
+                }
+                _ => {
+                    // Either no existing index block or body wasn't an object —
+                    // replace wholesale.
+                    existing = json!({ "index": inner });
+                    state.engine.index_settings.insert(idx.clone(), existing);
+                    continue;
                 }
             }
-            _ => {
-                // Either no existing index block or body wasn't an object —
-                // replace wholesale.
-                existing = json!({ "index": inner });
-                state.engine.index_settings.insert(idx.clone(), existing);
-                continue;
-            }
+            state.engine.index_settings.insert(idx.clone(), existing);
         }
-        state.engine.index_settings.insert(idx.clone(), existing);
-    }
 
-    // `index.blocks.*` is not a display-only setting: it gates writes and reads
-    // in the engine, whose `Index::settings` is a different store from the
-    // `engine.index_settings` map updated above. Forward the block keys so a
-    // settings PUT can both set *and clear* a block — previously it updated only
-    // the display copy, leaving every block permanent once set.
-    for name in &targets {
-        let Ok(idx) = state.engine.get_index(name) else {
-            continue;
-        };
-        if let Err(e) = idx.apply_block_settings(&body).await {
-            return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+        // `index.blocks.*` is not a display-only setting: it gates writes and reads
+        // in the engine, whose `Index::settings` is a different store from the
+        // `engine.index_settings` map updated above. Forward the block keys so a
+        // settings PUT can both set *and clear* a block — previously it updated only
+        // the display copy, leaving every block permanent once set.
+        for name in &targets {
+            let Ok(idx) = state.engine.get_index(name) else {
+                continue;
+            };
+            if let Err(e) = idx.apply_block_settings(&body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+            sync_display_blocks(&state, name).await;
         }
-        sync_display_blocks(&state, name).await;
     }
 
     // `PUT {index}/_settings` is the other real ILM entry point — for
@@ -31212,8 +35759,9 @@ pub async fn close_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
 ) -> impl IntoResponse {
-    // ES 8's `action.destructive_requires_name` defaults to true: closing
-    // by wildcard/_all is refused outright — only concrete names may close.
+    // Closing stays stricter than `action.destructive_requires_name`: a
+    // wildcard or `_all` is refused even when that setting is false. Only
+    // concrete names may close.
     if index == "_all" || index.contains('*') {
         return (
             StatusCode::BAD_REQUEST,
@@ -32480,14 +37028,20 @@ pub async fn cat_allocation(
     let (disk_total, disk_avail) = read_disk_stats(&state.config.server.data_dir)
         .unwrap_or((10 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024));
     let disk_used_bytes = disk_total.saturating_sub(disk_avail);
-    let disk_percent = ((disk_total - disk_avail) * 100)
-        .checked_div(disk_total)
-        .unwrap_or(0);
+    // Same integer percent the governor admits on (`used * 100 / total` in
+    // u128). The previous u64 multiply overflows on a volume larger than
+    // `u64::MAX / 100`, which would report a low percent while the write
+    // block used the real one. Realistic disks are unchanged.
+    let disk_percent = if disk_total == 0 {
+        0
+    } else {
+        ((disk_used_bytes as u128 * 100) / disk_total as u128) as u64
+    };
 
     let shards = health.index_count;
 
     if params.format.as_deref() == Some("json") {
-        return Json(vec![json!({
+        let mut row = json!({
             "shards": shards.to_string(),
             "disk.indices": format!("{indices_bytes}b"),
             "disk.used": format!("{disk_used_bytes}b"),
@@ -32497,8 +37051,21 @@ pub async fn cat_allocation(
             "host": "127.0.0.1",
             "ip": "127.0.0.1",
             "node": "xerj-node-1",
-        })])
-        .into_response();
+            // #2284: memory writes name this directory when the flood-stage
+            // block fires. Not a cat column — the text table below is unchanged.
+            "path.data": state.config.server.data_dir,
+        });
+        // #2077: effective flood-stage gate, so autoindex can refuse before
+        // it walks. Not cat columns — the text table below is unchanged.
+        // Omitted when no governor is installed; the client then does not
+        // guess a threshold.
+        if let Some(governor) = xerj_engine::governor::global() {
+            let gate = governor.disk_flood_admission();
+            row["disk.flood_stage"] = json!(gate.flood_pct.to_string());
+            row["disk.threshold_enabled"] = json!(gate.threshold_enabled.to_string());
+            row["disk.flood_blocked"] = json!(gate.blocked.to_string());
+        }
+        return Json(vec![row]).into_response();
     }
 
     let body = format!(
@@ -32515,41 +37082,11 @@ pub async fn cat_allocation(
         .into_response()
 }
 
-/// Real `(total_bytes, avail_bytes)` for the filesystem backing `path`, via
-/// `statvfs(2)`. Returns `None` if the syscall fails (caller falls back).
-///
-/// The `as u64` casts are PORTABILITY, not noise: `statvfs` field widths
-/// differ per libc target — `f_blocks`/`f_bavail` are u64 on Linux but u32
-/// on macOS, and `f_frsize`/`f_bsize` are c_ulong. Clippy on Linux flags
-/// them as same-type casts; removing them breaks the Apple release builds.
-#[cfg(unix)]
-#[allow(clippy::unnecessary_cast)]
+/// Real `(total_bytes, avail_bytes)` for the filesystem backing `path`,
+/// delegated to `xerj_engine::governor::disk_stats` (`statvfs` on Unix,
+/// `GetDiskFreeSpaceExW` on Windows). Returns `None` if the probe fails.
 fn read_disk_stats(path: &str) -> Option<(u64, u64)> {
-    let c = std::ffi::CString::new(path).ok()?;
-    // SAFETY: `statvfs` fully initialises the struct it writes to; we only
-    // read scalar fields afterwards and never alias the buffer.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    let bsize = if st.f_frsize > 0 {
-        st.f_frsize as u64
-    } else {
-        st.f_bsize as u64
-    };
-    let total = (st.f_blocks as u64).saturating_mul(bsize);
-    let avail = (st.f_bavail as u64).saturating_mul(bsize);
-    if total == 0 {
-        return None;
-    }
-    Some((total, avail))
-}
-
-/// Non-unix: no statvfs. Return `None`; the caller already falls back to
-/// a conservative default estimate.
-#[cfg(not(unix))]
-fn read_disk_stats(_path: &str) -> Option<(u64, u64)> {
-    None
+    xerj_engine::governor::disk_stats(path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33140,13 +37677,15 @@ pub async fn restore_snapshot(
 // GET  /_cluster/pending_tasks
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_cluster_settings(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let settings = state.engine.cluster_settings.read().await;
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(settings.get("persistent"), flat),
+        "transient": render_settings(settings.get("transient"), flat),
         "defaults": {},
     }))
     .into_response()
@@ -33154,23 +37693,79 @@ pub async fn get_cluster_settings(State(state): State<AppState>) -> impl IntoRes
 
 pub async fn put_cluster_settings(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut settings = state.engine.cluster_settings.write().await;
-    if let Some(persistent) = body.get("persistent") {
-        settings["persistent"] = persistent.clone();
+    // ES merges an update into the stored settings, keyed by the flat dotted
+    // name whichever form the request used, and `null` removes a setting.
+    // The response lists only the settings this request set.
+    let mut updated = json!({ "persistent": {}, "transient": {} });
+    for scope in ["persistent", "transient"] {
+        let Some(update) = body.get(scope) else {
+            continue;
+        };
+        let mut flat = serde_json::Map::new();
+        flatten_settings("", update, &mut flat);
+        if !settings[scope].is_object() {
+            settings[scope] = json!({});
+        }
+        if let Some(stored) = settings[scope].as_object_mut() {
+            for (key, value) in flat {
+                if value.is_null() {
+                    stored.remove(&key);
+                } else {
+                    updated[scope][key.as_str()] = value.clone();
+                    stored.insert(key, value);
+                }
+            }
+        }
     }
-    if let Some(transient) = body.get("transient") {
-        settings["transient"] = transient.clone();
-    }
-    let persistent = settings.get("persistent").cloned().unwrap_or(json!({}));
-    let transient = settings.get("transient").cloned().unwrap_or(json!({}));
+    let flat = flat_settings_param(&params);
     Json(json!({
         "acknowledged": true,
-        "persistent": persistent,
-        "transient": transient,
+        "persistent": render_settings(updated.get("persistent"), flat),
+        "transient": render_settings(updated.get("transient"), flat),
     }))
     .into_response()
+}
+
+/// `?flat_settings` / `?flat_settings=true`; ES defaults to the nested form.
+fn flat_settings_param(params: &std::collections::HashMap<String, String>) -> bool {
+    matches!(
+        params.get("flat_settings").map(String::as_str),
+        Some("" | "true")
+    )
+}
+
+/// Settings are stored under flat dotted keys; render them nested unless the
+/// caller asked for `flat_settings`.
+fn render_settings(stored: Option<&Value>, flat: bool) -> Value {
+    let stored = stored.cloned().unwrap_or(json!({}));
+    if flat {
+        stored
+    } else {
+        expand_dotted_keys(stored)
+    }
+}
+
+/// Flattens `{"a": {"b": 1}}` into `{"a.b": 1}`.
+fn flatten_settings(prefix: &str, value: &Value, out: &mut serde_json::Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let key = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_settings(&key, child, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), value.clone());
+        }
+    }
 }
 
 pub async fn cluster_reroute(
@@ -33770,7 +38365,7 @@ pub async fn nodes_info(
     // Same resolution `es_info` (GET /) uses.
     let compat_version = resolve_compat_version(&state, &headers);
     let reported_version = compat_version.number.clone();
-    let (_idx_count, total_docs, store_bytes) = real_index_totals(&state).await;
+    let (_idx_count, total_docs, total_deleted, store_bytes) = real_index_totals(&state).await;
     let rss_bytes = read_rss_bytes().unwrap_or(0);
     // Real host memory total from /proc/meminfo (falls back to an RSS-derived
     // estimate if unreadable).
@@ -33880,7 +38475,7 @@ pub async fn nodes_info(
                 "plugins": [],
                 "modules": [],
                 "indices": {
-                    "docs": { "count": total_docs, "deleted": 0 },
+                    "docs": { "count": total_docs, "deleted": total_deleted },
                     "store": { "size_in_bytes": store_bytes },
                 },
         }),
@@ -34976,7 +39571,11 @@ fn spawn_watch_evaluator(
                 if !alive {
                     break;
                 }
-                cursor = evaluate_watch_pass(&state, &id, &watch, cursor).await;
+                // The pass owns a search state machine. Polling it inline on
+                // this task shares the caller's stack with the `#[tokio::test]`
+                // runtime (2 MiB). The box keeps that machine off the stack;
+                // the cursor and the retry rules are unchanged.
+                cursor = Box::pin(evaluate_watch_pass(&state, &id, &watch, cursor)).await;
             }
         },
     ));
@@ -35827,7 +40426,28 @@ pub async fn search_template(
         search_body_val
             .get("aggs")
             .or_else(|| search_body_val.get("aggregations")),
-    ) {
+    )
+    .or_else(|| {
+        find_invalid_composite_agg(
+            search_body_val
+                .get("aggs")
+                .or_else(|| search_body_val.get("aggregations")),
+        )
+        .or_else(|| {
+            find_invalid_agg_params(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+            .or_else(|| {
+                find_invalid_pipeline_agg(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+            })
+        })
+    }) {
         return ApiError::new(xerj_common::XerjError::invalid_query(msg)).into_response();
     }
 
@@ -35869,7 +40489,12 @@ pub async fn search_template(
     // question this sweep didn't ask.
     let mut merged_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total: u64 = 0;
+    // #2305: this minimal merge still fans a semantic query across every
+    // match of a wildcard. An expanded index without the field is skipped.
+    let mut semantic_skips = ExpandedSemanticSkips::default();
+    let search_node = state.engine.node_id.clone();
     for (name, idx) in &handles {
+        semantic_skips.note_attempt();
         match idx.search(&search_req).await {
             Ok(result) => {
                 if let Some(reason) = &result.script_failure {
@@ -35878,8 +40503,17 @@ pub async fn search_template(
                 total += result.total.value;
                 merged_hits.extend(result.hits.into_iter().map(|h| (name.clone(), h)));
             }
-            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+            Err(e) => {
+                let err = xerj_common::XerjError::from(e);
+                match semantic_skips.take_skippable(&index, name, search_node.as_str(), err) {
+                    Ok(()) => continue,
+                    Err(err) => return ApiError::new(err).into_response(),
+                }
+            }
         }
+    }
+    if let Some(err) = semantic_skips.failure_if_every_index_skipped() {
+        return ApiError::new(err).into_response();
     }
     merged_hits.sort_by(|(_, a), (_, b)| {
         b.score
@@ -35909,7 +40543,7 @@ pub async fn search_template(
             })
         })
         .collect();
-    Json(json!({
+    let mut resp = json!({
         "took": took_ms,
         "timed_out": false,
         "_shards": crate::responses::EsShards::search_success(),
@@ -35918,8 +40552,18 @@ pub async fn search_template(
             "max_score": max_score,
             "hits": hits,
         },
-    }))
-    .into_response()
+    });
+    if semantic_skips.skipped > 0 {
+        let shard_total = handles.len().max(1) as u32;
+        resp["_shards"] = json!({
+            "total": shard_total,
+            "successful": shard_total.saturating_sub(semantic_skips.skipped),
+            "skipped": 0,
+            "failed": semantic_skips.skipped,
+            "failures": semantic_skips.failures,
+        });
+    }
+    Json(resp).into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36088,7 +40732,28 @@ async fn msearch_template_impl(
             search_body_val
                 .get("aggs")
                 .or_else(|| search_body_val.get("aggregations")),
-        ) {
+        )
+        .or_else(|| {
+            find_invalid_composite_agg(
+                search_body_val
+                    .get("aggs")
+                    .or_else(|| search_body_val.get("aggregations")),
+            )
+            .or_else(|| {
+                find_invalid_agg_params(
+                    search_body_val
+                        .get("aggs")
+                        .or_else(|| search_body_val.get("aggregations")),
+                )
+                .or_else(|| {
+                    find_invalid_pipeline_agg(
+                        search_body_val
+                            .get("aggs")
+                            .or_else(|| search_body_val.get("aggregations")),
+                    )
+                })
+            })
+        }) {
             responses.push(json!({
                 "error": { "type": "illegal_argument_exception", "reason": msg },
                 "status": 400
@@ -36119,6 +40784,9 @@ async fn msearch_template_impl(
         let mut total_count: u64 = 0;
         let mut script_failure: Option<String> = None;
         let mut search_error: Option<xerj_common::XerjError> = None;
+        // #2305: `*` / `_all` and alias expansion on this route.
+        let mut semantic_skips = ExpandedSemanticSkips::default();
+        let search_node = state.engine.node_id.clone();
 
         // Both arms below used to be `if let Ok(..)` with no else, so a
         // missing index or a query the engine refused produced
@@ -36137,6 +40805,7 @@ async fn msearch_template_impl(
                     break;
                 }
             };
+            semantic_skips.note_attempt();
             match idx.search(&search_req).await {
                 Ok(result) => {
                     if let Some(reason) = result.script_failure {
@@ -36159,8 +40828,19 @@ async fn msearch_template_impl(
                     }
                 }
                 Err(e) => {
-                    search_error = Some(xerj_common::XerjError::from(e));
-                    break;
+                    let err = xerj_common::XerjError::from(e);
+                    match semantic_skips.take_skippable(
+                        &index_name,
+                        idx_name,
+                        search_node.as_str(),
+                        err,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            search_error = Some(err);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -36171,6 +40851,9 @@ async fn msearch_template_impl(
             responses.push(script_limit_error_value(&reason));
             continue;
         }
+        if search_error.is_none() {
+            search_error = semantic_skips.failure_if_every_index_skipped();
+        }
 
         if let Some(err) = search_error {
             responses.push(ApiError::new(err).into_value());
@@ -36178,7 +40861,7 @@ async fn msearch_template_impl(
         }
 
         let took_ms = started.elapsed().as_millis() as u64;
-        responses.push(json!({
+        let mut item = json!({
             "took": took_ms,
             "timed_out": false,
             "_shards": crate::responses::EsShards::search_success(),
@@ -36186,7 +40869,18 @@ async fn msearch_template_impl(
                 "total": { "value": total_count, "relation": "eq" },
                 "hits": merged_hits,
             },
-        }));
+        });
+        if semantic_skips.skipped > 0 {
+            let total = index_names.len().max(1) as u32;
+            item["_shards"] = json!({
+                "total": total,
+                "successful": total.saturating_sub(semantic_skips.skipped),
+                "skipped": 0,
+                "failed": semantic_skips.skipped,
+                "failures": semantic_skips.failures,
+            });
+        }
+        responses.push(item);
     }
 
     Json(json!({
@@ -39406,6 +44100,9 @@ pub(crate) fn build_docvalue_fields(
             let base = field_name.strip_suffix(".keyword")?;
             get_source_value_by_path(source, base)
         });
+        // Same packed-embedding expansion as `fields` (#1940). Doc values
+        // skip the string, so this path is the one that still sees it.
+        let raw = raw.map(expand_packed_embedding_value);
         let arr: Vec<Value> = match raw {
             Some(Value::Array(a)) => a,
             Some(Value::Null) | None => vec![],
@@ -39563,6 +44260,14 @@ pub(crate) fn get_field_value_via_walk(source: &Value, segs: &[&str]) -> Option<
         }
     }
     walk(source, segs)
+}
+
+/// Expand a packed embedding (`xerj:f32:` hex) into the number array
+/// `fields` and `docvalue_fields` have always returned. Leaves every other
+/// value unchanged, including a vector that is already a number array.
+fn expand_packed_embedding_value(mut value: Value) -> Value {
+    xerj_common::packed_f32::expand_packed_f32_values(&mut value);
+    value
 }
 
 pub(crate) fn get_source_value_by_path(source: &Value, path: &str) -> Option<Value> {
@@ -43694,6 +48399,18 @@ pub async fn put_legacy_template(
     Path(name): Path<String>,
     Json(mut body): Json<Value>,
 ) -> impl IntoResponse {
+    let has_patterns = match body.get("index_patterns") {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        _ => false,
+    };
+    if !has_patterns {
+        return es_bad_request(
+            "action_request_validation_exception",
+            "Validation Failed: 1: index patterns are missing;",
+            None,
+        );
+    }
     if let Some(ip) = body.get("index_patterns") {
         if ip.is_string() {
             body["index_patterns"] = json!([ip.as_str().unwrap_or_default()]);
@@ -44450,7 +49167,7 @@ fn count_dense_vector_fields(node: &Value) -> u64 {
 /// targets an index that has been closed via `POST /:index/_close`.
 /// Mirrors Elasticsearch's body shape so wire-compat clients see the
 /// exact `type`/`reason`/`index` triplet plus the duplicated root_cause.
-fn closed_index_error(index: &str) -> axum::response::Response {
+pub(crate) fn closed_index_error(index: &str) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
@@ -44471,21 +49188,24 @@ fn closed_index_error(index: &str) -> axum::response::Response {
 
 // ── Batch C helpers ──
 
-/// Real `(index_count, total_docs, store_size_in_bytes)` sampled from the
-/// live engine: doc counts come from `list_indices()`, store size is the
-/// recursive on-disk byte sum of each index's `data_dir`. Read-only; safe
-/// to call on a live engine.
-async fn real_index_totals(state: &AppState) -> (usize, u64, u64) {
+/// Real `(index_count, total_docs, total_deleted_docs, store_size_in_bytes)`
+/// sampled from the live engine: doc counts come from `list_indices()`, store
+/// size is the recursive on-disk byte sum of each index's `data_dir`, and the
+/// deleted count is the pre-merge physical-minus-live number the per-index
+/// `_stats`/`_cat` surfaces report. Read-only; safe to call on a live engine.
+async fn real_index_totals(state: &AppState) -> (usize, u64, u64, u64) {
     let indices = state.engine.list_indices().await;
     let mut total_docs = 0u64;
+    let mut total_deleted = 0u64;
     let mut store_bytes = 0u64;
     for info in &indices {
         total_docs += info.doc_count;
         if let Ok(idx) = state.engine.get_index(&info.name) {
+            total_deleted += idx.deleted_doc_count();
             store_bytes += dir_size_bytes(idx.data_dir());
         }
     }
-    (indices.len(), total_docs, store_bytes)
+    (indices.len(), total_docs, total_deleted, store_bytes)
 }
 
 /// Sum the live per-index search + indexing counters across every index,

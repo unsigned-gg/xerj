@@ -140,6 +140,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<NodeState>) {
         }
     } else if method == "POST" && path == "/_bulk" {
         bulk_http(&body, state)
+    } else if method == "POST" && path.ends_with("/_mget") {
+        (200, mget_http(&path, &body, state))
     } else if method == "POST" && path.ends_with("/_search") {
         (200, search_http(&path, &body, state))
     } else if method == "POST" && path.ends_with("/_delete_by_query") {
@@ -181,6 +183,40 @@ fn serve(mut stream: TcpStream, state: &Mutex<NodeState>) {
     );
     let _ = stream.write_all(bytes.as_bytes());
     let _ = stream.flush();
+}
+
+/// `POST /{index}/_mget`. The latest bulk of an id wins: a rewrite appends
+/// another row, and the catalog read-back has to see that one.
+fn mget_http(path: &str, body: &[u8], state: &Mutex<NodeState>) -> Value {
+    let index = path
+        .trim_start_matches('/')
+        .trim_end_matches("/_mget")
+        .to_owned();
+    let query: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let ids = query
+        .get("ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let docs = state.lock().unwrap().docs.clone();
+    let out: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let Some(id) = id.as_str() else {
+                return json!({"_index": index, "found": false});
+            };
+            if let Some((_, _, doc)) = docs
+                .iter()
+                .rev()
+                .find(|(doc_index, doc_id, _)| doc_index == &index && doc_id == id)
+            {
+                json!({"_index": index, "_id": id, "found": true, "_source": doc})
+            } else {
+                json!({"_index": index, "_id": id, "found": false})
+            }
+        })
+        .collect();
+    json!({"docs": out})
 }
 
 /// A small-but-real `_search` over the captured documents. The generated
@@ -369,12 +405,14 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, label: &Path) -> IndexCfg {
         bulk_timeout_secs: 30,
         snapshot_max_bytes: 64 << 30,
         prefix: "label-http".into(),
+        replace_prefix: false,
+        prefix_note: None,
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,
         follow_symlinks_outside_root: false,
         ignore: crate::ignore_rules::IgnoreOptions::default(),
-        max_file_gb: 1,
+        max_file_bytes: 1 << 30,
         sample: 100,
         no_semantic: true,
         code_analyzer: Default::default(),
@@ -382,7 +420,11 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, label: &Path) -> IndexCfg {
         no_graph: true,
         max_minutes: 0,
         approve: None,
+        max_index_bytes: None,
+        budget_plan: None,
+        drop_indexed: false,
         dry_run: false,
+        walk_only: false,
         json: false,
         quiet: true,
         progress: crate::progress::ProgressMode::None,
@@ -390,6 +432,8 @@ fn cfg(root: &Path, state_dir: &Path, url: &str, label: &Path) -> IndexCfg {
         watch: false,
         debounce: std::time::Duration::from_millis(0),
         label: Some(label.to_owned()),
+        exclude_rels: Vec::new(),
+        skip_corpus_data: false,
     }
 }
 

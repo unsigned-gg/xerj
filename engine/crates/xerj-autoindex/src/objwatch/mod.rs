@@ -687,16 +687,26 @@ fn fetch_batch(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<Result<FetchedObject>>>> =
         keys.iter().map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
+    let fetch = || loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= keys.len() {
+            break;
+        }
+        let r = src.get(keys[i], max_bytes);
+        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    };
+    // #1122: `Builder::spawn_scoped` returns `Ok` and the child then
+    // panics if the alternate signal stack cannot be mapped. This scope
+    // does not install that stack. The fetchers share one cursor, so a
+    // short pool only costs concurrency: stop spawning and let this
+    // thread fetch alongside whichever ones started. The failed closure
+    // is dropped unrun; `fetch` below is a separate call.
+    xerj_common::thread_spawn::scope(|scope| {
         for _ in 0..FETCH_CONCURRENCY.min(keys.len()) {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= keys.len() {
-                    break;
-                }
-                let r = src.get(keys[i], max_bytes);
-                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-            });
+            if scope.spawn("xerj-objwatch-fetch", fetch).is_err() {
+                fetch();
+                break;
+            }
         }
     });
     slots
