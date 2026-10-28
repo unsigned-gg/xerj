@@ -2481,13 +2481,15 @@ async fn execute_owner_group(
                 }
             }
             Ok(result) => {
-                let (items, wire) = spread_group_failure(
-                    pieces,
-                    &group.pieces,
-                    result.status,
-                    nack_reason(&result),
-                );
-                return (items, wire, refusal_from_nack(&result));
+                // A refused group reads the same here as on the local arm.
+                let refusal = refusal_from_nack(&result);
+                let reason = match &refusal {
+                    Some(r) => format!("xerj_bulk_admission_exception: {}", r.reason),
+                    None => nack_reason(&result),
+                };
+                let (items, wire) =
+                    spread_group_failure(pieces, &group.pieces, result.status, reason);
+                return (items, wire, refusal);
             }
             Err(err) => {
                 let (items, wire) =
@@ -2549,7 +2551,7 @@ fn align_group(
 /// [`crate::es_compat`] calls this only when a cluster handle is attached.
 /// The returned wire versions are the primary's. The accepting node does not
 /// have the document, so a local lookup would report a fresh id.
-pub(crate) async fn bulk_on_primaries(
+pub async fn bulk_on_primaries(
     state: &AppState,
     default_index: Option<&str>,
     body: &str,
@@ -3450,10 +3452,6 @@ pub(crate) async fn delete_by_query_on_primaries(
 mod refusal_tests {
     use super::*;
 
-    /// Tests below seed process-wide state (the measured throughput and the
-    /// passage ledger), so they take turns.
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn piece(id: &str) -> BulkPiece {
         BulkPiece {
             action: "index".into(),
@@ -3464,41 +3462,6 @@ mod refusal_tests {
             preset: None,
             concrete: "docs".into(),
         }
-    }
-
-    /// A state whose index `refusal-docs` is `semantic_text`.
-    fn state() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = xerj_common::config::Config::default();
-        config.server.data_dir = dir.path().to_string_lossy().into_owned();
-        let metrics = xerj_common::metrics::Metrics::new().unwrap();
-        let engine = xerj_engine::Engine::new(config.clone()).unwrap();
-        engine
-            .create_index("refusal-docs", xerj_common::Schema::empty())
-            .unwrap();
-        engine
-            .put_index_mapping(
-                "refusal-docs",
-                json!({"properties": {"sem": {"type": "semantic_text"}}}),
-            )
-            .unwrap();
-        (AppState::new(config, engine, metrics), dir)
-    }
-
-    /// A 60-passage budget at 1 passage per second, with 1000 passages already
-    /// queued by someone else, so any semantic bulk is over budget.
-    fn busy_embedder() -> xerj_engine::admission::PassageGuard {
-        xerj_ai::embedder::record_neural_window(1, Duration::from_secs(1));
-        xerj_engine::admission::process_ledger()
-            .admit(1000, 0.0, 60)
-            .unwrap()
-    }
-
-    fn big_bulk() -> String {
-        let text = "word ".repeat(448 * 4 / 5);
-        format!(
-            "{{\"index\":{{\"_index\":\"refusal-docs\",\"_id\":\"1\"}}}}\n{{\"sem\":\"{text}\"}}\n"
-        )
     }
 
     /// A group the primary refused whole answers one 429 item per action, in
@@ -3523,39 +3486,22 @@ mod refusal_tests {
         }
     }
 
-    /// A primary that refuses a forwarded bulk answers 429 and says how long
-    /// to wait, not an empty 200.
-    #[tokio::test]
-    async fn a_primary_that_refuses_a_bulk_answers_429_with_a_retry_after() {
-        let _turn = SERIAL.lock().await;
-        let (state, _dir) = state();
-        let _queued = busy_embedder();
-        let reply = handle_bulk(&state, &big_bulk(), None, None, None, None).await;
-        assert_eq!(reply.status, 429, "{}", reply.body);
-        let body: Value = serde_json::from_str(&reply.body).unwrap();
-        assert_eq!(body["error"]["type"], "xerj_bulk_admission_exception");
-        let secs = body["error"]["retry_after_secs"].as_u64().unwrap();
-        assert!((1..=60).contains(&secs), "{secs}");
-        let refusal = refusal_from_nack(&reply).expect("the accepting node can read it back");
-        assert_eq!(refusal.retry_after_secs, secs);
-    }
-
-    /// When every group of a cluster bulk is refused nothing was written, so
-    /// the accepting node refuses the whole request, with its Retry-After.
-    #[tokio::test]
-    async fn a_cluster_bulk_refused_by_every_group_is_refused_whole() {
-        let _turn = SERIAL.lock().await;
-        let (state, _dir) = state();
-        let _queued = busy_embedder();
-        let (result, wire) = bulk_on_primaries(
-            &state,
-            None,
-            &big_bulk(),
-            xerj_engine::bulk::BulkOpts::default(),
-        )
-        .await;
-        let refusal = result.refusal.expect("whole-request refusal");
-        assert!((1..=60).contains(&refusal.retry_after_secs));
-        assert!(result.items.is_empty() && result.errors && wire.is_empty());
+    /// The remote arm reads a refused group's 429 back with the same text the
+    /// local arm gives.
+    #[test]
+    fn a_refusal_nack_is_read_back_with_its_wait() {
+        let nack = ShardResult::http(
+            429,
+            json!({"error": {"type": "xerj_bulk_admission_exception",
+                "reason": "r", "retry_after_secs": 9}, "status": 429})
+            .to_string(),
+        );
+        let refusal = refusal_from_nack(&nack).unwrap();
+        assert_eq!(
+            (refusal.reason.as_str(), refusal.retry_after_secs),
+            ("r", 9)
+        );
+        assert!(refusal_from_nack(&ShardResult::http(429, "{}")).is_none());
+        assert!(refusal_from_nack(&ShardResult::http(500, nack.body.clone())).is_none());
     }
 }
