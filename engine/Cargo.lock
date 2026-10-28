@@ -7770,7 +7770,7 @@ dependencies = [
 
 [[package]]
 name = "xerj-sandbox"
-version = "1.0.0-rc.98"
+version = "1.0.0-rc.100"
 dependencies = [
  "chrono",
  "landlock",
@@ -7912,7 +7912,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "1.0.0-rc.98"
+version = "1.0.0-rc.100"
 dependencies = [
  "toml",
 ]

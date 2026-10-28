@@ -41,7 +41,9 @@ fn check_projectfile_content(text: &str) -> Result<(), String> {
     ];
     for needle in required {
         if !text.contains(needle) {
-            return Err(format!("missing required Projectfile v1 clause: `{needle}`"));
+            return Err(format!(
+                "missing required Projectfile v1 clause: `{needle}`"
+            ));
         }
     }
     Ok(())
@@ -82,7 +84,9 @@ fn check_cargo_manifest_content(text: &str, engine_dir: &Path) -> Result<(), Str
         .and_then(toml::Value::as_str)
         .ok_or_else(|| "missing `workspace.resolver`".to_string())?;
     if resolver != "2" {
-        return Err(format!("expected `workspace.resolver = \"2\"`, got `{resolver}`"));
+        return Err(format!(
+            "expected `workspace.resolver = \"2\"`, got `{resolver}`"
+        ));
     }
 
     let pkg = ws
@@ -90,17 +94,28 @@ fn check_cargo_manifest_content(text: &str, engine_dir: &Path) -> Result<(), Str
         .and_then(toml::Value::as_table)
         .ok_or_else(|| "missing `[workspace.package]` table".to_string())?;
 
-    for required_key in ["version", "edition", "rust-version", "license", "repository"] {
+    for required_key in [
+        "version",
+        "edition",
+        "rust-version",
+        "license",
+        "repository",
+    ] {
         let val = pkg
             .get(required_key)
             .and_then(toml::Value::as_str)
             .ok_or_else(|| format!("missing required `workspace.package.{required_key}`"))?;
         if val.trim().is_empty() {
-            return Err(format!("`workspace.package.{required_key}` must not be empty"));
+            return Err(format!(
+                "`workspace.package.{required_key}` must not be empty"
+            ));
         }
     }
 
-    let license = pkg.get("license").and_then(toml::Value::as_str).unwrap_or_default();
+    let license = pkg
+        .get("license")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
     if license != "Apache-2.0" {
         return Err(format!(
             "expected `workspace.package.license = \"Apache-2.0\"`, got `{license}`"
@@ -142,7 +157,9 @@ fn manifest_check(engine: &Path) -> ExitCode {
     };
     match check_cargo_manifest_content(&text, engine) {
         Ok(()) => {
-            println!("manifest-check: ok (engine/Cargo.toml workspace metadata and members verified)");
+            println!(
+                "manifest-check: ok (engine/Cargo.toml workspace metadata and members verified)"
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
