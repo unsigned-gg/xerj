@@ -84,10 +84,12 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
+pub mod derived_vectors;
 mod row_hydration;
 pub use row_hydration::{
-    decode_stored_v2_rows, decode_stored_v2_rows_controlled, decode_stored_v2_rows_projected,
-    decode_stored_v2_rows_projected_controlled, StoredV2HydratedRow, StoredV2RowHydrationResult,
+    decode_stored_v2_ids, decode_stored_v2_rows, decode_stored_v2_rows_controlled,
+    decode_stored_v2_rows_projected, decode_stored_v2_rows_projected_controlled,
+    decode_stored_v2_rows_projected_parallel, StoredV2HydratedRow, StoredV2RowHydrationResult,
     StoredV2RowHydrationStats,
 };
 
@@ -347,12 +349,23 @@ fn encode_stored_v2_at_level_inner(
     long_effort_level: Option<i32>,
 ) -> Vec<u8> {
     // Parse the JSON array of documents.  Failure → v1 fallback.
-    let docs: Vec<serde_json::Value> = match serde_json::from_slice(stored_docs_json) {
+    let mut docs: Vec<serde_json::Value> = match serde_json::from_slice(stored_docs_json) {
         Ok(v) => v,
         Err(_) => return encode_stored_lz4(stored_docs_json),
     };
     if docs.len() < V2_MIN_DOCS {
         return encode_stored_lz4(stored_docs_json);
+    }
+    // #1122/#2433: drop regenerable semantic_text vectors (see
+    // `derived_vectors`). Must match `encode_stored_v2_from_values_inner`.
+    {
+        use rayon::prelude::*;
+        docs.par_iter_mut().for_each(|doc| {
+            let stripped = doc.get("_source").and_then(derived_vectors::strip_source);
+            if let (Some(stripped), Some(obj)) = (stripped, doc.as_object_mut()) {
+                obj.insert("_source".into(), stripped);
+            }
+        });
     }
 
     // Flatten each doc into (id, seq_no, source-fields).  Anything non-JSON
@@ -490,6 +503,21 @@ fn encode_stored_v2_from_values_inner(
     let num_docs = docs.len();
     let prof = std::env::var_os("XERJ_PROF").is_some();
     let t_build = std::time::Instant::now();
+
+    // #1122/#2433: drop regenerable semantic_text vectors (see
+    // `derived_vectors`); identical to the JSON entry point's pass.
+    let stripped: Vec<Option<serde_json::Value>> = {
+        use rayon::prelude::*;
+        docs.par_iter()
+            .map(|(_, _, src)| derived_vectors::strip_source(src))
+            .collect()
+    };
+    let stripped_docs: Vec<(&str, u64, &serde_json::Value)> = docs
+        .iter()
+        .zip(&stripped)
+        .map(|((id, seq, src), stripped)| (*id, *seq, stripped.as_ref().unwrap_or(src)))
+        .collect();
+    let docs: &[(&str, u64, &serde_json::Value)] = &stripped_docs;
 
     // Synthetic __id / __seq_no columns need owned Values to borrow from.
     let ids: Vec<serde_json::Value> = docs
@@ -914,18 +942,58 @@ fn split_stored_v3(bytes: &[u8]) -> Result<StoredV3Parts<'_>> {
 /// Returns the canonical JSON-array payload that every upstream caller
 /// expects (`[{"_id", "_seq_no", "_source": {...}}, ...]`).
 pub fn decode_stored(bytes: &[u8]) -> Result<Vec<u8>> {
+    decode_stored_inner(bytes, true)
+}
+
+/// [`decode_stored`] without rebuilding derived `semantic_text` vectors
+/// (#1122/#2433): stripped rows keep their marker and stay vector-less.
+/// For a rewrite that re-encodes the documents (merge), so a stripped row
+/// is not regenerated only to be verified and dropped again. Never hand
+/// this output to a reader.
+pub fn decode_stored_preserving_derived(bytes: &[u8]) -> Result<Vec<u8>> {
+    decode_stored_inner(bytes, false)
+}
+
+/// Decode for a merge that re-encodes the documents (#1122/#2433).
+///
+/// By default stripped rows stay stripped ([`decode_stored_preserving_derived`]).
+/// With `XERJ_STORE_SEMANTIC_VECTORS` set the rows are rehydrated instead, so
+/// the merged segment stores full vectors: that is how `force_merge` restores
+/// vectors written before the opt-out was turned on.
+pub fn decode_stored_for_rewrite(bytes: &[u8]) -> Result<Vec<u8>> {
+    decode_stored_inner(bytes, derived_vectors::store_vectors_opt_out())
+}
+
+/// Whether a stored section holds rows whose derived `semantic_text`
+/// vectors were stripped (#1122/#2433). `force_merge` under
+/// `XERJ_STORE_SEMANTIC_VECTORS` rewrites such a segment even when the
+/// index is already at its target segment count.
+pub fn stored_has_derived_rows(bytes: &[u8]) -> Result<bool> {
+    Ok(derived_vectors::contains_marker(
+        &decode_stored_preserving_derived(bytes)?,
+    ))
+}
+
+fn decode_stored_inner(bytes: &[u8], rehydrate: bool) -> Result<Vec<u8>> {
     if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
         let (present_nulls, inner) = split_stored_v3(bytes)?;
-        return decode_stored_v2(&inner[4..], &present_nulls);
+        return decode_stored_v2_filtered(&inner[4..], &present_nulls, None, rehydrate);
     }
     if is_columnar_stored_magic(bytes) {
-        return decode_stored_v2(&bytes[4..], &[]);
+        return decode_stored_v2_filtered(&bytes[4..], &[], None, rehydrate);
     }
-    if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
-        return lz4_flex::decompress_size_prepended(&bytes[4..])
-            .map_err(|e| StorageError::Other(anyhow::anyhow!("LZ4 decompress failed: {e}")));
+    let raw = if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
+        lz4_flex::decompress_size_prepended(&bytes[4..])
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("LZ4 decompress failed: {e}")))?
+    } else {
+        bytes.to_vec()
+    };
+    // A merge can write marker-bearing rows through the LZ4 fallback.
+    if rehydrate {
+        derived_vectors::rehydrate_canonical(raw)
+    } else {
+        Ok(raw)
     }
-    Ok(bytes.to_vec())
 }
 
 /// Column-projected decode over any supported stored payload (#950).
@@ -1400,14 +1468,28 @@ pub fn stored_v2_source_column_names(bytes: &[u8]) -> Result<Option<Vec<String>>
         return Ok(None);
     }
     let directory = parse_v2_directory(&bytes[4..])?;
-    Ok(Some(
-        directory
-            .columns
-            .iter()
-            .filter(|column| column.name != "__id" && column.name != "__seq_no")
-            .map(|column| column.name.to_string())
-            .collect(),
-    ))
+    let mut names: Vec<String> = directory
+        .columns
+        .iter()
+        .filter(|column| column.name != "__id" && column.name != "__seq_no")
+        .map(|column| column.name.to_string())
+        .collect();
+    // #1122/#2433: derived semantic vectors may be stripped from every row
+    // and so have no column; they are still `_source` fields a projection
+    // can ask for (the row decoders rebuild them).
+    let targets: Vec<String> = names
+        .iter()
+        .filter_map(|name| derived_vectors::metadata_target(name))
+        .map(str::to_string)
+        .collect();
+    for target in targets {
+        for name in [derived_vectors::chunks_name(&target), target] {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(Some(names))
 }
 
 /// Decode only named columns from a V2 stored section.
@@ -1932,14 +2014,39 @@ where
         ));
     }
     let directory = parse_v2_directory(&bytes[4..])?;
+    // #1122/#2433: stripped rows rebuild their vectors from the text.
+    let metadata_column = format!("{}{vector_field}", derived_vectors::PASSAGE_METADATA_PREFIX);
+    let has_metadata = directory
+        .columns
+        .iter()
+        .any(|column| column.name == metadata_column);
     let Some(vector_column) = directory
         .columns
         .iter()
         .find(|column| column.name == vector_field)
     else {
-        return Ok(StoredDecodeRun::Complete(
-            StoredV2KnnProjectionResult::MissingVectorColumn,
-        ));
+        if !has_metadata {
+            return Ok(StoredDecodeRun::Complete(
+                StoredV2KnnProjectionResult::MissingVectorColumn,
+            ));
+        }
+        if decode_cancelled(&mut checkpoint, StoredDecodePhase::BeforeColumn, 0, 0) {
+            return Ok(StoredDecodeRun::Cancelled);
+        }
+        let mut vectors: StoredVectorRows = vec![None; directory.num_docs];
+        let mut vector_chunks: Option<StoredVectorChunkRows> = None;
+        if !fill_derived_knn_rows(
+            bytes,
+            &metadata_column,
+            vector_chunks_field.is_some(),
+            &mut vectors,
+            &mut vector_chunks,
+        )? {
+            return Ok(StoredDecodeRun::Complete(
+                StoredV2KnnProjectionResult::UnsupportedVectorShape,
+            ));
+        }
+        return knn_projection_with_identity(bytes, vectors, vector_chunks, &mut checkpoint);
     };
     let vector_index = directory
         .columns
@@ -2013,8 +2120,109 @@ where
         },
         None => None,
     };
+    let mut vectors = vectors;
+    let mut vector_chunks = vector_chunks;
+    if has_metadata
+        && vectors.iter().any(Option::is_none)
+        && !fill_derived_knn_rows(
+            bytes,
+            &metadata_column,
+            vector_chunks_field.is_some(),
+            &mut vectors,
+            &mut vector_chunks,
+        )?
+    {
+        return Ok(StoredDecodeRun::Complete(
+            StoredV2KnnProjectionResult::UnsupportedVectorShape,
+        ));
+    }
+    knn_projection_with_identity(bytes, vectors, vector_chunks, &mut checkpoint)
+}
+
+/// Rebuild the typed vectors of every stripped row (`vectors[row] == None`
+/// with a lexical marker in its passage metadata) from its text.
+/// `Ok(false)` when the rows cannot be read selectively.
+fn fill_derived_knn_rows(
+    bytes: &[u8],
+    metadata_column: &str,
+    want_chunks: bool,
+    vectors: &mut StoredVectorRows,
+    vector_chunks: &mut Option<StoredVectorChunkRows>,
+) -> Result<bool> {
+    let ordinals: Vec<usize> = (0..vectors.len())
+        .filter(|&row| vectors[row].is_none())
+        .collect();
+    if ordinals.is_empty() {
+        return Ok(true);
+    }
+    let StoredV2RowHydrationResult::Hydrated {
+        rows: meta_rows, ..
+    } = decode_stored_v2_rows_projected(bytes, &ordinals, &[metadata_column])?
+    else {
+        return Ok(false);
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for row in &meta_rows {
+        if let Some(field) = row
+            .source
+            .get(metadata_column)
+            .filter(|meta| derived_vectors::is_stripped(meta))
+            .and_then(derived_vectors::metadata_field)
+        {
+            if !fields.iter().any(|known| known == field) {
+                fields.push(field.to_string());
+            }
+        }
+    }
+    if fields.is_empty() {
+        return Ok(true);
+    }
+    let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let StoredV2RowHydrationResult::Hydrated {
+        rows: text_rows, ..
+    } = decode_stored_v2_rows_projected(bytes, &ordinals, &field_refs)?
+    else {
+        return Ok(false);
+    };
+    let texts: HashMap<usize, serde_json::Map<String, serde_json::Value>> = text_rows
+        .into_iter()
+        .map(|row| (row.ordinal, row.source))
+        .collect();
+    let rebuilt: Vec<(usize, Option<derived_vectors::LexicalSemanticVectors>)> = {
+        use rayon::prelude::*;
+        meta_rows
+            .par_iter()
+            .map(|row| {
+                let rebuilt = row.source.get(metadata_column).and_then(|meta| {
+                    let text = derived_vectors::metadata_field(meta)
+                        .and_then(|field| texts.get(&row.ordinal)?.get(field))
+                        .and_then(serde_json::Value::as_str);
+                    derived_vectors::regenerate(meta, text)
+                });
+                (row.ordinal, rebuilt)
+            })
+            .collect()
+    };
+    for (ordinal, rebuilt) in rebuilt {
+        let Some((pooled, chunks)) = rebuilt else {
+            continue;
+        };
+        vectors[ordinal] = Some(pooled);
+        if let (true, Some(chunks)) = (want_chunks, chunks) {
+            vector_chunks.get_or_insert_with(|| vec![None; vectors.len()])[ordinal] = Some(chunks);
+        }
+    }
+    Ok(true)
+}
+
+fn knn_projection_with_identity(
+    bytes: &[u8],
+    vectors: StoredVectorRows,
+    vector_chunks: Option<StoredVectorChunkRows>,
+    checkpoint: &mut dyn FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
+) -> Result<StoredDecodeRun<StoredV2KnnProjectionResult>> {
     let (identity_num_docs, id_values, seq_values) =
-        match row_hydration::decode_v2_identity_columns_controlled(bytes, &mut checkpoint)? {
+        match row_hydration::decode_v2_identity_columns_controlled(bytes, checkpoint)? {
             StoredDecodeRun::Complete(Some(values)) => values,
             StoredDecodeRun::Complete(None) => {
                 return Ok(StoredDecodeRun::Complete(
@@ -2039,7 +2247,41 @@ where
     ))
 }
 
-fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>> {
+/// Decode a stored section like [`decode_stored`], but emit only the
+/// `_source` columns `keep` accepts (`_id` and `_seq_no` are always
+/// emitted). Same canonical `[{"_id","_seq_no","_source":{…}}, …]` framing,
+/// with the dropped fields absent from every `_source` — byte-identical to
+/// running `decode_stored` and deleting those keys.
+///
+/// A column that is not kept is not decompressed at all, unless a kept
+/// `COPY_OF` / `CROSS_DEP` column is derived from it, in which case it is
+/// decoded as a dependency and still left out of the output.
+///
+/// #2427: a brute stored scan decoded EVERY column of a cold segment to
+/// evaluate a lexical query, and on a semantic_text corpus the generated
+/// embedding companions (`*_vector`, `*_vector_chunks`, passage metadata)
+/// are ~85% of the decoded bytes and of the transient peak (a 20k-doc
+/// segment: 342 MB decoded, ~720 MB peak, ~600 MB of it vectors).
+///
+/// `Ok(None)` for a legacy (non-columnar) section; the caller falls back to
+/// [`decode_stored`].
+pub fn decode_stored_keeping(bytes: &[u8], keep: &dyn Fn(&str) -> bool) -> Result<Option<Vec<u8>>> {
+    if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        let (present_nulls, inner) = split_stored_v3(bytes)?;
+        return decode_stored_v2_filtered(&inner[4..], &present_nulls, Some(keep), true).map(Some);
+    }
+    if is_columnar_stored_magic(bytes) {
+        return decode_stored_v2_filtered(&bytes[4..], &[], Some(keep), true).map(Some);
+    }
+    Ok(None)
+}
+
+fn decode_stored_v2_filtered(
+    body: &[u8],
+    present_nulls: &[(u32, u32)],
+    keep: Option<&dyn Fn(&str) -> bool>,
+    rehydrate: bool,
+) -> Result<Vec<u8>> {
     // Positions that were a *present* explicit `_source` null (issue #415).
     // Empty for plain ZBS2 segments; populated by `split_stored_v3` for ZBS3.
     let present_null_set: std::collections::HashSet<(u32, u32)> =
@@ -2094,11 +2336,83 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
     // 100 MB autoindex section's decode; serially every other column queued
     // behind it on the first (cold) search of a segment. Errors surface in
     // column order, as the serial loop reported them.
+    // #2427: which columns are emitted, and which must be decoded (the
+    // emitted ones plus whatever a kept COPY_OF / CROSS_DEP derives from).
+    // #1122/#2433: rows whose derived semantic vectors were stripped get
+    // them rebuilt from the text. A reader that keeps those vectors needs
+    // every column decoded (the text and metadata they derive from); the
+    // `allowed` set then trims the rebuilt row back to what `keep` asked.
+    let has_metadata = rehydrate
+        && entries
+            .iter()
+            .any(|(name, _, _)| derived_vectors::metadata_target(name).is_some());
+    let wants_derived = has_metadata
+        && keep.is_none_or(|keep| {
+            derived_vectors::keep_wants_derived(entries.iter().map(|(n, _, _)| n.as_str()), keep)
+        });
+    let allowed: Option<std::collections::HashSet<String>> = match keep {
+        Some(keep) if wants_derived => {
+            let mut names: std::collections::HashSet<String> = entries
+                .iter()
+                .map(|(name, _, _)| name.clone())
+                .filter(|name| keep(name))
+                .collect();
+            for target in entries
+                .iter()
+                .filter_map(|(name, _, _)| derived_vectors::metadata_target(name))
+            {
+                for name in [target.to_string(), derived_vectors::chunks_name(target)] {
+                    if keep(&name) {
+                        names.insert(name);
+                    }
+                }
+            }
+            Some(names)
+        }
+        _ => None,
+    };
+    let keep = if wants_derived { None } else { keep };
+    let emit: Vec<bool> = entries
+        .iter()
+        .map(|(name, _, _)| {
+            keep.is_none_or(|keep| name == "__id" || name == "__seq_no" || keep(name))
+        })
+        .collect();
+    let mut needed = emit.clone();
+    if keep.is_some() {
+        loop {
+            let mut grew = false;
+            for ix in 0..entries.len() {
+                if !needed[ix] {
+                    continue;
+                }
+                let (_, codec, payload) = &entries[ix];
+                let source = match codec {
+                    ColCodec::CopyOf => Some(copy_of_source_index(payload)?),
+                    ColCodec::CrossDep => Some(cross_dep_source_index(payload, num_docs)?),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    if source < needed.len() && !needed[source] {
+                        needed[source] = true;
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
     let decoded: Vec<Result<Vec<serde_json::Value>>> = {
         use rayon::prelude::*;
         entries
             .par_iter()
-            .map(|(_, codec, payload)| {
+            .zip(needed.par_iter())
+            .map(|((_, codec, payload), needed)| {
+                if !*needed {
+                    return Ok(Vec::new());
+                }
                 let payload = *payload;
                 Ok(match codec {
                     ColCodec::RawJson => decode_raw_json(payload)?,
@@ -2308,7 +2622,7 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
                         }
                         let mut source_map = serde_json::Map::new();
                         for (cix, name) in col_names.iter().enumerate() {
-                            if cix == id_col_ix || cix == seq_col_ix {
+                            if cix == id_col_ix || cix == seq_col_ix || !emit[cix] {
                                 continue;
                             }
                             let v = cell(cix);
@@ -2320,6 +2634,12 @@ fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>
                                 // field, which stays dropped.
                                 source_map.insert(name.clone(), serde_json::Value::Null);
                             }
+                        }
+                        if wants_derived {
+                            derived_vectors::rehydrate_source_map(&mut source_map);
+                        }
+                        if let Some(allowed) = allowed.as_ref() {
+                            source_map.retain(|name, _| allowed.contains(name));
                         }
                         let mut doc = serde_json::Map::new();
                         doc.insert("_id".into(), cell(id_col_ix));
@@ -3346,6 +3666,170 @@ fn read_zigzag_i64(data: &[u8], pos: &mut usize) -> Result<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── #1122/#2433: derived semantic vectors are not persisted ──────────
+
+    fn semantic_docs(n: usize) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| {
+                let text = if i.is_multiple_of(9) {
+                    format!("doc {i} {}", "storage vectors merge segment ".repeat(40))
+                } else {
+                    format!("doc {i} quarterly liquidity ledger {}", i * 31)
+                };
+                let mut source = derived_vectors::tests::ingested(&text, 16);
+                source["n"] = json!(i);
+                json!({"_id": i.to_string(), "_seq_no": i, "_source": source})
+            })
+            .collect()
+    }
+
+    fn sources(json_bytes: &[u8]) -> Vec<serde_json::Value> {
+        let docs: Vec<serde_json::Value> = serde_json::from_slice(json_bytes).unwrap();
+        docs.into_iter().map(|d| d["_source"].clone()).collect()
+    }
+
+    #[test]
+    fn derived_vectors_round_trip_through_both_encoders() {
+        let docs = semantic_docs(300);
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let refs: Vec<(String, u64)> = (0..docs.len()).map(|i| (i.to_string(), i as u64)).collect();
+        let tuples: Vec<(&str, u64, &serde_json::Value)> = docs
+            .iter()
+            .zip(&refs)
+            .map(|(d, (id, seq))| (id.as_str(), *seq, &d["_source"]))
+            .collect();
+        let from_json = encode_stored_v2(&raw);
+        let from_values = encode_stored_v2_from_values_nojson(&tuples);
+        let unstripped_len = raw.len();
+        for encoded in [&from_json, &from_values] {
+            assert!(is_columnar_stored_magic(encoded));
+            let names = stored_v2_source_column_names(encoded).unwrap().unwrap();
+            assert!(names.iter().any(|n| n == "body_vector"));
+            assert!(names.iter().any(|n| n == "body_vector_chunks"));
+            assert_eq!(sources(&decode_stored(encoded).unwrap()), sources(&raw));
+            let preserved = decode_stored_preserving_derived(encoded).unwrap();
+            assert!(preserved.len() < unstripped_len);
+            for source in sources(&preserved) {
+                assert!(source.get("body_vector").is_none());
+                assert!(source.get("body_vector_chunks").is_none());
+                assert!(derived_vectors::is_stripped(
+                    &source[&format!("{}body_vector", derived_vectors::PASSAGE_METADATA_PREFIX)]
+                ));
+            }
+        }
+        assert_eq!(
+            decode_stored(&from_json).unwrap(),
+            decode_stored(&from_values).unwrap()
+        );
+    }
+
+    #[test]
+    fn derived_vectors_keep_projection_rows_and_knn() {
+        let docs = semantic_docs(200);
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let encoded = encode_stored_v2(&raw);
+        let originals = sources(&raw);
+
+        let with_vec = decode_stored_keeping(&encoded, &|n| n == "body_vector" || n == "n")
+            .unwrap()
+            .unwrap();
+        for (got, want) in sources(&with_vec).iter().zip(&originals) {
+            assert_eq!(got.as_object().unwrap().len(), 2, "{got}");
+            assert_eq!(got["body_vector"], want["body_vector"]);
+        }
+        let without = decode_stored_keeping(&encoded, &|n| n == "n")
+            .unwrap()
+            .unwrap();
+        for got in sources(&without) {
+            assert_eq!(got.as_object().unwrap().len(), 1, "{got}");
+        }
+
+        let ordinals = [0usize, 5, 9, 199];
+        match row_hydration::decode_stored_v2_rows(&encoded, &ordinals).unwrap() {
+            row_hydration::StoredV2RowHydrationResult::Hydrated { rows, .. } => {
+                for row in rows {
+                    assert_eq!(
+                        serde_json::Value::Object(row.source),
+                        originals[row.ordinal]
+                    );
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match row_hydration::decode_stored_v2_rows_projected(
+            &encoded,
+            &ordinals,
+            &["body_vector_chunks"],
+        )
+        .unwrap()
+        {
+            row_hydration::StoredV2RowHydrationResult::Hydrated { rows, .. } => {
+                for row in rows {
+                    let want = originals[row.ordinal].get("body_vector_chunks");
+                    assert_eq!(row.source.get("body_vector_chunks"), want);
+                    assert!(row.source.len() <= 1, "{:?}", row.source);
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        match decode_stored_v2_knn_projection(&encoded, "body_vector", Some("body_vector_chunks"))
+            .unwrap()
+        {
+            StoredV2KnnProjectionResult::Projected(projection) => {
+                assert_eq!(projection.num_docs, 200);
+                let chunks = projection.vector_chunks.unwrap();
+                for (i, want) in originals.iter().enumerate() {
+                    assert_eq!(projection.ids[i].as_deref(), Some(i.to_string().as_str()));
+                    assert_eq!(
+                        projection.vectors[i],
+                        derived_vectors::vector_f32(&want["body_vector"])
+                    );
+                    let want_chunks = want.get("body_vector_chunks").map(|c| {
+                        c.as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|v| derived_vectors::vector_f32(v).unwrap())
+                            .collect::<Vec<_>>()
+                    });
+                    assert_eq!(chunks[i], want_chunks);
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derived_vectors_legacy_and_foreign_rows_are_untouched() {
+        // A segment written before the strip (or with the opt-out) has the
+        // vectors as ordinary columns and decodes unchanged.
+        let mut docs = semantic_docs(150);
+        // Foreign vector: not what the lexical embedder derives.
+        docs[3]["_source"]["body_vector"] = json!([0.5, 0.5]);
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let encoded = encode_stored_v2(&raw);
+        let preserved = sources(&decode_stored_preserving_derived(&encoded).unwrap());
+        assert_eq!(preserved[3]["body_vector"], json!([0.5, 0.5]));
+        assert!(preserved[4].get("body_vector").is_none());
+        assert_eq!(sources(&decode_stored(&encoded).unwrap()), sources(&raw));
+
+        // Small (LZ4) sections keep vectors and pass through unchanged.
+        let small = serde_json::to_vec(&semantic_docs(3)).unwrap();
+        let lz4 = encode_stored_v2(&small);
+        assert_eq!(decode_stored(&lz4).unwrap(), small);
+        // A marked LZ4 section (merge output of stripped rows) rehydrates.
+        let marked: Vec<serde_json::Value> =
+            sources(&decode_stored_preserving_derived(&encoded).unwrap())
+                .into_iter()
+                .take(3)
+                .enumerate()
+                .map(|(i, s)| json!({"_id": i.to_string(), "_seq_no": i, "_source": s}))
+                .collect();
+        let marked_lz4 = encode_stored_lz4(&serde_json::to_vec(&marked).unwrap());
+        let want: Vec<serde_json::Value> = sources(&raw).into_iter().take(3).collect();
+        assert_eq!(sources(&decode_stored(&marked_lz4).unwrap()), want);
+    }
 
     #[test]
     fn lz4_roundtrip() {
@@ -4941,6 +5425,62 @@ mod tests {
             assert_eq!(doc["_seq_no"].as_u64(), Some(100 + i as u64), "row {i}");
             assert_eq!(doc["_id"].as_str(), Some(format!("s{}", i).as_str()));
         }
+    }
+
+    /// #2427: the kept-column decode equals the full decode with the dropped
+    /// fields deleted — including a kept COPY_OF whose source is dropped
+    /// (decoded as a dependency, not emitted) and explicit nulls (ZBS3/V3
+    /// present-null set) on both kept and dropped columns.
+    #[test]
+    fn decode_stored_keeping_matches_filtered_full_decode() {
+        let docs: Vec<serde_json::Value> = (0..300u64)
+            .map(|i| {
+                let long = format!("source-text-{i}-padded-so-copy-of-wins-over-dict");
+                let mut source = json!({
+                    "title": format!("title {}", i % 7),
+                    "long_a": long.clone(),
+                    "long_b": long,
+                    "body_vector": [i as f64 * 0.5, 1.25, -2.0],
+                    "body_vector_chunks": [{ "text": "chunk", "vector": [0.1, 0.2] }],
+                    "__xerj_passage_meta__body_vector": { "n": i },
+                    "line": i,
+                });
+                if i % 5 == 0 {
+                    source["title"] = serde_json::Value::Null;
+                    source["body_vector"] = serde_json::Value::Null;
+                }
+                json!({ "_id": format!("d{i}"), "_seq_no": i, "_source": source })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        let full: Vec<serde_json::Value> =
+            serde_json::from_slice(&decode_stored(&encoded).unwrap()).unwrap();
+        assert_eq!(full.len(), docs.len());
+
+        let kept = ["title", "long_b", "line"];
+        let keep = |name: &str| kept.contains(&name);
+        let projected_bytes = decode_stored_keeping(&encoded, &keep)
+            .unwrap()
+            .expect("columnar section");
+        let projected: Vec<serde_json::Value> = serde_json::from_slice(&projected_bytes).unwrap();
+        assert_eq!(projected.len(), full.len());
+        for (i, (got, mut want)) in projected.into_iter().zip(full).enumerate() {
+            want["_source"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| kept.contains(&key.as_str()));
+            assert_eq!(got, want, "row {i}");
+            assert!(got["_source"].get("long_a").is_none(), "row {i}");
+            assert!(got["_source"].get("body_vector").is_none(), "row {i}");
+        }
+        assert!(
+            projected_bytes.len() * 2 < decode_stored(&encoded).unwrap().len(),
+            "dropping the vector columns must shrink the decode"
+        );
+
+        // A legacy LZ4 section is not columnar: the caller falls back.
+        let legacy = encode_stored_lz4(&serde_json::to_vec(&docs).unwrap());
+        assert!(decode_stored_keeping(&legacy, &keep).unwrap().is_none());
     }
 
     /// The `_id` ↔ `doc_id` echo: the later column stores a 4-byte reference

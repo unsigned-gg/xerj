@@ -114,6 +114,68 @@ async fn batch_preserves_positions_errors_duplicates_and_exact_ids() {
     let _ = server.await;
 }
 
+/// #2497: a plain string item is shorthand for `{"query": <string>}`, not an
+/// invalid item; a blank one still fails alone with the query error.
+#[tokio::test]
+async fn batch_accepts_plain_string_items_as_queries() {
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
+    let app = Router::new().route(
+        "/_msearch",
+        axum::routing::post(move |text: String| {
+            seen.lock().unwrap().push(text.clone());
+            let hit = json!({"hits":{"total":{"value":1,"relation":"eq"},"hits":[{
+                "_index":"docs","_id":"record-1","_source":{"body":"rotate the WAL"}}]}});
+            async move {
+                let searches = text.lines().count() / 2;
+                Json(json!({"responses":vec![hit; searches]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = body(
+        &call(
+            &url,
+            json!({"index":"docs","queries":[
+                "rotate the WAL",
+                {"key":"object","query":"rotate the WAL"},
+                "   "
+            ]}),
+        )
+        .await,
+    );
+    let items = result["results"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "{result}");
+    assert_eq!(items[0]["position"], 0);
+    assert_eq!(items[0]["status"], "hits", "{result}");
+    assert!(items[0].get("key").is_none(), "{result}");
+    assert_eq!(items[0]["hits"], items[1]["hits"]);
+    assert_eq!(items[2]["status"], "error", "{result}");
+    assert!(
+        items[2]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("non-blank"),
+        "{result}"
+    );
+    {
+        let requests = requests.lock().unwrap();
+        let lines: Vec<Value> = requests[0]
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4, "the blank item never reaches the node");
+        assert_eq!(
+            lines[1], lines[3],
+            "a string item searches exactly as its object form"
+        );
+    }
+    server.abort();
+    let _ = server.await;
+}
+
 #[tokio::test]
 async fn batch_rejects_invalid_envelopes_before_network() {
     for args in [

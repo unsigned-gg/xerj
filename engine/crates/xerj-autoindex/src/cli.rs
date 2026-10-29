@@ -11,7 +11,7 @@ use std::time::Duration;
 // are pinned by the `local admin-key discovery` tests at the bottom of this
 // file: they stayed here when the helpers moved to `xerj-common`, so they
 // are the shared helpers' tests wherever the helpers live.
-use xerj_common::localauth::{discover_local_admin_key_for_url, url_is_loopback};
+use xerj_common::localauth::{discover_local_admin_key_for_url_with_origin, url_is_loopback};
 
 /// Largest `--max-minutes` accepted: one week. Past that the flag is a typo,
 /// and `--max-minutes 0` already exists to mean "never ask".
@@ -493,7 +493,7 @@ pub fn help_text_with(feedback: bool) -> String {
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20the JSON decision request on stdout and exits 4 instead,\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20exactly like an agent-driven run. See ESTIMATE + DECISION\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20GATE.\n\
-         \x20\x20\x20\x20--dataset <SLUG>     (map, no folder) show a single catalog dataset\n\
+         \x20\x20\x20\x20--dataset <SLUG>     (map, no folder) show one autoindex dataset (not a managed corpus slug)\n\
          \x20\x20\x20\x20--offset <N>         (map, no folder) skip the first N dataset detail sections\n\
          \x20\x20\x20\x20--limit <N>          (map, no folder) how many dataset detail sections to print\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(default: all of them when there are few, otherwise\n\
@@ -1670,18 +1670,24 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     // we are talking to a server on this machine, and sending it anywhere else
     // would leak a credential to a host it does not belong to.
     if api_key.is_none() && url_is_loopback(&url) {
-        if let Some((key, path)) = discover_local_admin_key_for_url(&url) {
+        if let Some(found) = discover_local_admin_key_for_url_with_origin(&url) {
             // Announced, never silent: a blind onboarding run found this
             // fallback made success depend on the working directory, because
             // `./data/admin.key` is resolved relative to cwd. Saying which
             // file was used turns "it worked here and not there" into
-            // something the reader can see and reason about.
+            // something the reader can see and reason about; saying which
+            // discovery step found it (#2578) turns "why is it using another
+            // project's key?" into the same kind of answer.
             eprintln!(
-                "autoindex: no --api-key/XERJ_API_KEY given; using the admin key at {}",
-                path.display()
+                "autoindex: no --api-key/XERJ_API_KEY given; using the admin key at {} ({})",
+                found.path.display(),
+                found.provenance()
             );
-            api_key = Some(key);
-            api_key_file = Some(path);
+            if let Some(warning) = found.foreign_warning("--api-key or XERJ_API_KEY") {
+                eprintln!("autoindex: warning: {warning}");
+            }
+            api_key = Some(found.key);
+            api_key_file = Some(found.path);
         }
     }
 
@@ -3952,6 +3958,9 @@ mod tests {
     /// is the `--dry-run` preview. A bare `map` still reads the catalog.
     #[test]
     fn map_with_a_folder_is_the_dry_run_preview_and_bare_map_stays_the_catalog() {
+        // Both parses discover local auth. Hold the same lock as the
+        // sandbox tests so cwd/key discovery cannot change between them.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let help = super::help_text();
         assert!(
             help.contains("xerj autoindex map <folder>"),

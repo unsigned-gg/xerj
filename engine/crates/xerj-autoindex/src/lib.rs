@@ -52,6 +52,7 @@ pub mod search;
 pub mod sessions;
 pub mod sniff;
 pub mod source;
+mod stage;
 pub mod staleness;
 pub mod state;
 mod sync;
@@ -64,7 +65,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -4258,6 +4259,36 @@ fn scan_file(
             }
         })
         .collect();
+    // CSV, JSONL and logs declare no length, so `records` is the sample: it
+    // stops at `sample` rows (500 by default) or at the sample byte cap. A
+    // 100_000-row CSV then looked like a 500-row one, and the dataset caps
+    // (`dataset::DATASET_CAP_PROTECT_RECORDS`) merged it into a shared index
+    // as if it were small. When the sample may have stopped early, count on
+    // with the same extractor up to the protect threshold. That is enough to
+    // decide the caps and stays bounded however large the file is.
+    if matches!(sn.family, Family::Csv | Family::Jsonl | Family::Logs) {
+        let threshold = dataset::DATASET_CAP_PROTECT_RECORDS;
+        let sample_cut = |s: &GroupSketch| {
+            s.population < threshold
+                && (s.records >= sample as u64 || limit.is_some_and(|l| sn.gzip || size > l))
+        };
+        if out.sketches.iter().any(sample_cut) {
+            let groups_seen = out.sketches.len();
+            let mut counts: HashMap<Option<String>, u64> = HashMap::new();
+            let mut count = |rec: extract::RawRecord| -> bool {
+                *counts.entry(rec.group).or_default() += 1;
+                counts.len() < groups_seen || counts.values().any(|n| *n < threshold)
+            };
+            // A read error part-way still leaves a lower bound: every
+            // record counted was really there.
+            let _ = extract::extract(path, &sn, None, &mut count);
+            for s in &mut out.sketches {
+                if let Some(&n) = counts.get(&s.group) {
+                    s.population = s.population.max(n);
+                }
+            }
+        }
+    }
     out.sketches.sort_by(|a, b| a.group.cmp(&b.group));
     out.sniffed = Some(sn);
     out
@@ -4444,6 +4475,108 @@ mod clustering_key_tests {
             .expect("runs group");
         assert_eq!(runs.records, 2);
         assert_eq!(runs.population, 3);
+    }
+
+    fn csv_body(tag: &str, rows: usize) -> String {
+        let mut b = format!("{tag}_id,{tag}_name,{tag}_val\n");
+        for i in 0..rows {
+            b.push_str(&format!("{i},name{i},{}\n", i * 3));
+        }
+        b
+    }
+
+    fn jsonl_body(tag: &str, rows: usize) -> String {
+        let mut b = String::new();
+        for i in 0..rows {
+            b.push_str(&format!(
+                "{{\"{tag}_id\":{i},\"{tag}_name\":\"name{i}\",\"{tag}_val\":{}}}\n",
+                i * 3
+            ));
+        }
+        b
+    }
+
+    /// Line-record files declare no length, so the sample (500 rows) used to
+    /// be the population and a 2000-row CSV/JSONL counted as small (#2422).
+    /// Phase A now counts on to the protect threshold; a 10-row file still
+    /// reports exactly its 10 rows.
+    #[test]
+    fn a_sampled_line_record_file_reports_rows_past_the_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("big.csv", csv_body("b", 2000)),
+            ("big.jsonl", jsonl_body("j", 2000)),
+        ] {
+            let s = scan(dir.path(), name, &body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            assert_eq!(sk.records, 500, "{name}: the sample still stops at 500");
+            assert!(
+                sk.population >= dataset::DATASET_CAP_PROTECT_RECORDS,
+                "{name}: population {} is the sample, not the file",
+                sk.population
+            );
+        }
+        let small = scan(dir.path(), "small.csv", &csv_body("s", 10));
+        assert_eq!(small.sketches[0].records, 10);
+        assert_eq!(small.sketches[0].population, 10);
+    }
+
+    /// End to end through `cluster()`: past the run cap, 2000-row CSV and
+    /// JSONL files keep their own datasets, and the 10-row CSVs still merge
+    /// into one shared CSV dataset.
+    #[test]
+    fn past_the_run_cap_large_sampled_csv_and_jsonl_keep_their_own_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files: Vec<(String, String)> = Vec::new();
+        let n_big = dataset::MAX_DATASETS_PER_RUN + 2;
+        for i in 0..n_big {
+            files.push((format!("big{i}.csv"), csv_body(&format!("b{i}"), 2000)));
+        }
+        files.push(("big.jsonl".into(), jsonl_body("j", 2000)));
+        let n_small = 3;
+        for i in 0..n_small {
+            files.push((format!("small{i}.csv"), csv_body(&format!("s{i}"), 10)));
+        }
+        let mut rels = Vec::new();
+        let mut sketches = Vec::new();
+        for (idx, (name, body)) in files.iter().enumerate() {
+            let s = scan(dir.path(), name, body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            sketches.push(dataset::Sketch {
+                file_idx: idx,
+                group: sk.group.clone(),
+                family: s.sniffed.as_ref().unwrap().family,
+                fields: sk.fields.clone(),
+                key_fields: sk.key_fields.clone(),
+                records: sk.records,
+                population: sk.population,
+            });
+            rels.push(name.clone());
+        }
+        let scopes = vec![String::new(); rels.len()];
+        let clusters = dataset::cluster(sketches, &rels, &scopes);
+        let data: Vec<&dataset::Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        let home = |idx: usize| {
+            data.iter()
+                .find(|c| c.members.contains(&idx))
+                .unwrap_or_else(|| panic!("{} has no data dataset: {clusters:#?}", rels[idx]))
+        };
+        // Every large file — the CSVs and the JSONL — is alone in its dataset.
+        for (idx, rel) in rels.iter().enumerate().take(n_big + 1) {
+            assert_eq!(home(idx).members, vec![idx], "{rel} was merged");
+        }
+        // The 10-row CSVs share one dataset, rows intact.
+        let shared = home(n_big + 1);
+        let mut members = shared.members.clone();
+        members.sort();
+        assert_eq!(
+            members,
+            (n_big + 1..n_big + 1 + n_small).collect::<Vec<_>>()
+        );
+        assert_eq!(shared.records, 10 * n_small as u64);
+        assert_eq!(data.len(), n_big + 2);
     }
 }
 
@@ -10739,10 +10872,7 @@ fn run_index_report_inner(
             // only source that can name a PDF page boundary's
             // predecessor (p2-s0 follows the LAST section of page 1).
             let mut prev_section: Option<(String, String)> = None;
-            let mut staged = match tempfile::Builder::new()
-                .prefix(".autoindex-stage-")
-                .tempfile_in(&state_dir)
-            {
+            let mut staged = match stage::Stage::create_in(&state_dir) {
                 Ok(file) => file,
                 Err(error) => {
                     let mut errors = bulk_errors.lock().unwrap();
@@ -10807,12 +10937,9 @@ fn run_index_report_inner(
                         align_hit_locators(&mut fields, &f.rel);
                         let action = json!({"index": {
                                     "_index": rt.index, "_id": cf.anchor_doc_id}});
-                        if let Err(error) = writeln!(
-                            staged.as_file_mut(),
-                            "{}\n{}",
-                            action,
-                            Value::Object(fields)
-                        ) {
+                        if let Err(error) =
+                            writeln!(&mut staged, "{}\n{}", action, Value::Object(fields))
+                        {
                             send_err = Some(format!("stage file card for {}: {error}", f.rel));
                         }
                     }
@@ -10906,7 +11033,7 @@ fn run_index_report_inner(
                     let action = json!({"index": {"_index": rt.index, "_id": id}});
                     let doc = Value::Object(fields);
                     if let Err(error) = writeln!(
-                        staged.as_file_mut(),
+                        &mut staged,
                         "{}\n{}",
                         action,
                         serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into())
@@ -11146,9 +11273,28 @@ fn run_index_report_inner(
                     continue;
                 }
             }
+            // Finish buffered compression before the first remote mutation.
+            // ENOSPC can surface here even when every earlier write succeeded;
+            // keep the previous records live and the replacement pending then.
+            // Reference: tantivy 3a55bc98, src/directory/mmap_directory/mod.rs:
+            // 372-376 flushes the temporary writer before publishing its file.
+            // The stage is consumed here whether or not the send runs: an
+            // early error drops it, and the unnamed file goes with it.
+            let staged_len = staged.raw_bytes();
+            let mut reader = None;
+            if send_err.is_none() {
+                match staged.into_reader() {
+                    Ok((r, _disk)) => reader = Some(r),
+                    Err(error) => {
+                        send_err = Some(format!("finish staged records for {}: {error}", f.rel));
+                    }
+                }
+            } else {
+                drop(staged);
+            }
             // Visibility begins only after extraction and the second
-            // full-content verification. Delete-before-replace makes
-            // a retry clean up any partial prior attempt.
+            // full-content verification and stage finalization.
+            // Delete-before-replace makes a retry clean up any partial prior attempt.
             if send_err.is_none() && cleanup_required.contains(key) {
                 let prior = superseded.get(&f.rel);
                 let mut indices: Vec<String> = fa
@@ -11182,12 +11328,7 @@ fn run_index_report_inner(
                     }
                 }
             }
-            if send_err.is_none() {
-                if let Err(error) = staged.as_file_mut().rewind() {
-                    send_err = Some(format!("rewind staged records for {}: {error}", f.rel));
-                }
-            }
-            if send_err.is_none() {
+            if let Some(mut reader) = reader.filter(|_| send_err.is_none()) {
                 // The second half of a mailbox's bar: staged bytes
                 // handed to the engine, out of staged bytes in total.
                 // Credit is taken at submission: the shared buffer
@@ -11195,9 +11336,7 @@ fn run_index_report_inner(
                 // flush carries them, and the bar measures reading
                 // work, not wire time.
                 let credit_send = sn.family == Family::Mbox;
-                let staged_len = staged.as_file().metadata().map(|m| m.len()).unwrap_or(0);
                 let mut staged_sent = 0u64;
-                let mut reader = BufReader::new(staged.as_file_mut());
                 // A LOCAL chunk, not the bulk: chunks join whatever
                 // the other workers are staging in the shared buffer,
                 // so a small file stops paying for its own round-trip.
@@ -12882,7 +13021,15 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         if let Some(s) = sort {
             body["sort"] = s;
         }
-        let v = es.search(catalog::CATALOG_INDEX, &body)?;
+        let v = es
+            .search_present(catalog::CATALOG_INDEX, &body)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "autoindex catalog {} is missing (HTTP 404). {}",
+                    catalog::CATALOG_INDEX,
+                    catalog::MAP_NAMESPACE_HINT
+                )
+            })?;
         Ok(v.pointer("/hits/hits")
             .and_then(|h| h.as_array())
             .map(|arr| {
@@ -12914,17 +13061,18 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
     if datasets.is_empty() {
         if let Some(prefix) = cfg.prefix.as_deref() {
             eprintln!(
-                "no autoindex catalog found for --prefix {prefix} at {} (index {}) — run `xerj autoindex <folder> --prefix {prefix}` first",
+                "no autoindex datasets match --prefix {prefix} at {} (catalog {})",
                 cfg.url,
                 catalog::CATALOG_INDEX
             );
         } else {
             eprintln!(
-                "no autoindex catalog found at {} (index {}) — run `xerj autoindex <folder>` first",
+                "no autoindex datasets match at {} (catalog {})",
                 cfg.url,
                 catalog::CATALOG_INDEX
             );
         }
+        eprintln!("{}", catalog::MAP_NAMESPACE_HINT);
         return Ok(1);
     }
     let mut run_must = vec![json!({"term": {"doc_kind": "run"}})];

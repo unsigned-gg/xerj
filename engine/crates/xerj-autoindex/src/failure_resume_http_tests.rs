@@ -3268,6 +3268,91 @@ fn existing_completion_is_invalidated_and_partial_visibility_is_deleted_on_resum
 }
 
 #[test]
+fn stage_finish_failure_preserves_previous_records_and_resume_replaces_them() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = corpus.path().join("records.csv");
+    fs::write(&path, "id,value\n0,old\n1,old\n").unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    let (old_docs, old_deletes, old_bulks) = {
+        let state = endpoint.state.lock().unwrap();
+        (
+            state.docs.clone(),
+            state.delete_calls,
+            state.data_bulk_number,
+        )
+    };
+    assert!(!old_docs.is_empty());
+    fs::write(&path, "id,value\n0,new\n1,new\n").unwrap();
+
+    // Compression can buffer a successful write until into_reader finishes
+    // the frame. This local failure must precede the remote replacement.
+    arm_replacement_failpoint(5, state_dir.path());
+    let error = run_index(config.clone()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected replacement crash boundary 5"),
+        "{error:#}"
+    );
+    {
+        let state = endpoint.state.lock().unwrap();
+        assert_eq!(
+            state.delete_calls, old_deletes,
+            "deleted before stage finished"
+        );
+        assert_eq!(state.data_bulk_number, old_bulks);
+        assert_eq!(
+            state.docs, old_docs,
+            "previous records must remain readable"
+        );
+    }
+    assert_eq!(file_done_count(state_dir.path()), 1);
+    let replay = state::Journal::open(
+        state_dir.path(),
+        &config.root.to_string_lossy(),
+        &config.url,
+        &config.prefix,
+        config.bulk_timeout_secs,
+        false,
+    )
+    .unwrap();
+    assert!(
+        replay.done.is_empty(),
+        "failed replacement cannot be committed"
+    );
+    assert_eq!(replay.pending_replacements.len(), 1);
+    drop(replay);
+
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    assert_eq!(file_done_count(state_dir.path()), 2);
+    let (new_docs, new_bulks) = {
+        let state = endpoint.state.lock().unwrap();
+        assert_eq!(state.delete_calls, old_deletes + 1);
+        let rows: Vec<_> = state
+            .docs
+            .values()
+            .filter(|doc| doc.get("value").is_some())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|doc| doc["value"].as_str() == Some("new")));
+        (state.docs.clone(), state.data_bulk_number)
+    };
+    // A zero-work rerun must retain the completed replacement unchanged.
+    assert_eq!(run_index(config).unwrap(), 0);
+    let state = endpoint.state.lock().unwrap();
+    assert_eq!(state.docs, new_docs);
+    assert_eq!(state.data_bulk_number, new_bulks);
+    assert_eq!(state.delete_calls, old_deletes + 1);
+}
+
+#[test]
 fn resume_repairs_kills_after_plan_delete_and_final_bulk_before_file_done() {
     let _guard = FAILPOINT_TEST_LOCK
         .lock()

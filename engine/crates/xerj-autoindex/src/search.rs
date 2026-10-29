@@ -93,6 +93,23 @@ pub(crate) fn search_mode_refusal(asked: &str) -> String {
     )
 }
 
+/// #2458: an unknown flag got "unexpected argument" followed by the whole
+/// USAGE, and an agent read the help dump as the answer and gave up. Name the
+/// flag on one line, and point the names agents guess first at the real one.
+pub(crate) fn unknown_flag_refusal(flag: &str) -> String {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    let hint = match name {
+        "--index" | "--indices" | "-i" => {
+            " Use --prefix <P> to choose the indices: it searches <P>-* (default \"ax\")."
+        }
+        "--max-hits" | "--size" | "--limit" | "--top" | "--top-k" | "-n" => {
+            " Use -k <N> for the number of passages (default 5)."
+        }
+        _ => "",
+    };
+    format!("xerj search: unknown flag '{name}'.{hint} Run `xerj search --help` for every option.")
+}
+
 /// One line for the human printer when the node says this lexical query
 /// scored a `semantic_text` field and did not consult the embedding.
 ///
@@ -787,6 +804,10 @@ fn parse_search_cli(
                 return Ok(SearchCli::Refuse);
             }
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
+            other if other.starts_with('-') => {
+                eprintln!("{}", unknown_flag_refusal(other));
+                return Ok(SearchCli::Refuse);
+            }
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
@@ -875,12 +896,18 @@ pub fn run_search_cli() -> i32 {
         url = "http://localhost:9200".to_string();
     }
     if api_key.is_none() && xerj_common::localauth::url_is_loopback(&url) {
-        if let Some((key, path)) = xerj_common::localauth::discover_local_admin_key_for_url(&url) {
+        if let Some(found) =
+            xerj_common::localauth::discover_local_admin_key_for_url_with_origin(&url)
+        {
             eprintln!(
-                "xerj search: no --api-key/XERJ_API_KEY given; using the admin key at {}",
-                path.display()
+                "xerj search: no --api-key/XERJ_API_KEY given; using the admin key at {} ({})",
+                found.path.display(),
+                found.provenance()
             );
-            api_key = Some(key);
+            if let Some(warning) = found.foreign_warning("--api-key or XERJ_API_KEY") {
+                eprintln!("xerj search: warning: {warning}");
+            }
+            api_key = Some(found.key);
         }
     }
 
@@ -1234,6 +1261,36 @@ mod tests {
                 SearchCli::Refuse => panic!("refusal from {args:?}"),
             }
         }
+    }
+
+    /// #2458: a guessed flag is refused by name, with the real flag when the
+    /// guess is a common one, not answered with the USAGE dump.
+    #[test]
+    fn an_unknown_flag_is_named_not_answered_with_usage() {
+        for args in [
+            vec!["--index", "docs", "needle"],
+            vec!["needle", "--max-hits", "5"],
+            vec!["--max-hits=5", "needle"],
+            vec!["--bogus", "needle"],
+        ] {
+            let parsed = parse_search_cli(words(&args).into_iter(), String::new(), None)
+                .unwrap_or_else(|e| panic!("{args:?} took the USAGE path: {e}"));
+            assert!(matches!(parsed, SearchCli::Refuse), "{args:?}: {parsed:?}");
+        }
+        let index = unknown_flag_refusal("--index");
+        assert!(index.contains("unknown flag '--index'"), "{index}");
+        assert!(index.contains("--prefix <P>"), "{index}");
+        let hits = unknown_flag_refusal("--max-hits=5");
+        assert!(hits.contains("unknown flag '--max-hits'"), "{hits}");
+        assert!(hits.contains("-k <N>"), "{hits}");
+        let other = unknown_flag_refusal("--bogus");
+        assert!(other.contains("unknown flag '--bogus'"), "{other}");
+        assert!(other.contains("xerj search --help"), "{other}");
+        assert!(!other.contains("USAGE"), "{other}");
+        // A second positional is still a usage error, not a flag refusal.
+        let err = parse_search_cli(words(&["one", "two"]).into_iter(), String::new(), None)
+            .expect_err("two queries");
+        assert!(err.contains("unexpected argument 'two'"), "{err}");
     }
 
     #[test]

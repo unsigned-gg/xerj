@@ -1,6 +1,6 @@
-//! Plain text: prose files become one document record (title = first line,
-//! body split into ~32KB sections); line-oriented files become overlapping
-//! line-window chunks.
+//! Plain text: prose files become one document record (title = first line, or
+//! a frontmatter `title:`; body split into ~32KB sections); line-oriented
+//! files become overlapping line-window chunks.
 //!
 //! ## Why line-oriented text is chunked, not emitted per line
 //!
@@ -38,6 +38,10 @@ const CHUNK_OVERLAP: usize = 10;
 /// Byte ceiling per chunk, so a file of very long lines cannot produce a
 /// multi-megabyte record that would blow up `_source` on every hit.
 const CHUNK_MAX_BYTES: usize = 8 << 10;
+/// Largest frontmatter block `split_frontmatter` will hand to the YAML parser.
+/// The sniffer only routes frontmatter here when it closes inside its 8 KiB
+/// prefix, so this bounds the parse locally rather than by that invariant.
+const FRONTMATTER_MAX_BYTES: usize = 64 << 10;
 
 pub fn extract_prose(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats> {
     let mut stats = ExtractStats::default();
@@ -46,11 +50,8 @@ pub fn extract_prose(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats
         return Ok(stats);
     };
     let (text, _) = crate::sniff::decode_text(&bytes);
-    let title = text
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| {
-            let t = l.trim();
+    let title = prose_title(&text)
+        .map(|t| {
             let mut s: String = t.chars().take(200).collect();
             if s.len() < t.len() {
                 s.push('…');
@@ -77,6 +78,78 @@ pub fn extract_prose(path: &Path, gzip: bool, sink: Sink) -> Result<ExtractStats
         &mut stats,
     );
     Ok(stats)
+}
+
+/// The title of a prose document: the first non-blank line, unless the text
+/// opens with a frontmatter block.
+///
+/// #2556: the sniffer routes frontmatter over a prose body here (#551), so for
+/// every Jekyll/Hugo/Obsidian page the first line is the opening `---` and
+/// every page was titled `---`. A frontmatter `title:` wins; without one, the
+/// first line after the block. A bare `---` rule is never the title, even when
+/// the leading block is not frontmatter we can parse. `None` when there is no
+/// line to use.
+fn prose_title(text: &str) -> Option<String> {
+    let mut rest = text;
+    if let Some((title, after)) = split_frontmatter(text) {
+        if title.is_some() {
+            return title;
+        }
+        rest = after;
+    }
+    rest.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && *l != "---")
+        .map(str::to_string)
+}
+
+/// Splits a leading frontmatter block off `text`: its `title:` (whitespace
+/// collapsed, `None` when absent or blank) and the text after the closing
+/// fence. The fences follow the sniffer's #551 lookahead (first non-blank line
+/// `---`, next `---` line closes it); the block must be at most
+/// `FRONTMATTER_MAX_BYTES` and parse as a YAML mapping, so prose between two
+/// `---` rules is not frontmatter.
+fn split_frontmatter(text: &str) -> Option<(Option<String>, &str)> {
+    let mut lines = text.split_inclusive('\n');
+    let mut offset = 0;
+    loop {
+        let line = lines.next()?;
+        offset += line.len();
+        if !line.trim().is_empty() {
+            if line.trim() != "---" {
+                return None;
+            }
+            break;
+        }
+    }
+    let block_start = offset;
+    for line in lines {
+        let line_start = offset;
+        if line_start - block_start > FRONTMATTER_MAX_BYTES {
+            return None;
+        }
+        offset += line.len();
+        if line.trim() == "---" {
+            let serde_yaml::Value::Mapping(map) =
+                serde_yaml::from_str(&text[block_start..line_start]).ok()?
+            else {
+                return None;
+            };
+            // `title: 1984` is a YAML number, still a title.
+            let title = map
+                .get("title")
+                .and_then(|v| match v {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml::Value::Number(n) => Some(n.to_string()),
+                    serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|t| !t.is_empty());
+            return Some((title, &text[offset..]));
+        }
+    }
+    None
 }
 
 pub fn extract_lines(
@@ -336,6 +409,168 @@ mod chunk_tests {
                 source.ends_with(first),
                 "start_line {line} does not hold the section start: {first:?} vs {source:?}"
             );
+        }
+    }
+
+    /// Runs `extract_prose` over `text` and returns each record's
+    /// (title, start_line, body).
+    fn prose(name: &str, text: &str) -> Vec<(String, u64, String)> {
+        let dir = std::env::temp_dir().join(format!("xerj-prose-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        let mut got = Vec::new();
+        {
+            let mut sink = |r: RawRecord| {
+                got.push((
+                    r.fields["title"].as_str().unwrap().to_string(),
+                    r.fields["start_line"].as_u64().unwrap(),
+                    r.fields["body"].as_str().unwrap().to_string(),
+                ));
+                true
+            };
+            extract_prose(&p, false, &mut sink).unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+        got
+    }
+
+    /// #2556: the sniffer routes frontmatter over a prose body here (#551), so
+    /// the title must come from the frontmatter, not its opening `---` fence.
+    /// The body and its start line are unchanged: the frontmatter stays
+    /// searchable.
+    #[test]
+    fn frontmatter_title_key_titles_the_document() {
+        let text = "---\ntitle: Deploy runbook\ndate: 2026-10-01\n---\n\n# Deploy runbook\n\nRoll the canary first.\n";
+        let got = prose("deploy.md", text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "Deploy runbook");
+        assert_eq!(got[0].1, 1, "the body still starts at the fence");
+        assert_eq!(got[0].2, text.trim(), "the frontmatter stays in the body");
+    }
+
+    #[test]
+    fn quoted_frontmatter_title_is_unquoted() {
+        let got = prose(
+            "q.md",
+            "---\ntitle: \"Deploy: the runbook\"\n---\nRoll the canary first.\n",
+        );
+        assert_eq!(got[0].0, "Deploy: the runbook");
+        let got = prose(
+            "s.md",
+            "---\ntitle: 'It''s live'\n---\nRoll the canary first.\n",
+        );
+        assert_eq!(got[0].0, "It's live");
+        let got = prose(
+            "f.md",
+            "---\ntitle: >\n  Deploy\n  runbook\n---\nRoll the canary first.\n",
+        );
+        assert_eq!(got[0].0, "Deploy runbook", "a folded title is one line");
+    }
+
+    /// No `title:` key: the first line after the closing fence, as a file
+    /// without frontmatter would get.
+    #[test]
+    fn frontmatter_without_a_title_uses_the_first_body_line() {
+        let got = prose(
+            "n.md",
+            "\n---\ndate: 2026-10-01\ntags: [ops]\n---\n\nRoll the canary first.\nThen promote.\n",
+        );
+        assert_eq!(got[0].0, "Roll the canary first.");
+        let got = prose("e.md", "---\ntitle: \"\"\n---\nRoll the canary first.\n");
+        assert_eq!(
+            got[0].0, "Roll the canary first.",
+            "an empty title is no title"
+        );
+    }
+
+    #[test]
+    fn crlf_frontmatter_and_a_number_title() {
+        let got = prose(
+            "c.md",
+            "---\r\ntitle: Deploy runbook\r\n---\r\nRoll the canary first.\r\n",
+        );
+        assert_eq!(got[0].0, "Deploy runbook");
+        let got = prose("y.md", "---\ntitle: 1984\n---\nRoll the canary first.\n");
+        assert_eq!(got[0].0, "1984", "a YAML number is still a title");
+    }
+
+    /// Only a closed, bounded block that parses as a YAML mapping is
+    /// frontmatter. Anything else (an unclosed fence, prose between two `---`
+    /// rules, YAML the parser refuses, an oversized block) takes the first
+    /// line that is not a bare `---` rule.
+    #[test]
+    fn a_leading_rule_that_is_not_frontmatter_never_titles_the_page() {
+        let got = prose("u.md", "---\ntitle: never closed\nRoll the canary first.\n");
+        assert_eq!(got[0].0, "title: never closed");
+        let got = prose(
+            "r.md",
+            "---\nRoll the canary first, then promote.\n---\nCheck the dashboards.\n",
+        );
+        assert_eq!(got[0].0, "Roll the canary first, then promote.");
+        let got = prose(
+            "d.md",
+            "---\ntitle: First\ntitle: Second\n---\nRoll the canary first.\n",
+        );
+        assert_eq!(got[0].0, "title: First", "duplicate keys do not parse");
+        let pad = "x".repeat(FRONTMATTER_MAX_BYTES);
+        let got = prose(
+            "big.md",
+            &format!("---\ntitle: Big\npad: {pad}\n---\nRoll the canary first.\n"),
+        );
+        assert_eq!(got[0].0, "title: Big", "an oversized block is not parsed");
+    }
+
+    /// The route the fix depends on: a Jekyll-shaped page sniffs as prose
+    /// (#551) and then takes its frontmatter title.
+    #[test]
+    fn a_sniffed_frontmatter_page_takes_its_frontmatter_title() {
+        let dir = std::env::temp_dir().join(format!("xerj-prose-sniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("deploy.md");
+        std::fs::write(
+            &p,
+            "---\ntitle: Deploy runbook\ndate: 2026-10-01\n---\n\n# Deploy runbook\n\nRoll the canary first, then promote the release.\n",
+        )
+        .unwrap();
+        let family = crate::sniff::sniff(&p).unwrap().family;
+        assert_eq!(family, crate::sniff::Family::TxtProse);
+        let mut titles = Vec::new();
+        {
+            let mut sink = |r: RawRecord| {
+                titles.push(r.fields["title"].as_str().unwrap().to_string());
+                true
+            };
+            extract_prose(&p, false, &mut sink).unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(titles, ["Deploy runbook"]);
+    }
+
+    #[test]
+    fn short_markdown_frontmatter_keeps_its_title_and_complete_body() {
+        let dir = tempfile::tempdir().unwrap();
+        for extension in [
+            "md", "MD", "markdown", "mdx", "mdown", "mkd", "mkdn", "mdwn",
+        ] {
+            let path = dir.path().join(format!("install.{extension}"));
+            let text = "---\ntitle: Install guide\n---\n\n- npm\n- pnpm\n- yarn\n";
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                crate::sniff::sniff(&path).unwrap().family,
+                crate::sniff::Family::TxtProse,
+                "short body must survive the YAML-looking bullets: {extension}"
+            );
+            let mut records = Vec::new();
+            extract_prose(&path, false, &mut |record| {
+                records.push(record);
+                true
+            })
+            .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].fields["title"], "Install guide");
+            assert_eq!(records[0].fields["body"], text.trim());
+            assert_eq!(records[0].fields["start_line"], 1);
         }
     }
 }

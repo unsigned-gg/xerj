@@ -10,23 +10,23 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) fn spec() -> Value {
     json!({
         "name":"xerj_batch_search",
-        "description": "Search 1..50 IDs or questions in one call, in input order. Shares the CLI xerj batch-search adapter. Each result has its zero-based position, optional caller key, and status hits, abstain (only a complete empty search), or error. Hits carry citations: index/id plus file/line or record locator when available. This retrieves evidence, not generated answers or calibrated confidence. Use identifier plus an explicitly keyword-mapped field for exact IDs; query takes plain text or an ES query clause. One bad item never discards its siblings; identical inputs remain separate. Uses one _msearch request, plus at most one mapping read. Optional max_tokens caps the entire successful JSON response using StandardTokenizer UAX #29 words, not BPE. Budgeting removes raw hit bodies, then extra hits, retaining each item's status and at least one citation per matched item. If that minimum cannot fit, returns an actionable tool error, never truncated JSON or a false abstention. Errors are not truncated.",
+        "description": "Search 1..50 IDs or questions in one call, in input order. Shares the CLI xerj batch-search adapter. Each result has its zero-based position, optional caller key, and status hits, abstain (only a complete empty search), or error. Hits carry citations: index/id plus file/line or record locator when available. This retrieves evidence, not generated answers or calibrated confidence. Use identifier plus an explicitly keyword-mapped field for exact IDs; query takes plain text or an ES query clause. One bad item never discards its siblings; identical inputs remain separate. Uses one _msearch request, plus at most one mapping read. Omitted or null max_tokens defaults to 8000 UAX #29 words and caps the entire successful JSON response using StandardTokenizer UAX #29 words, not BPE. Budgeting removes raw hit bodies, then extra hits, retaining each item's status and at least one citation per matched item. If that minimum cannot fit, returns an actionable tool error, never truncated JSON or a false abstention. Errors are not truncated.",
         "inputSchema":{
             "type":"object", "additionalProperties":false,
             "properties":{
                 "queries":{"type":"array","minItems":1,"maxItems":50,
-                    "description":"Ordered queries. Duplicate keys are allowed; position is authoritative. Entire input is limited to 1 MiB.",
-                    "items":{"type":"object","additionalProperties":false,"properties":{
+                    "description":"Ordered queries. A plain string item is shorthand for {\"query\": <string>}. Duplicate keys are allowed; position is authoritative. Entire input is limited to 1 MiB.",
+                    "items":{"anyOf":[{"type":"string","minLength":1},{"type":"object","additionalProperties":false,"properties":{
                         "key":{"type":"string","description":"Optional correlation key, at most 256 UTF-8 bytes."},
                         "query":{"oneOf":[{"type":"string","minLength":1},{"type":"object"}],
                             "description":"Plain text or ES query clause. Cannot be combined with identifier/field."},
                         "identifier":{"type":"string","minLength":1,"description":"Exact value, used verbatim in a term query; requires field."},
                         "field":{"type":"string","minLength":1,"description":"Flat keyword field for identifier. Must be mapped as keyword wherever present; unreadable, absent or conflicting mappings fail this item."}
-                    }, "oneOf":[{"required":["query"]},{"required":["identifier","field"]}]}},
+                    }, "oneOf":[{"required":["query"]},{"required":["identifier","field"]}]}]}},
                 "index":{"type":"string","description":"Index or pattern; alternative to prefix. Defaults to ax-*."},
                 "prefix":{"type":"string","description":"Autoindex prefix, e.g. project searches project-*. Cannot combine with index."},
                 "size":{"type":"integer","minimum":1,"maximum":50,"default":3,"description":"Maximum hits per item."},
-                "max_tokens":{"type":"integer","minimum":32,"description":format!("Whole-response budget counted with {} (not BPE); minimum 32. A successful response NEVER exceeds it. Preserves ordered item outcomes and at least one citation per matched item, removing raw bodies first. Refuses if that minimum cannot fit; split the batch or increase the budget. Errors are outside this budget.", token_budget::TOKENIZER_NAME)}
+                "max_tokens":{"type":"integer","minimum":32,"default":token_budget::DEFAULT_MAX_TOKENS,"description":format!("Whole-response budget counted with {} (not BPE or a byte cap); minimum 32. Omitted or null defaults to 8000 words; pass a larger integer for more. A successful response NEVER exceeds it. Preserves ordered item outcomes and at least one citation per matched item, removing raw bodies first. Refuses if that minimum cannot fit; split the batch or increase the budget. Errors are outside this budget.", token_budget::TOKENIZER_NAME)}
             },"required":["queries"]
         }
     })
@@ -393,6 +393,14 @@ pub(crate) async fn execute(ctx: &Ctx, args: &Value) -> Result<String, String> {
         limit,
         items,
     } = envelope(args)?;
+    // #2497: a bare string item is shorthand for {"query": <string>}.
+    let items: Vec<Value> = items
+        .iter()
+        .map(|item| match item {
+            Value::String(s) => json!({ "query": s }),
+            other => other.clone(),
+        })
+        .collect();
     // Validate locally before any I/O; invalid items do not sink siblings.
     let validation: Vec<_> = items.iter().map(validate_item).collect();
     let needs_mapping = items.iter().zip(&validation).any(|(item, valid)| {
