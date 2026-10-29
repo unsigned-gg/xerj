@@ -320,7 +320,9 @@ HTTP Request
 | `xerj-hub` | Corpus Hub v2 client behind `xerj ask` / `xerj "<question>"`, `xerj hub …` and `xerj code <corpus> --def`: pulls, verifies and restores signed pre-indexed packs, builds them for CI, and routes a question to a corpus. Depends on `xerj-autoindex`; the engine does not link it |
 | `xerj-sandbox` | OS-level sandboxed execution (Landlock V2 on Linux, Seatbelt on macOS), out-of-band containment evidence verification, and single-consumption retained-run custody adapted from [`unsigned-gg/sbx`](https://github.com/unsigned-gg/sbx) (contributions and collaboration on isolate primitives welcome at `unsigned-gg/sbx`) |
 | `xerj-wasm` | Pluggable ingest-time document transform pipeline |
-| `xtask` | Scoped repository automation and Cargo workspace manifest verification (`cargo xtask <manifest-check\|workflow-timeout-check\|xwork>`) |
+| `lsc-core` | Zero-I/O pure domain models for Lean 4 spec AST parsing, Projectfile v1 interpolation and CI DAG lowering, validation receipts, and CAS hashes vendored from [`unsigned-gg/lsc`](https://github.com/unsigned-gg/lsc) |
+| `lsc` | LeanSpec parser, structural AST validator, Projectfile v1 compiler, and CAS listing engine CLI vendored from [`unsigned-gg/lsc`](https://github.com/unsigned-gg/lsc) |
+| `xtask` | Scoped repository automation, Projectfile v1 verification, and deterministic verification pipeline lowered via `lsc-core` (`cargo xtask <projectfile-check\|manifest-check\|stages-check\|workflow-timeout-check\|xwork>`) |
 
 Every crate under `crates/` appears in this table — `crates/xerj-engine/tests/docs_capability_lists.rs`
 fails if one is missing or if the table names a crate that no longer exists. Five of them

@@ -1,0 +1,18 @@
+[package]
+name = "lsc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Zero-I/O pure domain models for Lean 4 spec AST parsing, theorem statements, and CAS hashes."
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+

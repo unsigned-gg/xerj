@@ -20,6 +20,8 @@ members = [
     "crates/xerj-autoindex",
     "crates/xerj-hub",
     "crates/xerj-sandbox",
+    "crates/lsc-core",
+    "crates/lsc",
     "crates/xtask",
     "tests/es-compat-yaml",
 ]
@@ -57,7 +59,11 @@ tower-http = { version = "0.5", features = ["cors", "trace", "limit", "decompres
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
 simd-json = "0.14"
+# Spec & Projectfile verification
+blake3 = { version = "1.8", default-features = false }
+lsc-core = { path = "crates/lsc-core" }
 # SIMD-accelerated byte search
 memchr = "2"
 # Config
