@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Vendor `lsc-core` and `lsc` from `unsigned-gg/lsc` (`v0.2.0`) under
+  `engine/crates/lsc-core` and `engine/crates/lsc` as path dependencies with
+  `version.workspace = true`, and wire `engine/crates/xtask` to lower
+  `projectfile.yaml` offline via `lsc-core` (`projectfile-check`,
+  `stages-check`, `stages-gen`, `toolchain-check`, `receipt-check`, `xwork`, and
+  the `SPEC-0004` `XT-1..XT-11` gates) (#1461).
+
 ## [1.0.0-rc.100] - 2026-10-26
 
 **rc.100: faster autoindex and search, shaped by your field reports.** This
