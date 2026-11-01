@@ -133,6 +133,9 @@ impl Client {
     }
 
     pub fn release(&self, tag: &str) -> Result<Release> {
+        if !crate::version::valid_tag(tag) {
+            bail!("'{tag}' is not a vX.Y.Z tag");
+        }
         let resp = self.get(
             self.api_url(&format!("releases/tags/{tag}"))?,
             "application/vnd.github+json",
@@ -154,7 +157,7 @@ impl Client {
                 continue;
             }
             if let Some(tag) = r.get("tag_name").and_then(|x| x.as_str()) {
-                if tag.starts_with('v') && crate::version::Version::parse(tag).is_ok() {
+                if crate::version::valid_tag(tag) {
                     return Ok(tag.to_string());
                 }
             }

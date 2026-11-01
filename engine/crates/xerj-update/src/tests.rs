@@ -431,3 +431,136 @@ fn argument_parsing() {
 fn tag_commit_const_is_a_full_sha() {
     assert_eq!(COMMIT.len(), 40);
 }
+
+#[test]
+fn a_tag_with_url_text_is_refused_before_any_request() {
+    let e = env(vec![rel("1.0.0-rc.101", &script("1.0.0-rc.101"))]);
+    for bad in [
+        "v1.0.0-rc.101+build",
+        "v1.0.1/../../x",
+        "v1.0.1?x=1",
+        "1.0.1",
+    ] {
+        let msg = err(update(
+            &e.cfg(),
+            &Options {
+                tag: Some(bad.into()),
+                ..Options::default()
+            },
+        ));
+        assert!(msg.contains("not a vX.Y.Z tag"), "{bad}: {msg}");
+    }
+    assert_eq!(
+        e.server.seen.lock().unwrap().len(),
+        0,
+        "no request was made"
+    );
+}
+
+#[test]
+fn a_repo_that_is_not_owner_slash_name_is_refused() {
+    let e = env(vec![rel("1.0.0-rc.101", &script("1.0.0-rc.101"))]);
+    for bad in ["o", "o/r/x", "../r", "o/r?x=1"] {
+        let mut cfg = e.cfg();
+        cfg.repo = bad.into();
+        let msg = err(update(&cfg, &Options::default()));
+        assert!(msg.contains("<owner>/<repo>"), "{bad}: {msg}");
+    }
+    assert_eq!(e.server.seen.lock().unwrap().len(), 0);
+}
+
+/// A one-route-table HTTP listener that answers with raw response bytes, and
+/// records the Authorization header of every request it receives.
+fn raw_server(respond: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Seen = Arc::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            let auth = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                .map(|l| l.to_string());
+            log.lock().unwrap().push((path.clone(), auth));
+            let _ = s.write_all(&respond(&path));
+        }
+    });
+    Server { base, seen }
+}
+
+fn http_ok(body: &[u8]) -> Vec<u8> {
+    let mut r = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    r.extend_from_slice(body);
+    r
+}
+
+fn asset(url: String) -> github::Asset {
+    github::Asset {
+        name: "x".into(),
+        url,
+        size: 0,
+    }
+}
+
+#[test]
+fn a_redirect_to_another_host_does_not_carry_the_token() {
+    let store = raw_server(|_| http_ok(b"object-bytes"));
+    let store_url = format!("{}/blob", store.base);
+    let api = raw_server(move |_| {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {store_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    });
+    let client = github::Client::new(&api.base, "o/r", Some("secret-token-value".into())).unwrap();
+    let got = client
+        .download(
+            &asset(format!("{}/repos/o/r/releases/assets/1", api.base)),
+            1024,
+        )
+        .unwrap();
+    assert_eq!(got, b"object-bytes");
+    let api_seen = api.seen.lock().unwrap();
+    assert!(
+        api_seen[0]
+            .1
+            .as_deref()
+            .is_some_and(|h| h.contains("Bearer ")),
+        "the API origin did get the token"
+    );
+    let store_seen = store.seen.lock().unwrap();
+    assert_eq!(store_seen.len(), 1);
+    assert_eq!(
+        store_seen[0].1, None,
+        "the redirect target must not see the token"
+    );
+}
+
+#[test]
+fn an_asset_url_on_a_foreign_origin_is_fetched_without_the_token() {
+    let foreign = raw_server(|_| http_ok(b"foreign-bytes"));
+    let api = raw_server(|_| http_ok(b"{}"));
+    let client = github::Client::new(&api.base, "o/r", Some("secret-token-value".into())).unwrap();
+    let got = client
+        .download(&asset(format!("{}/a", foreign.base)), 1024)
+        .unwrap();
+    assert_eq!(got, b"foreign-bytes");
+    assert_eq!(foreign.seen.lock().unwrap()[0].1, None);
+    assert_eq!(api.seen.lock().unwrap().len(), 0);
+}

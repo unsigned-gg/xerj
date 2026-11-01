@@ -84,6 +84,32 @@ impl PartialOrd for Version {
     }
 }
 
+/// A release tag as it may appear in a URL path: `v<MAJOR>.<MINOR>.<PATCH>` with an
+/// optional `-pre.release` part, nothing else (no `+build`, no slashes, no spaces).
+pub fn valid_tag(tag: &str) -> bool {
+    tag.starts_with('v')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && Version::parse(tag).is_ok()
+}
+
+/// `<owner>/<repo>`: one slash, each side GitHub-name characters, no dot-only parts.
+pub fn valid_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let ok = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    };
+    ok(owner) && ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +155,36 @@ mod tests {
             "v1.2.3.4",
         ] {
             assert!(Version::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tags_are_strict_before_they_reach_a_url() {
+        for good in ["v1.2.3", "v1.0.0-rc.100"] {
+            assert!(valid_tag(good), "{good}");
+        }
+        for bad in [
+            "1.2.3",
+            "v1.2.3+build",
+            "v1.2.3/../x",
+            "v1.2.3 ",
+            "v1.2.3?x=1",
+            "v1.2.3#f",
+            "v1.2",
+            "main",
+        ] {
+            assert!(!valid_tag(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn repos_are_owner_slash_name() {
+        assert!(valid_repo("unsigned-gg/xerj"));
+        assert!(valid_repo("a.b/c_d-e"));
+        for bad in [
+            "", "xerj", "a/b/c", "/b", "a/", "../x", "a/..", "a b/c", "a/b?x", "a/b#f", "a:b/c",
+        ] {
+            assert!(!valid_repo(bad), "{bad}");
         }
     }
 }

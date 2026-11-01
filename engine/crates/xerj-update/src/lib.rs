@@ -140,11 +140,14 @@ pub fn update(cfg: &Config, opts: &Options) -> Result<Outcome> {
         let reported = swap::rollback(&cfg.exe)?;
         return Ok(Outcome::RolledBack { reported });
     }
+    if !version::valid_repo(&cfg.repo) {
+        bail!("'{}' is not an <owner>/<repo> name", cfg.repo);
+    }
     let current = Version::parse(&cfg.current_version).map_err(anyhow::Error::msg)?;
     let client = github::Client::new(&cfg.api_base, &cfg.repo, cfg.token.clone())?;
     let tag = match &opts.tag {
         Some(t) => {
-            if !t.starts_with('v') || Version::parse(t).is_err() {
+            if !version::valid_tag(t) {
                 bail!("'{t}' is not a vX.Y.Z tag");
             }
             t.clone()
@@ -208,7 +211,8 @@ const USAGE: &str = "usage: xerj update [--check] [--tag vX.Y.Z] [--rollback]
   --tag TAG    use this release instead of the newest
   --rollback   put the previous binary (xerj.bak) back
 
-environment: XERJ_UPDATE_REPO (default unsigned-gg/xerj), GITHUB_TOKEN or
+environment: XERJ_UPDATE_REPO (an <owner>/<repo>; default unsigned-gg/xerj, and
+the provenance check is pinned to whichever repo this names), GITHUB_TOKEN or
 GH_TOKEN (optional; the fork is public)";
 
 fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
