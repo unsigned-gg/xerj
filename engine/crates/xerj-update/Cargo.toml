@@ -1,0 +1,16 @@
+[package]
+name = "xerj-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "xerj update: fetch the newest release of the unsigned-gg/xerj fork, verify it against the release manifest, and swap the running binary atomically"
+
+[dependencies]
+anyhow.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+tempfile.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
