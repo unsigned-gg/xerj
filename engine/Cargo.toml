@@ -19,6 +19,7 @@ members = [
     "crates/xerj-console-api",
     "crates/xerj-autoindex",
     "crates/xerj-hub",
+    "crates/xerj-update",
     "crates/xerj-sandbox",
     "crates/lsc-core",
     "crates/lsc",

@@ -7869,6 +7869,7 @@ dependencies = [
  "xerj-mcp",
  "xerj-query",
  "xerj-storage",
+ "xerj-update",
  "xerj-vector",
 ]
 
@@ -7905,6 +7906,19 @@ dependencies = [
  "xerj-common",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "xerj-update"
+version = "1.0.0-rc.100"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
 ]
 
 [[package]]

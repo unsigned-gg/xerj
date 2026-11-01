@@ -186,6 +186,7 @@ fn is_top_level_command(arg: &str) -> bool {
             | "code"
             | "corpus"
             | "hub"
+            | "update"
             | "ask"
             | "mcp"
             | "__extract-pdf"
@@ -4189,6 +4190,17 @@ async fn async_main() -> Result<()> {
         let code = tokio::task::spawn_blocking(move || xerj_autoindex::xc::run_corpus_cli(&args))
             .await
             .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("update")) {
+        // Move this binary to the newest release of the fork (or back with
+        // --rollback). Blocking HTTP and file work: off the async runtime.
+        let args: Vec<String> = xerj_common::argv::args_after_subcommand();
+        let code = tokio::task::spawn_blocking(move || {
+            xerj_update::run_cli(env!("CARGO_PKG_VERSION"), &args)
+        })
+        .await
+        .unwrap_or(1);
         std::process::exit(code);
     }
     if matches!(argv1.as_deref(), Some("hub")) {
