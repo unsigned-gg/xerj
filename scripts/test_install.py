@@ -197,6 +197,25 @@ class RefusalTests(InstallTest):
         self.release.write_manifest(tag="v9.9.9")
         self.assert_refused(self.run_install(TAG), "manifest")
 
+    def test_compact_two_entry_manifest_with_the_host_entry_first(self):
+        # One-line JSON, host entry first, a decoy last: a parser that splits
+        # badly and reads the last object would take the decoy's hash.
+        r = self.release
+        manifest = {
+            "package": "xerj", "channel": "stable", "version": VERSION, "tag": TAG,
+            "tag_commit": COMMIT,
+            "artifacts": [
+                {"archive": r.archive, "binary": "xerj", "sha256": r.digest,
+                 "size": (r.dir / r.archive).stat().st_size, "target": r.target},
+                {"archive": "xerj-1.2.3-x86_64-pc-windows-msvc.zip", "binary": "xerj.exe",
+                 "sha256": "0" * 64, "size": 1, "target": "x86_64-pc-windows-msvc"},
+            ],
+        }
+        (r.dir / "xerj-1.2.3-manifest.json").write_text(json.dumps(manifest))
+        res = self.run_install(TAG)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertEqual(self.installed().read_bytes(), fake_binary())
+
     def test_manifest_missing(self):
         (self.release.dir / "xerj-1.2.3-manifest.json").unlink()
         self.assert_refused(self.run_install(TAG), "manifest")
@@ -210,6 +229,14 @@ class RefusalTests(InstallTest):
         self.assertIn("--version", r.stdout + r.stderr)
         self.assertEqual(self.installed().read_bytes(), b"old-binary")
         self.assertFalse((self.dest / "xerj.bak").exists())
+
+    def test_version_prefix_of_a_longer_version_is_refused(self):
+        # A binary reporting 1.2.3-rc.10 must not pass for 1.2.3.
+        Release.__init__(self.release, self.root, binary=fake_binary("1.2.3-rc.10"))
+        r = self.run_install(TAG)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--version", r.stdout + r.stderr)
+        self.assertFalse(self.installed().exists())
 
     def test_refusal_leaves_an_existing_binary_alone(self):
         self.dest.mkdir()

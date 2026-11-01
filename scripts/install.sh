@@ -130,12 +130,12 @@ want="$(awk -v n="$ARCHIVE" '$2 == n { print $1 }' "$WORK/$SUMS" | head -n 1)"
 say "ok   $ARCHIVE matches $SUMS"
 
 # --- manifest -----------------------------------------------------------------
-# One artifact is one flat JSON object, so split the file after each closing
-# brace and read the object that names this archive.
+# One artifact is one flat JSON object, so split the file at each closing
+# brace (tr, not GNU-only sed escapes) and read the object that names this archive.
 flat="$(tr -d '\n\r' < "$WORK/$MANIFEST")"
 m_tag="$(printf '%s' "$flat" | sed -n 's/.*"tag": *"\([^"]*\)".*/\1/p')"
 [ "$m_tag" = "$TAG" ] || die "$MANIFEST: manifest is for tag '$m_tag', not $TAG"
-entry="$(printf '%s' "$flat" | sed 's/}/}\n/g' | grep "\"archive\": *\"$ARCHIVE\"" | head -n 1 || true)"
+entry="$(printf '%s' "$flat" | tr '}' '\n' | grep "\"archive\": *\"$ARCHIVE\"" | head -n 1 || true)"
 [ -n "$entry" ] || die "$MANIFEST: no entry for $ARCHIVE"
 m_sha="$(printf '%s' "$entry" | sed -n 's/.*"sha256": *"\([0-9a-f]*\)".*/\1/p')"
 m_size="$(printf '%s' "$entry" | sed -n 's/.*"size": *\([0-9][0-9]*\).*/\1/p')"
@@ -164,8 +164,9 @@ NEW_BIN="$WORK/unpack/xerj-$VERSION-$TARGET/xerj"
 chmod 755 "$NEW_BIN"
 if [ "$HOST_RUNS" = 1 ]; then
   reported="$("$NEW_BIN" --version 2>&1 || true)"
+  # Match the version as a whole word: 1.0.0-rc.10 must not pass for 1.0.0-rc.1.
   case "$reported" in
-    "xerj v$VERSION"*) say "ok   binary --version: $reported" ;;
+    "xerj v$VERSION"|"xerj v$VERSION "*) say "ok   binary --version: $reported" ;;
     *) die "the binary's --version says '$reported', expected 'xerj v$VERSION'; nothing was installed" ;;
   esac
 else
