@@ -252,6 +252,170 @@ impl TeamRhythmAndScaleAudit {
     }
 }
 
+/// Principle 3 of the 7-Principle Sales & Problem-Solving Canon (`xc-iopsych-corpus`:
+/// `iopsych-sales-problem-solving-canon`):
+/// "People buy 4 things and 4 things only. Ever. Those 4 things are time, money, sex,
+/// and approval/peace of mind. If you try selling something other than those 4 things
+/// you will fail."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuyerDriver {
+    /// Saves human or agent execution time (e.g., zero ingestion pipeline authoring, 1.5x-2.7x fewer turns).
+    Time,
+    /// Saves or generates money (e.g., lower compute/token spend, single static binary replacing a JVM cluster).
+    Money,
+    /// Elevates status, attraction, or prestige for the buyer.
+    Sex,
+    /// Delivers approval, certainty, compliance, and peace of mind (e.g., `ax_path:match_line` ground-truth citations).
+    ApprovalPeaceOfMind,
+}
+
+impl BuyerDriver {
+    /// Canonical snake_case wire label for this buyer driver.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Money => "money",
+            Self::Sex => "sex",
+            Self::ApprovalPeaceOfMind => "approval_peace_of_mind",
+        }
+    }
+}
+
+/// Principle 4 of the 7-Principle Sales & Problem-Solving Canon:
+/// "People buy aspirin always. They buy vitamins only occasionally and at unpredictable times. Sell aspirin."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PainClass {
+    /// Acute, immediate operational pain that buyers purchase predictably in every cycle.
+    Aspirin,
+    /// Optional nice-to-have improvement bought only occasionally and at unpredictable times.
+    Vitamin,
+}
+
+impl PainClass {
+    /// Canonical snake_case wire label for this pain classification.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aspirin => "aspirin",
+            Self::Vitamin => "vitamin",
+        }
+    }
+}
+
+/// Verdict from evaluating a product positioning, demo flow, or commercial offer against
+/// the 7-Principle Sales & Problem-Solving Canon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SalesCanonVerdict {
+    /// Satisfies all 7 principles: walks up and hits the ball, focuses on people and problem solving,
+    /// anchors in the 4 buyer drivers, sells Aspirin, establishes product parity + friendship,
+    /// practices unconditional value-first generosity, and leaks zero internal metrics.
+    HitTheBallAspirin,
+    /// Violates Principle 7: leaks internal quota, payroll, opex, or burn rate to the buyer.
+    InternalMetricLeakage,
+    /// Violates Principle 2: pitches technology, lines of code, or jargon instead of the human problem.
+    TechJargonOverProblem,
+    /// Violates Principle 3: fails to anchor in Time, Money, Sex, or Approval/Peace of Mind.
+    MissingBuyerDriver,
+    /// Violates Principle 4: pitches an optional Vitamin instead of acute Aspirin pain relief.
+    VitaminPitch,
+    /// Violates Principle 1: overcomplicates execution instead of walking up and hitting the ball.
+    OvercomplicatedFunnel,
+    /// Violates Principle 5 or 6: lacks baseline product parity ("make everything else equal")
+    /// or gates help transactionally instead of practicing unconditional value-first generosity.
+    TransactionalOrLowParity,
+}
+
+impl SalesCanonVerdict {
+    /// Canonical snake_case wire label for this verdict.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HitTheBallAspirin => "hit_the_ball_aspirin",
+            Self::InternalMetricLeakage => "internal_metric_leakage",
+            Self::TechJargonOverProblem => "tech_jargon_over_problem",
+            Self::MissingBuyerDriver => "missing_buyer_driver",
+            Self::VitaminPitch => "vitamin_pitch",
+            Self::OvercomplicatedFunnel => "overcomplicated_funnel",
+            Self::TransactionalOrLowParity => "transactional_or_low_parity",
+        }
+    }
+}
+
+/// Pure domain evaluation of a product surface, GTM motion, or customer interaction against
+/// the 7-Principle Sales & Problem-Solving Canon (`xc-iopsych-corpus`: `iopsych-sales-problem-solving-canon`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SalesCanonEval {
+    /// Principle 1 ("Walk up and hit the ball"): direct execution simplicity in `[0.0, 1.0]`.
+    pub direct_execution_score: f64,
+    /// Principle 2 ("People and problem solving, not lines of code"): human problem focus in `[0.0, 1.0]`.
+    pub problem_over_tech_ratio: f64,
+    /// Principle 3 ("People buy 4 things and 4 things only"): anchored buyer drivers.
+    pub buyer_drivers: Vec<BuyerDriver>,
+    /// Principle 4 ("Sell aspirin, not vitamins"): pain classification.
+    pub pain_class: PainClass,
+    /// Principle 5 ("Make everything else equal, then go make a lot of friends"):
+    /// product parity/quality score in `[0.0, 1.0]`.
+    pub product_parity_score: f64,
+    /// Principle 5 & 6 ("Go make a lot of friends" + "Being valuable and useful expecting nothing in return"):
+    /// authentic value-first generosity and relationship warmth in `[0.0, 1.0]`.
+    pub value_first_generosity_score: f64,
+    /// Principle 7 ("No one cares about your quota, payroll, opex, burn rate"):
+    /// `true` if any internal company metric is leaked into the external pitch.
+    pub leaks_internal_metrics: bool,
+    /// Resulting 7-Principle Sales Canon verdict.
+    pub verdict: SalesCanonVerdict,
+}
+
+impl SalesCanonEval {
+    /// Evaluate a product pitch, demo, or commercial workflow against all 7 principles.
+    #[must_use]
+    pub fn evaluate(
+        direct_execution_score: f64,
+        problem_over_tech_ratio: f64,
+        buyer_drivers: Vec<BuyerDriver>,
+        pain_class: PainClass,
+        product_parity_score: f64,
+        value_first_generosity_score: f64,
+        leaks_internal_metrics: bool,
+    ) -> Self {
+        let direct = direct_execution_score.clamp(0.0, 1.0);
+        let problem = problem_over_tech_ratio.clamp(0.0, 1.0);
+        let parity = product_parity_score.clamp(0.0, 1.0);
+        let generosity = value_first_generosity_score.clamp(0.0, 1.0);
+
+        let verdict = if leaks_internal_metrics {
+            SalesCanonVerdict::InternalMetricLeakage
+        } else if problem < 0.60 {
+            SalesCanonVerdict::TechJargonOverProblem
+        } else if buyer_drivers.is_empty() {
+            SalesCanonVerdict::MissingBuyerDriver
+        } else if pain_class == PainClass::Vitamin {
+            SalesCanonVerdict::VitaminPitch
+        } else if direct < 0.60 {
+            SalesCanonVerdict::OvercomplicatedFunnel
+        } else if parity < 0.75 || generosity < 0.70 {
+            SalesCanonVerdict::TransactionalOrLowParity
+        } else {
+            SalesCanonVerdict::HitTheBallAspirin
+        };
+
+        Self {
+            direct_execution_score: direct,
+            problem_over_tech_ratio: problem,
+            buyer_drivers,
+            pain_class,
+            product_parity_score: parity,
+            value_first_generosity_score: generosity,
+            leaks_internal_metrics,
+            verdict,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +501,62 @@ mod tests {
             TeamRhythmAndScaleAudit::evaluate(5, true, 0.98, true, true, principles, state);
         assert!(!recorded_meeting.never_recorded_compliant);
         assert!(!recorded_meeting.is_healthy());
+    }
+
+    #[test]
+    fn sales_canon_enforces_seven_principles_aspirin_four_drivers_and_zero_metric_leakage() {
+        let xerj_flagship = SalesCanonEval::evaluate(
+            0.92,
+            0.90,
+            vec![
+                BuyerDriver::Time,
+                BuyerDriver::Money,
+                BuyerDriver::ApprovalPeaceOfMind,
+            ],
+            PainClass::Aspirin,
+            0.95,
+            0.92,
+            false,
+        );
+        assert_eq!(xerj_flagship.verdict, SalesCanonVerdict::HitTheBallAspirin);
+
+        let leaked_quota = SalesCanonEval::evaluate(
+            0.90,
+            0.90,
+            vec![BuyerDriver::Time],
+            PainClass::Aspirin,
+            0.90,
+            0.90,
+            true,
+        );
+        assert_eq!(
+            leaked_quota.verdict,
+            SalesCanonVerdict::InternalMetricLeakage
+        );
+
+        let vitamin_pitch = SalesCanonEval::evaluate(
+            0.85,
+            0.85,
+            vec![BuyerDriver::Time],
+            PainClass::Vitamin,
+            0.90,
+            0.85,
+            false,
+        );
+        assert_eq!(vitamin_pitch.verdict, SalesCanonVerdict::VitaminPitch);
+
+        let code_jargon = SalesCanonEval::evaluate(
+            0.85,
+            0.35,
+            vec![BuyerDriver::Money],
+            PainClass::Aspirin,
+            0.90,
+            0.85,
+            false,
+        );
+        assert_eq!(
+            code_jargon.verdict,
+            SalesCanonVerdict::TechJargonOverProblem
+        );
     }
 }

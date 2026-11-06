@@ -25,9 +25,9 @@ pub use document::{
     ValidationReport,
 };
 pub use leadership::{
-    CommunicationArchetype, EngineeringPrincipleVerdict, InteroceptiveStateEval, StateDiagnosis,
-    TeamRhythmAndScaleAudit, TopThreePrinciplesEval, INTEROCEPTIVE_TIMEOUT_MINUTES,
-    WES_BROWN_MAX_SPAN_OF_CONTROL,
+    BuyerDriver, CommunicationArchetype, EngineeringPrincipleVerdict, InteroceptiveStateEval,
+    PainClass, SalesCanonEval, SalesCanonVerdict, StateDiagnosis, TeamRhythmAndScaleAudit,
+    TopThreePrinciplesEval, INTEROCEPTIVE_TIMEOUT_MINUTES, WES_BROWN_MAX_SPAN_OF_CONTROL,
 };
 pub use lean::{
     extract_lean_blocks, parse_lean_source, LeanConstructor, LeanDeclaration, LeanDef, LeanField,
@@ -42,9 +42,10 @@ pub use projectfile::{
     XtaskTargetOptions,
 };
 pub use receipt::{
-    parse_libtest_counts, LibtestCounts, ReceiptCacheState, ReceiptResult, ValidationGateReceipt,
-    ValidationReceipt, ValidityFingerprint, ValidityInput, ValidityInputKind, ValidityStrength,
-    VALIDATION_RECEIPT_SCHEMA_VERSION, VALIDITY_FINGERPRINT_SCHEMA_VERSION,
+    parse_libtest_counts, parse_libtest_proof, LibtestCounts, ReceiptCacheState, ReceiptResult,
+    ValidationGateReceipt, ValidationReceipt, ValidityFingerprint, ValidityInput,
+    ValidityInputKind, ValidityStrength, VALIDATION_RECEIPT_SCHEMA_VERSION,
+    VALIDITY_FINGERPRINT_SCHEMA_VERSION,
 };
 pub use rules::{
     parse_file_name, parse_folder_name, parse_folder_spec, parse_spec, LEGACY_SECTIONS,

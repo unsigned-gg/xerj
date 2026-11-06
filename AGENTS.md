@@ -290,6 +290,7 @@ time — is [scripts/seo/README.md](./scripts/seo/README.md).
 | XERJ vs Lucene architecture comparison | [docs/XERJ_VS_LUCENE.md](./docs/XERJ_VS_LUCENE.md) |
 | Pre-submission and review protocol | [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md) |
 | Wes Brown's engineering leadership canon & Top 3 Principles | [docs/WES_BROWN_LEADERSHIP_CANON.md](./docs/WES_BROWN_LEADERSHIP_CANON.md) · domain evaluator: `engine/crates/lsc-core/src/leadership.rs` |
+| The 7-Principle Sales & Problem-Solving Canon (Aspirin vs. Vitamins, 4 Buyer Drivers, Walk Up and Hit the Ball) | [docs/SALES_AND_PROBLEM_SOLVING_CANON.md](./docs/SALES_AND_PROBLEM_SOLVING_CANON.md) · domain evaluator: `engine/crates/lsc-core/src/leadership.rs` |
 | How to send a bug or a fix back upstream (written for agents) | [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md) |
 | Checking a published release is actually good | `scripts/verify-release.sh [tag]` — downloads every asset, asserts every target we ship is present, verifies checksums, asserts each binary reports its tag's version, then boots the host-native binary and runs a real search (Linux and macOS hosts; on a host where it cannot run one it says so and exits non-zero rather than passing) |
 | The `.deb` release asset and the Debian-archive question | [docs/PACKAGING_DEBIAN.md](./docs/PACKAGING_DEBIAN.md) · regenerate the dependency-coverage measurement with `scripts/debian-rust-coverage.sh --verbose` |
