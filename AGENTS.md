@@ -75,6 +75,7 @@ cannot push at all: [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md)
 - **Every CI job declares a `timeout-minutes`.** A job without one runs against GitHub's 360-minute default, and three of this repo's workflows serialise on a concurrency group that never auto-cancels — so one hung job holds that slot for hours and every later run queues behind it — during #751 one hung `Build + Test` ran into that 360-minute default, and a second hang the same morning discarded seven consecutive `main` pushes without running a single job. `python3 .github/scripts/workflow-timeout-guard.py` enforces it and runs as a merge gate; size a new job's cap from what the job actually measures, generously — a cap that false-fails a slow-but-healthy run is worse than the hang it guards against.
 - **Git discipline:** non-trivial changes land with full commit bodies (motivation, before/after numbers, root cause, file pointers) — the git history is the project's engineering log; read it before re-deriving decisions.
 - **Review discipline:** before submitting or updating a non-trivial change, run the applicable audit in [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md). In particular, audit the effective diff and ancestry, preserve existing workflows and recovery paths, test failure atomicity and durable-state transitions, and support user-visible or performance claims with repository-visible evidence.
+- **Wes Brown's Top 3 Engineering Principles & Leadership Practices ([docs/WES_BROWN_LEADERSHIP_CANON.md](./docs/WES_BROWN_LEADERSHIP_CANON.md), `lsc_core::leadership`):** (1) Determine the actual root problem being solved that has the most impact (`SymptomWorkaround` changes are refused); (2) Be cognizant of the cost of an approach in time, complexity, and ongoing maintenance burden; (3) Determine the "good enough" point (the 80% solution to 80% of the problem) and recognize that perfection is the enemy of good (`ShipEightyTwenty` over `PerfectionismTrap`). Generate upward status from shipped artifacts (PRs, commit bodies, `ValidationReceipt`s) rather than parallel ticket theater; keep all technical discussions public-by-default in shared searchable surfaces (never in 1:1 DMs; synchronous exploratory syncs are never recorded); state explicit trade-offs when scope shifts; and when friction or a retry loop occurs, **debug the state, not the argument** (`InteroceptiveStateEval`: checkpoint and reset when continuous work >= 240m, node RSS/context >= 85%, or retries >= 3).
 
 ## Running an index on someone's machine
 
@@ -288,6 +289,7 @@ time — is [scripts/seo/README.md](./scripts/seo/README.md).
 | Maintaining the website: article generator, URL map, SEO merge gates | [scripts/seo/README.md](./scripts/seo/README.md) |
 | XERJ vs Lucene architecture comparison | [docs/XERJ_VS_LUCENE.md](./docs/XERJ_VS_LUCENE.md) |
 | Pre-submission and review protocol | [docs/CONTRIBUTION_REVIEW.md](./docs/CONTRIBUTION_REVIEW.md) |
+| Wes Brown's engineering leadership canon & Top 3 Principles | [docs/WES_BROWN_LEADERSHIP_CANON.md](./docs/WES_BROWN_LEADERSHIP_CANON.md) · domain evaluator: `engine/crates/lsc-core/src/leadership.rs` |
 | How to send a bug or a fix back upstream (written for agents) | [.github/AI_CONTRIBUTIONS.md](./.github/AI_CONTRIBUTIONS.md) |
 | Checking a published release is actually good | `scripts/verify-release.sh [tag]` — downloads every asset, asserts every target we ship is present, verifies checksums, asserts each binary reports its tag's version, then boots the host-native binary and runs a real search (Linux and macOS hosts; on a host where it cannot run one it says so and exits non-zero rather than passing) |
 | The `.deb` release asset and the Debian-archive question | [docs/PACKAGING_DEBIAN.md](./docs/PACKAGING_DEBIAN.md) · regenerate the dependency-coverage measurement with `scripts/debian-rust-coverage.sh --verbose` |
@@ -298,3 +300,9 @@ time — is [scripts/seo/README.md](./scripts/seo/README.md).
 2. Read the caveats in llms.txt before crediting or discrediting a capability — they are kept current and load-bearing.
 3. Benchmarks: closed-loop, cache-off, correctness-checked (faster-but-wrong counts as a loss), independently re-measured before publication — reproduce them from `demo/playbooks/` rather than trusting or dismissing the headline.
 4. The right competitor for the flagship use case is "a human writing ingestion pipelines," not Elasticsearch's query DSL.
+
+## Canonical Estate References (`handbook` & `agentic`)
+
+All agents working in this repository must consult the two canonical estate reference repositories:
+- **`cerebral-work/handbook`** (`~/projects/mesh/comms/handbook/`): Organizational handbook (`START-HERE.md`, `where-things-live.md`, `how-to-get-merged.md`, `people.md`, `communicate-in-controlled-language.md`, and `sops/`).
+- **`unsigned-gg/agentic`** (`~/projects/agents/harness/agentic/`): Shared agent harness configurations, reusable skills (`packages/skills/`), lane personas (`packages/claude-agents/bin/lane-persona`), and estate context (`packages/context/estate.md`, `~/.agents/estate.md`).

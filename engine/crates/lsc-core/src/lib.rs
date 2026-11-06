@@ -10,6 +10,7 @@
 
 pub mod cas;
 pub mod document;
+pub mod leadership;
 pub mod lean;
 pub mod projectfile;
 pub mod receipt;
@@ -22,6 +23,11 @@ pub use cas::{
 pub use document::{
     SpecDocument, SpecFrontmatter, SpecPriority, SpecSection, SpecStatus, ValidationMessage,
     ValidationReport,
+};
+pub use leadership::{
+    CommunicationArchetype, EngineeringPrincipleVerdict, InteroceptiveStateEval, StateDiagnosis,
+    TeamRhythmAndScaleAudit, TopThreePrinciplesEval, INTEROCEPTIVE_TIMEOUT_MINUTES,
+    WES_BROWN_MAX_SPAN_OF_CONTROL,
 };
 pub use lean::{
     extract_lean_blocks, parse_lean_source, LeanConstructor, LeanDeclaration, LeanDef, LeanField,
