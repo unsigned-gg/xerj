@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Wire optional joined `service-xerj` Cortex mesh presence loop (`engine/crates/xerj-server/src/mesh.rs`, `CORTEX_MESH_URL`, `CORTEX_MESH_CRED_DIR`, `CORTEX_MESH_ROLE=service-xerj`) into `xerj-server`: heartbeat `/v1/mesh/heartbeat`, drain `/v1/mesh/recv`, ack `/v1/mesh/ack`, and emit rate-limited `kind: ack` receipts with live engine `status`, `index_count`, and `total_docs`.
 - Vendor `lsc-core` and `lsc` from `unsigned-gg/lsc` (`v0.2.0`) under
   `engine/crates/lsc-core` and `engine/crates/lsc` as path dependencies with
   `version.workspace = true`, and wire `engine/crates/xtask` to lower

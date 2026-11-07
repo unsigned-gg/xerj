@@ -32,6 +32,7 @@ xerj-mcp     = { path = "../xerj-mcp" }
 
 tokio.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 # In-process TLS termination for the REST + ES-compat listeners.
 # `tls-rustls-no-provider` deliberately avoids axum-server's default
 # `tls-rustls` feature, which would force `rustls/aws-lc-rs` into the

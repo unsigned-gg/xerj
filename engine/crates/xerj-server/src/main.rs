@@ -142,6 +142,7 @@ mod debug_profiling;
 mod grpc;
 mod grpc_hub;
 mod ingest_memory_trace;
+mod mesh;
 mod share;
 mod startup_data_dir;
 
@@ -4966,6 +4967,7 @@ async fn async_main() -> Result<()> {
     }
 
     let _ingest_memory_trace = storage_available.then(|| ingest_memory_trace::spawn(&state.engine));
+    let _cortex_mesh = mesh::spawn_from_env(state.engine.clone());
     // 13. Start servers concurrently. Their sockets stay open until
     // `phase_tx` says the final flush has finished; see `ShutdownPhase`.
     let rest_tls = tls_config.clone();
