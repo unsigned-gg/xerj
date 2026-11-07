@@ -335,7 +335,9 @@ pub(crate) fn reconcile_plan(
                     group,
                     sniffed.family.as_str(),
                     fields,
+                    &file.rel,
                     &owned_datasets,
+                    &refused_datasets_frozen,
                     &incremental_fields,
                 )
             } else {
@@ -566,7 +568,9 @@ fn retained_slug(
     group: &Option<String>,
     family: &str,
     fields: &HashMap<String, FieldAcc>,
+    rel: &str,
     datasets: &[PlanDataset],
+    refused: &[&PlanDataset],
     incremental: &BTreeMap<String, Vec<FieldSpec>>,
 ) -> Result<String, AssignFailure> {
     if owner.family != family {
@@ -575,16 +579,28 @@ fn retained_slug(
             owner.family
         )));
     }
+    let effective_group = if owner.as_document { &None } else { group };
     let matches = owner
         .assignments
         .iter()
-        .filter(|(assigned_group, _)| assigned_group == group)
+        .filter(|(assigned_group, _)| assigned_group == effective_group)
         .collect::<Vec<_>>();
-    if matches.len() != 1 {
+    if matches.is_empty() {
+        return classify_new(
+            effective_group,
+            family,
+            fields,
+            rel,
+            datasets,
+            refused,
+            incremental,
+        );
+    }
+    if matches.len() > 1 {
         return Err(AssignFailure::Fatal(anyhow::anyhow!(
             "frozen assignment has {} matches for group {:?}",
             matches.len(),
-            group
+            effective_group
         )));
     }
     let slug = &matches[0].1;
@@ -1847,5 +1863,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("duplicate content identity"));
+    }
+
+    #[test]
+    fn retained_file_gaining_unmapped_table_group_junks_that_file_not_aborts() {
+        let mut previous = Plan {
+            datasets: vec![PlanDataset {
+                family: "json".into(),
+                group: Some("order".into()),
+                ..dataset("cases-order", vec![spec("name", "text")])
+            }],
+            ..Plan::default()
+        };
+        previous.files.insert(
+            "old-cases".into(),
+            FileAssignment {
+                rel: "cases.json".into(),
+                path_id: "unix:63".into(),
+                is_symlink: Some(false),
+                family: "json".into(),
+                gzip: false,
+                content_digest: Some("old-digest".into()),
+                assignments: vec![(Some("order".into()), "cases-order".into())],
+                as_document: false,
+            },
+        );
+
+        let fields = HashMap::from([("name".to_string(), acc(&[json!("case-1")]))]);
+        let mut file_scan = scan(fields.clone());
+        file_scan.sniffed.as_mut().unwrap().family = Family::Json;
+        file_scan.sketches = vec![
+            crate::GroupSketch {
+                group: Some("order".into()),
+                fields: fields.clone(),
+                key_fields: std::collections::HashSet::new(),
+                records: 4,
+                population: 4,
+            },
+            crate::GroupSketch {
+                group: Some("ttl".into()),
+                fields,
+                key_fields: std::collections::HashSet::new(),
+                records: 4,
+                population: 4,
+            },
+        ];
+
+        let plan = reconcile_plan(
+            &inventory("cases.json", "unix:63", "new-cases"),
+            &previous,
+            vec![file_scan],
+            50,
+            REBUILD,
+        )
+        .expect("a retained file gaining a new table group must not abort the whole run");
+        assert!(plan.files.is_empty());
+        assert_eq!(plan.junk_files.len(), 1);
+        assert!(
+            plan.junk_files[0]
+                .reason
+                .contains("unsupported dataset/schema evolution"),
+            "{}",
+            plan.junk_files[0].reason
+        );
     }
 }
