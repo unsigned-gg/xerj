@@ -633,7 +633,13 @@ pub fn plan_operations(base: &[ManifestGroup], desired: &[ManifestGroup]) -> Vec
             Some(new)
                 if old.content_id != new.content_id
                     || old.content_digest != new.content_digest
-                    || old.content_size != new.content_size =>
+                    || old.content_size != new.content_size
+                    || old.dataset_slugs != new.dataset_slugs
+                    || old.expected_records != new.expected_records
+                    || old.expected_passages != new.expected_passages
+                    || old.expected_vectors != new.expected_vectors
+                    || old.expected_junk_records != new.expected_junk_records
+                    || old.expected_records_by_dataset != new.expected_records_by_dataset =>
             {
                 operations.push(operation(
                     SyncOperationKind::Upsert,
@@ -1837,21 +1843,27 @@ mod tests {
         let deleted = group("gone", "gone", path("02", false));
         let metadata_old = group("meta", "meta", path("03", false));
         let mut metadata_new = metadata_old.clone();
-        metadata_new.expected_records = 2;
+        metadata_new.aliases = vec![path("05", false)];
+        let count_changed_old = group("recount", "recount", path("06", false));
+        let mut count_changed_new = count_changed_old.clone();
+        count_changed_new.expected_records = 2;
+        count_changed_new.expected_records_by_dataset =
+            BTreeMap::from([("reports".to_string(), 2)]);
         let added = group("new", "new", path("04", false));
         let operations = plan_operations(
-            &[deleted, metadata_old, unchanged.clone()],
-            &[added, metadata_new, unchanged],
+            &[deleted, metadata_old, count_changed_old, unchanged.clone()],
+            &[added, metadata_new, count_changed_new, unchanged],
         );
         assert_eq!(
             operations
                 .iter()
-                .map(|operation| operation.kind.clone())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                SyncOperationKind::Delete,
-                SyncOperationKind::Metadata,
-                SyncOperationKind::Upsert
+                .map(|operation| (operation.group_id.as_str(), operation.kind.clone()))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("gone", SyncOperationKind::Delete),
+                ("meta", SyncOperationKind::Metadata),
+                ("new", SyncOperationKind::Upsert),
+                ("recount", SyncOperationKind::Upsert),
             ])
         );
     }

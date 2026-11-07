@@ -235,9 +235,11 @@ pub fn sniff_with_name(content_path: &Path, logical_path: &Path) -> Result<Sniff
     // #2337: a `.sql` schema file is promoted to Code inside `sniff_bytes`.
     // The same past-the-prefix row scan as #1984 still wins when the rest of
     // the file is a real dump, so a long CREATE TABLE section followed by
-    // INSERT/COPY does not stay code.
+    // INSERT/COPY does not stay code. Non-`.sql` source files (`.rs`, `.py`,
+    // etc.) that embed SQL test fixtures must stay Code.
     if prefix.len() == PREFIX
-        && matches!(s.family, Family::TxtLines | Family::TxtProse | Family::Code)
+        && (matches!(s.family, Family::TxtLines | Family::TxtProse)
+            || (s.family == Family::Code && is_sql_filename(logical_path)))
         && prefix_is_schema_ddl(&prefix)
         && file_contains_sql_row_data(content_path, gzip)
     {
@@ -4426,6 +4428,27 @@ mod tests {
         assert!(
             body.contains("apply_slope") && body.contains("'low'"),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn non_sql_source_file_with_ddl_prefix_and_later_insert_stays_code() {
+        let mut rust_test = String::from(
+            "#[test]\nfn schema_fixture() {\n    let ddl = \"\nCREATE TABLE authors (\n    id INTEGER PRIMARY KEY,\n    name TEXT NOT NULL\n);\n\";\n",
+        );
+        while rust_test.len() <= PREFIX + 256 {
+            rust_test.push_str("    let _padding = 1 + 1;\n");
+        }
+        rust_test.push_str("    let dml = \"\nINSERT INTO authors VALUES (1, 'Ada');\n\";\n}\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("integration_tests.rs");
+        std::fs::write(&path, rust_test).unwrap();
+        let sn = sniff(&path).unwrap();
+        assert_eq!(
+            sn.family,
+            Family::Code,
+            "Rust test file with SQL strings must stay Code, got {:?}",
+            sn.family
         );
     }
 
