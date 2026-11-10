@@ -69,9 +69,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       # Same profile the toolkit jobs use: opt-level 3, assertions on. The
       # binary only builds a pack here, and ci-test binaries land in
@@ -266,9 +269,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       - name: Build the xerj binary
         working-directory: engine
@@ -492,10 +498,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.key.outputs.ready == 'true'
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         if: steps.key.outputs.ready == 'true'
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       - name: Build the xerj binary
         if: steps.key.outputs.ready == 'true'

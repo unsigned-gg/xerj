@@ -163,9 +163,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cached cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-reference-coding
 
       # The contracts the old script tests pinned, now in Rust:
       #   xerj-common::xccode        - staleness refusal, RESTRICTED licence
@@ -322,9 +325,12 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-lint
 
       - name: rustfmt (check)
         working-directory: engine
@@ -492,16 +498,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
-          # Single writer for the Linux [profile.ci-test] dependency cache.
-          # This job compiles the whole workspace, so its dependency set is a
-          # superset of what api-checks / conformance / usecase-smoke need;
-          # they restore this same key read-only. rust-cache's default key is
-          # per-job, which meant five near-identical ~700 MB copies competing
-          # for a 10 GB repo budget and evicting each other.
-          shared-key: ci-test-linux
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-test-linux
 
       # One cargo invocation, not two. `cargo build --release --workspace` used
       # to run first, but `panic = "abort"` in [profile.release] makes cargo
@@ -593,9 +595,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-release
 
       - name: Build (release)
         working-directory: engine
@@ -616,9 +621,12 @@ jobs:
           components: clippy
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-onnx
 
       - name: Compile the server ONNX feature path
         working-directory: engine
@@ -649,16 +657,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
-          # Read-only consumer of build-test's ci-test dependency cache.
-          # save-if:false is what makes sharing safe: these jobs run
-          # concurrently, and a cache key is immutable once written, so if
-          # they all saved it one would win and the rest would log
-          # "Unable to reserve cache" -- the collision this PR set out to fix.
-          shared-key: ci-test-linux
-          save-if: false
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -692,16 +696,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
-          # Read-only consumer of build-test's ci-test dependency cache.
-          # save-if:false is what makes sharing safe: these jobs run
-          # concurrently, and a cache key is immutable once written, so if
-          # they all saved it one would win and the rest would log
-          # "Unable to reserve cache" -- the collision this PR set out to fix.
-          shared-key: ci-test-linux
-          save-if: false
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       # ci-test: conformance asserts wire behaviour, not throughput.
       - name: Build server + conformance runner (ci-test profile)
@@ -838,16 +838,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
-          # Read-only consumer of build-test's ci-test dependency cache.
-          # save-if:false is what makes sharing safe: these jobs run
-          # concurrently, and a cache key is immutable once written, so if
-          # they all saved it one would win and the rest would log
-          # "Unable to reserve cache" -- the collision this PR set out to fix.
-          shared-key: ci-test-linux
-          save-if: false
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       - name: Build xerj + xerj-mcp (release)
         working-directory: engine
@@ -927,9 +923,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          manifest-key: ci-fd-smoke-${{ matrix.os }}
 
       # ci-test, not release: this job boots the binary and checks liveness,
       # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
@@ -973,13 +972,12 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         with:
-          workspaces: engine
-          # Read-only consumer of build-test's ci-test dependency cache; that
-          # job owns the key (same arrangement as api-checks / conformance).
-          shared-key: ci-test-linux
-          save-if: false
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       # ci-test, not release: the thresholds are coarse (O(N) blowups, not
       # ±1 %), so fat LTO would buy measurement precision this gate does not

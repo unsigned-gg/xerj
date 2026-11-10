@@ -74,10 +74,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
         if: ${{ inputs.binary == 'build' }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
         if: ${{ inputs.binary == 'build' }}
         with:
-          workspaces: engine
+          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          mode: read-only
+          manifest-key: ci-test-linux
 
       - name: Build the xerj binary (this ref)
         if: ${{ inputs.binary == 'build' }}
