@@ -163,11 +163,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cached cargo build
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-reference-coding
 
       # The contracts the old script tests pinned, now in Rust:
@@ -325,11 +333,19 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-lint
 
       - name: rustfmt (check)
@@ -498,11 +514,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-test-linux
 
       # One cargo invocation, not two. `cargo build --release --workspace` used
@@ -595,11 +619,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-release
 
       - name: Build (release)
@@ -621,11 +653,19 @@ jobs:
           components: clippy
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-onnx
 
       - name: Compile the server ONNX feature path
@@ -657,11 +697,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: read-only
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: "false"
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-test-linux
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -696,11 +744,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: read-only
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: "false"
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-test-linux
 
       # ci-test: conformance asserts wire behaviour, not throughput.
@@ -838,11 +894,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: read-only
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: "false"
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-test-linux
 
       - name: Build xerj + xerj-mcp (release)
@@ -923,11 +987,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: ${{ github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-fd-smoke-${{ matrix.os }}
 
       # ci-test, not release: this job boots the binary and checks liveness,
@@ -972,11 +1044,19 @@ jobs:
         uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
 
       - name: Cache
-        uses: unsigned-gg/actions/rust-kache@037d4f60e554ad1ba57e5fb35a5a2e1aa79fb5a9
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
         with:
-          access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          mode: read-only
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: "false"
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
           manifest-key: ci-test-linux
 
       # ci-test, not release: the thresholds are coarse (O(N) blowups, not
