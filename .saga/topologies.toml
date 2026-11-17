@@ -1,0 +1,25 @@
+# Yggdrasil Layout Topologies -- XERJ
+# Declarative pane geometry catalog consumed by bifrost::yggdrasil.
+
+[topologies.solo]
+description = "Single full-window sovereign coordinator pane"
+slots = 1
+layout = "single"
+
+[topologies.dual-h]
+description = "Two side-by-side panes (50/50 horizontal split: coordinator left, critic right)"
+slots = 2
+layout = "split-h"
+ratios = [50, 50]
+
+[topologies.dual-v]
+description = "Two stacked panes (70/30 vertical split: coordinator top, probe/watcher bottom)"
+slots = 2
+layout = "split-v"
+ratios = [70, 30]
+
+[topologies.triad]
+description = "Coordinator left (50%), builder top-right (25%), critic bottom-right (25%)"
+slots = 3
+layout = "main-left-stack-right"
+ratios = [50, 25, 25]

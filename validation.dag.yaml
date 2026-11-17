@@ -1,0 +1,129 @@
+# XERJ Workstation & CI Validation DAG for dagrun v0.15.0+
+# Applies two-level cgroup-v2 containment, CPA moldable CPU width planning,
+# rss_baseline_bytes memory admission, and cargo-target lock serialization on ceres.
+
+version: 2
+
+defaults:
+  timeout: 900
+  env:
+    CARGO_BUILD_JOBS: "2"
+    JOBS: "2"
+
+resource_caps:
+  cargo-target: 1
+
+steps:
+  - job: toolchain-check
+    group: hygiene
+    desc: "Verify active rustc satisfies projectfile.yaml runtime floor"
+    cmd: "cargo run --manifest-path engine/Cargo.toml --locked -j 2 -p xtask -- toolchain-check"
+    cmdtype: cargo-build
+    hint:
+      est_duration_s: 1.0
+      rss_baseline_bytes: 268435456
+      hard_mem_max_bytes: 1073741824
+      preferred_inner_jobs: 2
+      resources:
+        cargo-target: 1
+
+  - job: projectfile-check
+    group: hygiene
+    desc: "Validate projectfile.yaml and engine/Cargo.toml parity via lsc-core"
+    cmd: "cargo run --manifest-path engine/Cargo.toml --locked -j 2 -p xtask -- projectfile-check"
+    cmdtype: unknown
+    deps:
+      - hygiene.toolchain-check
+    hint:
+      est_duration_s: 0.5
+      rss_baseline_bytes: 134217728
+      hard_mem_max_bytes: 536870912
+      resources:
+        cargo-target: 1
+
+  - job: stages-check
+    group: hygiene
+    desc: "Verify engine/crates/xtask/src/stages.rs matches projectfile.yaml lowering"
+    cmd: "cargo run --manifest-path engine/Cargo.toml --locked -j 2 -p xtask -- stages-check"
+    cmdtype: unknown
+    deps:
+      - hygiene.projectfile-check
+    hint:
+      est_duration_s: 0.5
+      rss_baseline_bytes: 134217728
+      hard_mem_max_bytes: 536870912
+      resources:
+        cargo-target: 1
+
+  - job: workflow-timeout-check
+    group: hygiene
+    desc: "Verify every GitHub Actions job declares bounded timeout-minutes"
+    cmd: "cargo run --manifest-path engine/Cargo.toml --locked -j 2 -p xtask -- workflow-timeout-check"
+    cmdtype: unknown
+    deps:
+      - hygiene.toolchain-check
+    hint:
+      est_duration_s: 0.5
+      rss_baseline_bytes: 134217728
+      hard_mem_max_bytes: 536870912
+      resources:
+        cargo-target: 1
+
+  - job: fmt-check
+    group: rust
+    desc: "Verify Rust engine workspace formatting"
+    cmd: "cargo fmt --manifest-path engine/Cargo.toml --all -- --check"
+    cmdtype: unknown
+    deps:
+      - hygiene.toolchain-check
+    hint:
+      est_duration_s: 1.5
+      rss_baseline_bytes: 268435456
+      hard_mem_max_bytes: 1073741824
+
+  - job: clippy
+    group: rust
+    desc: "Run engine workspace clippy with -D warnings (-j 2)"
+    cmd: "cargo clippy --manifest-path engine/Cargo.toml --workspace --locked -j 2 --all-targets -- -D warnings"
+    cmdtype: cargo-build
+    deps:
+      - rust.fmt-check
+      - hygiene.stages-check
+      - hygiene.workflow-timeout-check
+    hint:
+      est_duration_s: 25.0
+      rss_baseline_bytes: 3221225472
+      hard_mem_max_bytes: 8589934592
+      preferred_inner_jobs: 2
+      resources:
+        cargo-target: 1
+
+  - job: test
+    group: rust
+    desc: "Run engine workspace unit and binary tests (-j 2)"
+    cmd: "cargo test --manifest-path engine/Cargo.toml --workspace --locked -j 2 --lib --bins"
+    cmdtype: cargo-test
+    deps:
+      - rust.clippy
+    hint:
+      est_duration_s: 30.0
+      rss_baseline_bytes: 3221225472
+      hard_mem_max_bytes: 8589934592
+      preferred_inner_jobs: 2
+      resources:
+        cargo-target: 1
+
+  - job: doc-test
+    group: rust
+    desc: "Run engine workspace documentation tests (-j 2)"
+    cmd: "cargo test --manifest-path engine/Cargo.toml --doc --workspace --locked -j 2"
+    cmdtype: cargo-test
+    deps:
+      - rust.test
+    hint:
+      est_duration_s: 10.0
+      rss_baseline_bytes: 1073741824
+      hard_mem_max_bytes: 4294967296
+      preferred_inner_jobs: 2
+      resources:
+        cargo-target: 1

@@ -1,0 +1,30 @@
+# Saga Team Archetypes -- XERJ
+
+[teams.xerj-solo]
+description = "Sovereign solo coordinator lane for XERJ"
+topology = "solo"
+
+[[teams.xerj-solo.members]]
+role = "xerj-coordinator"
+kind = "agy"
+slot = 0
+authority = "sovereign"
+prompt = "AGENTS.md"
+
+[teams.xerj-dual]
+description = "Paired coordinator + critic lane for XERJ hybrid search, storage, and MCP gates"
+topology = "dual-h"
+
+[[teams.xerj-dual.members]]
+role = "xerj-coordinator"
+kind = "agy"
+slot = 0
+authority = "sovereign"
+prompt = "AGENTS.md"
+
+[[teams.xerj-dual.members]]
+role = "code-critic"
+kind = "claude"
+slot = 1
+authority = "advisory"
+prompt = "Audit XERJ storage durability, hybrid BM25 + HNSW invariants, tree-sitter symbol indexing, and SPEC-0004 xtask verification receipts."

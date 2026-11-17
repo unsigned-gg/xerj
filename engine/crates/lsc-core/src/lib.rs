@@ -42,10 +42,9 @@ pub use projectfile::{
     XtaskTargetOptions,
 };
 pub use receipt::{
-    parse_libtest_counts, parse_libtest_proof, LibtestCounts, ReceiptCacheState, ReceiptResult,
-    ValidationGateReceipt, ValidationReceipt, ValidityFingerprint, ValidityInput,
-    ValidityInputKind, ValidityStrength, VALIDATION_RECEIPT_SCHEMA_VERSION,
-    VALIDITY_FINGERPRINT_SCHEMA_VERSION,
+    parse_libtest_counts, LibtestCounts, ReceiptCacheState, ReceiptResult, ValidationGateReceipt,
+    ValidationReceipt, ValidityFingerprint, ValidityInput, ValidityInputKind, ValidityStrength,
+    VALIDATION_RECEIPT_SCHEMA_VERSION, VALIDITY_FINGERPRINT_SCHEMA_VERSION,
 };
 pub use rules::{
     parse_file_name, parse_folder_name, parse_folder_spec, parse_spec, LEGACY_SECTIONS,

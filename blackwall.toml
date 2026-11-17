@@ -1,0 +1,17 @@
+# Blackwall build-pipeline custody config for XERJ (unsigned-gg/xerj).
+# Custody chain: run -> settle -> reconcile -> verify -> PR -> merge-gate.
+
+[defaults]
+provider = "gateway"
+model = "kimi-k3"
+
+[verify]
+# Fail-closed workspace gate (-j 2 throttled hygiene, fmt-check, clippy -D warnings, tests).
+command = "make check"
+
+[merge]
+# Green CI reports ready; operator or fast-forward lane lands explicitly.
+automerge = false
+
+[budget]
+max_tokens_per_run = 200000

@@ -207,3 +207,7 @@ scripts/seo/evidence/
 .tools/
 engine/.tools/
 
+# Local orchestration scratch state
+.blackwall/
+.dagrun/
+
