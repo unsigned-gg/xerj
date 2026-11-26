@@ -489,6 +489,11 @@ pub async fn process_bulk_with_opts(
         },
         None => None,
     };
+    // Mirrors the permits held in the bulk pool: counted while the permit is.
+    let _bulk_in_flight = _bulk_permit
+        .is_some()
+        .then(|| xerj_common::metrics::global_metrics().map(|m| m.bulk_in_flight_guard()))
+        .flatten();
 
     let t_lines = std::time::Instant::now();
     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1596,6 +1601,8 @@ pub async fn process_bulk_with_opts(
 
     let group_ms = t_group.elapsed().as_millis() as u64;
     let t_exec = std::time::Instant::now();
+    // Time spent inside apply_semantic_embeddings_batch, summed over groups.
+    let mut embed_ms = 0u64;
 
     // ── semantic_text index actions: cross-document embedding windows ────
     //
@@ -1720,7 +1727,9 @@ pub async fn process_bulk_with_opts(
         // Backend-owned chunk strings, tokenizer tensors, and inference
         // scratch are not yet logically attributed. Their effect remains
         // visible only as allocator/RSS physical delta; it is not zero.
+        let t_embed = std::time::Instant::now();
         let prepared = idx.apply_semantic_embeddings_batch(valid_sources).await;
+        embed_ms += t_embed.elapsed().as_millis() as u64;
         #[cfg(test)]
         let _ = semantic_lifecycle_hook(&index_name, SemanticLifecyclePoint::Prepared);
         let mut valid_memory = valid_memory.map(Vec::into_iter);
@@ -2470,12 +2479,13 @@ pub async fn process_bulk_with_opts(
     // THROWAWAY prof (XERJ_PROF): whole-request bulk attribution.
     if std::env::var_os("XERJ_PROF").is_some() {
         eprintln!(
-            "XERJ_PROF bulk total_ms={} lines_ms={} parse_ms={} group_ms={} exec_ms={} n_lines={}",
+            "XERJ_PROF bulk total_ms={} lines_ms={} parse_ms={} group_ms={} exec_ms={} embed_ms={} n_lines={}",
             took_ms,
             lines_ms,
             parse_ms,
             group_ms,
             exec_ms,
+            embed_ms,
             lines.len()
         );
     }
@@ -3637,6 +3647,131 @@ mod semantic_lifecycle_tests {
         assert!(!points.contains(&(fails.to_string(), SemanticLifecyclePoint::EmbeddingInside)));
         assert_eq!(all_semantic_current(ledger), 0);
         assert_eq!(ledger.accounting_errors(), 0);
+    }
+
+    /// Embedding endpoint that answers every request with 200 and a width-16
+    /// vector per input after `delay`. Returns the URL and a request counter.
+    fn slow_embedding_server(
+        delay: std::time::Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    // Read headers, then exactly Content-Length body bytes.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let (body_start, content_length) = loop {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (pos + 4, len);
+                        }
+                    };
+                    while buf.len() < body_start + content_length {
+                        let n = sock.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let request: Value =
+                        serde_json::from_slice(&buf[body_start..body_start + content_length])
+                            .unwrap();
+                    let inputs = request["input"].as_array().map_or(0, Vec::len);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    let data: Vec<Value> = (0..inputs)
+                        .map(|i| json!({"index": i, "embedding": vec![0.25f64; 16]}))
+                        .collect();
+                    let body = json!({ "data": data }).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                });
+            }
+        });
+        (format!("http://{addr}/v1/embeddings"), calls)
+    }
+
+    /// The bulk embed deadline refuses windows that would start after it and
+    /// answers their items 429, without the per-item retry that would spend
+    /// the capacity just refused. Windows that started in time are written.
+    #[tokio::test]
+    async fn bulk_embed_deadline_answers_late_windows_429_without_per_item_retry() {
+        use std::sync::atomic::Ordering;
+        let name = "semantic-embed-deadline";
+        let (url, calls) = slow_embedding_server(std::time::Duration::from_millis(400));
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.embedding.mode = "proxy".into();
+        config.embedding.default_endpoint = url;
+        config.embedding.default_model = "m".into();
+        // One passage per window, one window at a time.
+        config.embedding.onnx_scheduling_window = 1;
+        config.embedding.neural_window_concurrency = 1;
+        config.embedding.bulk_embed_deadline_ms = 100;
+        let engine = Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        let mut field = FieldConfig::new("content", FieldType::Text);
+        field.options.dimensions = Some(16);
+        field.embedding = Some(EmbeddingConfig {
+            endpoint: None,
+            model: None,
+            target_field: Some("content_vector".into()),
+        });
+        schema.fields.push(field);
+        engine.create_index(name, schema).unwrap();
+        engine
+            .put_index_mapping(
+                name,
+                json!({"properties": {"content": {"type": "semantic_text"}}}),
+            )
+            .unwrap();
+
+        let mut body = String::new();
+        for i in 0..6 {
+            body.push_str(&format!(
+                "{{\"index\":{{\"_index\":\"{name}\",\"_id\":\"d{i}\"}}}}\n\
+                 {{\"content\":\"short document number {i}\"}}\n"
+            ));
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let result = process_bulk(&engine, None, &body).await;
+        let statuses: Vec<u16> = result.items.iter().map(|item| item.status).collect();
+        assert_eq!(
+            statuses,
+            [201, 429, 429, 429, 429, 429],
+            "{:?}",
+            result.items
+        );
+        assert!(result.errors);
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            1,
+            "only the first window may reach the backend; rejected windows must not \
+             be retried per item"
+        );
     }
 
     #[tokio::test]

@@ -19484,6 +19484,12 @@ impl Index {
         &self,
         mut sources: Vec<Value>,
     ) -> Vec<Result<Value>> {
+        // Budget for starting embedding windows. Captured first so schema
+        // reads and chunking count against it.
+        let embed_deadline = (self.embedding_config.bulk_embed_deadline_ms > 0).then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(self.embedding_config.bulk_embed_deadline_ms)
+        });
         // Collect (field, target_field, dims) specs without holding the schema
         // lock across the (possibly async) embedding calls.
         let specs: Vec<(String, String, usize)> = {
@@ -19613,13 +19619,10 @@ impl Index {
                 let (texts, offsets) = if chunks.len() <= 1 {
                     (vec![text.to_string()], vec![(0, text.len())])
                 } else {
-                    (
-                        chunks.iter().map(|c| c.text.clone()).collect(),
-                        chunks
-                            .iter()
-                            .map(|c| (c.start_offset, c.end_offset))
-                            .collect(),
-                    )
+                    chunks
+                        .into_iter()
+                        .map(|c| (c.text, (c.start_offset, c.end_offset)))
+                        .unzip()
                 };
                 jobs.push(EmbedJob {
                     source_idx,
@@ -19685,15 +19688,33 @@ impl Index {
             // embedded as its own batch and reassembled by position, so the
             // vectors computed per passage are identical to the serial loop.
             let mut window_results = Vec::with_capacity(windows.len());
+            // A window that would START after the bulk deadline is refused
+            // as an admission rejection without building its texts or
+            // calling the backend. A window already running is never
+            // interrupted.
+            let embedder_ref = &*embedder;
+            let windows_ref = &windows;
+            let window_texts_ref = &window_texts;
+            let launch = move |ordinal: usize| async move {
+                let (start, end, _passages) = windows_ref[ordinal];
+                if embed_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    return Err(anyhow::Error::new(
+                        xerj_ai::embedder::EmbeddingAdmissionError {
+                            reason: "bulk embedding deadline reached before this window \
+                                     started; retry the remaining items"
+                                .into(),
+                        },
+                    ));
+                }
+                embedder_ref
+                    .embed_batch_gated(window_texts_ref(start, end))
+                    .await
+            };
             if dual_session_scheduler_enabled(
                 onnx_pinned,
                 self.embedding_config.onnx_session_pool_size,
             ) {
-                let results = collect_ordinal_buffered_two(windows.len(), |ordinal| {
-                    let (start, end, _passages) = windows[ordinal];
-                    embedder.embed_batch(window_texts(start, end))
-                })
-                .await;
+                let results = collect_ordinal_buffered_two(windows.len(), &launch).await;
                 window_results.extend(
                     windows
                         .iter()
@@ -19704,10 +19725,7 @@ impl Index {
                 let results = collect_ordinal_buffered(
                     windows.len(),
                     self.embedding_config.neural_window_concurrency,
-                    |ordinal| {
-                        let (start, end, _passages) = windows[ordinal];
-                        embedder.embed_batch(window_texts(start, end))
-                    },
+                    &launch,
                 )
                 .await;
                 window_results.extend(
@@ -19742,6 +19760,23 @@ impl Index {
                             offset += count;
                         }
                     }
+                    Err(e) if is_embedding_admission_rejection(&e) => {
+                        // The backend or the bulk deadline refused this whole
+                        // window. Retrying per item would only spend the
+                        // capacity that was just refused, so answer every
+                        // source in it as an admission rejection (429).
+                        tracing::warn!(
+                            error = %e,
+                            jobs = end - start,
+                            passages,
+                            "semantic embedding window refused; not retrying per item"
+                        );
+                        for job in &jobs[start..end] {
+                            width_mismatches[job.source_idx] = false;
+                            admission_rejections[job.source_idx] = true;
+                            failures[job.source_idx] = Some(format!("field [{}]: {e}", job.field));
+                        }
+                    }
                     batch_result => {
                         // Preserve per-item bulk behavior on a backend error:
                         // retry each document-field job separately and only
@@ -19760,7 +19795,10 @@ impl Index {
                             "semantic embedding window failed; retrying per item"
                         );
                         for job_idx in start..end {
-                            match embedder.embed_batch(jobs[job_idx].texts.clone()).await {
+                            match embedder
+                                .embed_batch_gated(jobs[job_idx].texts.clone())
+                                .await
+                            {
                                 Ok(v)
                                     if v.len() == jobs[job_idx].texts.len()
                                         && v.iter()
@@ -40763,10 +40801,14 @@ fn semantic_width_mismatch_error(detail: &str) -> xerj_common::XerjError {
 /// `EmbeddingError` (500, `circuit_breaking_exception`) with `ctx` prepended.
 /// Takes `impl Display` because the `Embedder` surfaces `anyhow::Error` (the
 /// classification of transient-vs-permanent already happened inside the proxy).
-fn is_embedding_admission_rejection(_e: &anyhow::Error) -> bool {
+fn is_embedding_admission_rejection(e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<xerj_ai::embedder::EmbeddingAdmissionError>()
+        .is_some()
+    {
+        return true;
+    }
     #[cfg(feature = "onnx-experimental")]
-    if _e
-        .downcast_ref::<xerj_ai::embedder::OnnxAdmissionError>()
+    if e.downcast_ref::<xerj_ai::embedder::OnnxAdmissionError>()
         .is_some()
     {
         return true;
@@ -42984,6 +43026,7 @@ fn make_neural_embedder(cfg: &xerj_common::config::EmbeddingConfig) -> Result<xe
     // `configured_neural_config`. Duplicating it here once let the reported
     // identity describe a different model than the one that loads.
     ensure_neural_ready(cfg)?;
+    xerj_ai::embedder::configure_neural_gate(cfg.neural_max_inflight_calls, cfg.timeout_ms);
     let neural_cfg = configured_neural_config(cfg);
     info!(
         model = %neural_cfg.model_id,
