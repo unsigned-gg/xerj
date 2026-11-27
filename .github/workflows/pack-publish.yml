@@ -62,7 +62,7 @@ jobs:
     name: build + sign + publish rust-vulns
     # 12.2: retired (no new JSON release) once RECORD_HUBPACKS is `only`.
     if: vars.RECORD_HUBPACKS != 'only'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -270,7 +270,7 @@ jobs:
     name: build + sign + publish agent-session-trajectories
     # 12.2: retired (no new JSON release) once RECORD_HUBPACKS is `only`.
     if: vars.RECORD_HUBPACKS != 'only'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -457,7 +457,7 @@ jobs:
   # ── the same record packs as Corpus Hub v2 hubpacks (§12.1) ────────────────
   hubpack:
     name: hubpack ${{ matrix.slug }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 60
     strategy:
       fail-fast: false

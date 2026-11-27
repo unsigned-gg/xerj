@@ -18,7 +18,7 @@ permissions:
 jobs:
   derive:
     name: derive HUB_PUBKEY_HEX from HUB_SIGNING_SEED
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

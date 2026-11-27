@@ -152,7 +152,7 @@ jobs:
   # nothing is planned, published or proposed by a script whose tests fail.
   selftest:
     name: unit-test the pipeline scripts
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -173,7 +173,7 @@ jobs:
   preflight:
     name: hub key and secret in place?
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 5
     outputs:
       ready: ${{ steps.check.outputs.ready }}
@@ -226,7 +226,7 @@ jobs:
     name: plan the builds
     needs: [selftest, preflight]
     if: needs.preflight.outputs.ready == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -273,7 +273,7 @@ jobs:
     name: build xerj
     needs: preflight
     if: needs.preflight.outputs.ready == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -315,7 +315,7 @@ jobs:
     name: pack ${{ matrix.slug }}
     needs: [preflight, plan, build-xerj]
     if: needs.plan.result == 'success' && needs.plan.outputs.count != '0'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     # The repo-wide ceiling (.github/scripts/workflow-timeout-guard.py, 1..90).
     # This pipeline had never run for real before HUB_PUBKEY_HEX was committed,
     # so there is no measured job time to justify more; if a real pack needs longer, that
@@ -615,7 +615,7 @@ jobs:
     name: backfill report
     needs: [plan, build-xerj, pack]
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 10
     permissions:
       contents: write # commit the report to corpus-hub
@@ -670,7 +670,7 @@ jobs:
     # Runs even when some pack jobs failed: the catalogue is rebuilt from RELEASES,
     # and check-catalogue refuses to delist a corpus that is still live.
     if: ${{ !cancelled() && needs.preflight.outputs.ready == 'true' && needs.plan.result == 'success' && needs.build-xerj.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 90 # the repo-wide ceiling; see the `pack` job
     env:
       HUB_PUBKEY_HEX: ${{ needs.preflight.outputs.pubkey }}
@@ -837,6 +837,12 @@ jobs:
           mkdir -p tools/corpus-hub-site/out/api/v1
           cp catalogue.json catalogue.json.sig tools/corpus-hub-site/out/api/v1/
 
+      - name: Setup Node.js (for wrangler)
+        if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' && env.NO_PACKS != '1' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
       - name: Deploy to Cloudflare Pages
         if: ${{ !inputs.dry_run && vars.HUB_CATALOGUE_DEPLOY == 'true' && env.NO_PACKS != '1' }}
         run: npx wrangler@3 pages deploy tools/corpus-hub-site/out --project-name=xerj-hub --branch=corpus-hub
@@ -858,7 +864,7 @@ jobs:
     name: re-pin moved upstreams (opens PRs)
     needs: selftest
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.repin)
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 30
     permissions:
       contents: write # push the re-pin branches

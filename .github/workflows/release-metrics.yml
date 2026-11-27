@@ -30,7 +30,7 @@ concurrency:
 jobs:
   snapshot:
     name: Snapshot release download counts
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 20
     # Scheduled workflows run on forks too; a fork has nothing to snapshot.
     if: github.repository == 'xerj-org/xerj'

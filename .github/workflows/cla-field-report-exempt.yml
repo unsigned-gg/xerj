@@ -57,7 +57,7 @@ concurrency:
 jobs:
   field-report-exempt:
     name: Field-report CLA exemption
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 15
     steps:
       # Trusted base code ONLY — never the PR head. This runs under the elevated

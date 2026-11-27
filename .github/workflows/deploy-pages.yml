@@ -30,7 +30,7 @@ concurrency:
 jobs:
   deploy:
     name: Publish landing/ to Cloudflare Pages
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     # `pages-deploy` is a single non-cancelling slot shared by every deploy,
     # so an upload that wedges blocks ALL later site deploys for as long as
     # it runs. Measured max 0.7 min; 20 is generous for a network upload and
@@ -42,6 +42,11 @@ jobs:
     steps:
       - name: Check out the site
         uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Guard — secrets must be present
         run: |
