@@ -57,7 +57,8 @@ jobs:
   # on its own merge commit instead of on the next unrelated code PR.
   changes:
     name: Change scope
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 5
     outputs:
       code: ${{ steps.scope.outputs.code }}
@@ -106,7 +107,8 @@ jobs:
 
   cla-config:
     name: CLA gate config
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     permissions:
       contents: read
@@ -150,7 +152,8 @@ jobs:
 
   reference-coding:
     name: Reference-coding toolkit
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -231,7 +234,8 @@ jobs:
   # shallow checkout does not fetch.
   landing-constants-guard:
     name: Landing constants guard
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -278,7 +282,8 @@ jobs:
   # runners were busy.
   workflow-timeouts:
     name: Workflow job-timeout guard
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -301,7 +306,8 @@ jobs:
   # merge ref "behind base" is unobservable by construction.
   release-notes-gate:
     name: Release notes match the tree
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release/')
     steps:
@@ -322,7 +328,8 @@ jobs:
     name: Format + Clippy
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -372,7 +379,8 @@ jobs:
     name: Workspace resolves (links + lockfile)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -399,7 +407,8 @@ jobs:
     name: Dependency advisory audit (cargo-audit)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -438,7 +447,8 @@ jobs:
     name: Fuzz harnesses (cargo-fuzz)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -488,7 +498,8 @@ jobs:
     name: Build + Test
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     # #751's second-order damage was the whole job hanging against GitHub's 6h
     # default while main's `cancel-in-progress: false` never auto-cancels — main
     # then sat ~4h with no CI verdict. #751's root cause is fixed (see the step-6
@@ -610,7 +621,8 @@ jobs:
     name: Release build (fat LTO, all members link)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -642,7 +654,8 @@ jobs:
     name: ONNX feature compile + tests
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -688,7 +701,8 @@ jobs:
     name: API smoke + liveness + benchmark
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -735,7 +749,8 @@ jobs:
     name: ES-compat YAML conformance
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -836,7 +851,7 @@ jobs:
   ux-tests:
     name: UX pipeline tests
     needs: [changes]
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.ux == 'true') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.ux == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -874,7 +889,7 @@ jobs:
   usecase-smoke:
     name: Use-case harnesses (brain + MCP + autoindex)
     needs: [changes]
-    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -964,13 +979,55 @@ jobs:
   # macOS runners default to `ulimit -n 256` — the exact condition it regressed
   # under.
   autoindex-fd-smoke:
-    name: Autoindex FD smoke (${{ matrix.os }})
+    name: Autoindex FD smoke (linux)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      - name: Cache
+        uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # v1
+        with:
+          version: v2.0.0
+          s3-bucket: ${{ secrets.R2_ACCESS_KEY_ID != '' && 'estate-ci-sccache' || '' }}
+          s3-endpoint: https://07ae57cca8fc1a438f9c9b875d1e2283.r2.cloudflarestorage.com
+          s3-region: auto
+          s3-prefix: kache/${{ github.repository }}
+          s3-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-executables: "true"
+          cache-c-cpp: "true"
+          pr-comment: "false"
+          manifest-key: ci-fd-smoke-ubuntu-latest
+
+      # ci-test, not release: this job boots the binary and checks liveness,
+      # it does not measure performance. Fat LTO cost 6m21s here to run 3s of
+      # checks. Same opt-level and features, only LTO scope differs.
+      - name: Build xerj (ci-test profile)
+        working-directory: engine
+        run: cargo build --profile ci-test -p xerj-server
+
+      - name: Autoindex a many-dataset corpus (must not exhaust file descriptors)
+        shell: bash
+        env:
+          XERJ_BIN: engine/target/ci-test/xerj
+        run: bash .github/scripts/autoindex-fd-smoke.sh
+
+  autoindex-fd-smoke-cross-os:
+    name: Autoindex FD smoke (${{ matrix.os }})
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # Tier 3 plus 15 minutes, and the exception is measured rather than felt:
     # the windows-latest leg has the widest spread of any job here — over 204
@@ -1031,7 +1088,8 @@ jobs:
     name: Idle budget (many-index at-rest CPU/RSS)
     needs: [changes]
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     # One tier up from the no-compile tier: compiles one crate (xerj-server)
     # on the shared ci-test cache, then boots and measures. The fixture itself
     # is ~8 min measured (two 120 s settle windows + ~450 PUT/_bulk rounds);

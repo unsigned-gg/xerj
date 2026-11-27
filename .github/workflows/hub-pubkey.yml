@@ -18,7 +18,8 @@ permissions:
 jobs:
   derive:
     name: derive HUB_PUBKEY_HEX from HUB_SIGNING_SEED
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

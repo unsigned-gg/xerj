@@ -62,7 +62,8 @@ jobs:
     name: build + sign + publish rust-vulns
     # 12.2: retired (no new JSON release) once RECORD_HUBPACKS is `only`.
     if: vars.RECORD_HUBPACKS != 'only'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -270,7 +271,8 @@ jobs:
     name: build + sign + publish agent-session-trajectories
     # 12.2: retired (no new JSON release) once RECORD_HUBPACKS is `only`.
     if: vars.RECORD_HUBPACKS != 'only'
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -457,7 +459,8 @@ jobs:
   # ── the same record packs as Corpus Hub v2 hubpacks (§12.1) ────────────────
   hubpack:
     name: hubpack ${{ matrix.slug }}
-    runs-on: ubuntu-latest
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 60
     strategy:
       fail-fast: false
